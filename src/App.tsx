@@ -8,8 +8,17 @@ import { SettingsOverlay } from "./components/Settings";
 import { WorkspaceRail } from "./components/Workspace";
 import { CommandPalette } from "./components/CommandPalette";
 import { GlobalOverlays, ToastView, WindowTitlebar } from "./components/Overlays";
+import { IaPrototype } from "./prototype/ia/IaPrototype";
 
 export default function App() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has("variant")) {
+    return <IaPrototype />;
+  }
+  return <QuietRelayApp />;
+}
+
+function QuietRelayApp() {
   const { state, dispatch } = useApp();
 
   useEffect(() => {
