@@ -1,0 +1,338 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-22T12:20:00+08:00",
+  "title": "Design System: Hermes Desktop",
+  "extensions": {
+    "colorMeta": {
+      "paper": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "#f7f7f5",
+        "tonalRamp": ["#171714", "#2f2f2a", "#4a4a43", "#66665e", "#83837a", "#a6a69d", "#cbcbc2", "#f7f7f5"]
+      },
+      "paper-raised": {
+        "role": "neutral",
+        "displayName": "Raised Paper",
+        "canonical": "#fbfbf8",
+        "tonalRamp": ["#181815", "#30302b", "#4c4c45", "#68685f", "#85857b", "#a8a89d", "#cdcdc3", "#fbfbf8"]
+      },
+      "paper-deep": {
+        "role": "neutral",
+        "displayName": "Deep Paper",
+        "canonical": "#f1f1ed",
+        "tonalRamp": ["#181815", "#2f2f2a", "#4a4a43", "#65655d", "#818178", "#a4a49a", "#c9c9c0", "#f1f1ed"]
+      },
+      "sidebar": {
+        "role": "neutral",
+        "displayName": "Sidebar Paper",
+        "canonical": "#f3f3ef",
+        "tonalRamp": ["#181815", "#2f2f2a", "#4a4a43", "#65655d", "#818178", "#a4a49a", "#c9c9c0", "#f3f3ef"]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Working Surface",
+        "canonical": "#ffffff",
+        "tonalRamp": ["#171717", "#303030", "#4b4b4b", "#666666", "#828282", "#a6a6a6", "#cccccc", "#ffffff"]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#16181b",
+        "tonalRamp": ["#07080a", "#16181b", "#262a2f", "#3a3f46", "#51575f", "#6c737c", "#9299a2", "#c9cdd2"]
+      },
+      "ink-soft": {
+        "role": "neutral",
+        "displayName": "Soft Ink",
+        "canonical": "#30343a",
+        "tonalRamp": ["#08090b", "#171a1e", "#30343a", "#444a52", "#5a616a", "#737b86", "#969da7", "#c8ccd2"]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "#555a61",
+        "tonalRamp": ["#0b0c0e", "#1c1f22", "#34383e", "#555a61", "#6b7179", "#858c95", "#a6acb4", "#d1d4d8"]
+      },
+      "faint": {
+        "role": "neutral",
+        "displayName": "Faint Ink",
+        "canonical": "#676c73",
+        "tonalRamp": ["#0d0e10", "#202327", "#3b4046", "#52575e", "#676c73", "#82888f", "#a5aab0", "#d2d5d9"]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#e2e2db",
+        "tonalRamp": ["#171714", "#2e2e29", "#474741", "#61615a", "#7c7c74", "#9d9d94", "#c1c1b8", "#e2e2db"]
+      },
+      "line-strong": {
+        "role": "neutral",
+        "displayName": "Strong Hairline",
+        "canonical": "#c9c9c1",
+        "tonalRamp": ["#161613", "#2b2b27", "#42423c", "#5a5a52", "#73736a", "#93938a", "#b1b1a9", "#c9c9c1"]
+      },
+      "postal-vermilion": {
+        "role": "primary",
+        "displayName": "Postal Vermilion",
+        "canonical": "#c8442e",
+        "tonalRamp": ["#2a0a05", "#51160d", "#792518", "#a73826", "#c8442e", "#dd6d57", "#eea695", "#fbefec"]
+      },
+      "postal-vermilion-text": {
+        "role": "primary",
+        "displayName": "Vermilion Ink",
+        "canonical": "#a73826",
+        "tonalRamp": ["#230704", "#44130c", "#672014", "#8b2e1f", "#a73826", "#c25d4b", "#dda193", "#f7ece8"]
+      },
+      "postal-vermilion-soft": {
+        "role": "primary",
+        "displayName": "Vermilion Wash",
+        "canonical": "#faede8",
+        "tonalRamp": ["#2b0f09", "#522116", "#7a3524", "#a34b34", "#c86c53", "#e49a83", "#f2c9bb", "#faede8"]
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "Seal Red",
+        "canonical": "#9e2d1e",
+        "tonalRamp": ["#220704", "#42110a", "#651b12", "#851f14", "#9e2d1e", "#bf5546", "#dd9a8e", "#f6eae7"]
+      },
+      "ok": {
+        "role": "secondary",
+        "displayName": "Route Green",
+        "canonical": "#376d4a",
+        "tonalRamp": ["#0a160f", "#12281b", "#1d3e2a", "#2a563a", "#376d4a", "#5b8f6c", "#95b7a0", "#e3eee6"]
+      },
+      "warn": {
+        "role": "tertiary",
+        "displayName": "Custody Amber",
+        "canonical": "#8a6215",
+        "tonalRamp": ["#1c1304", "#382709", "#553b0e", "#704f11", "#8a6215", "#b08a3e", "#d0b47a", "#f4ead2"]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "New-session welcome only; not a marketing hero."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Session titles at the top of the conversation column."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Drawer, modal, and settings section titles."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Conversation copy and prose descriptions."
+      },
+      "control": {
+        "displayName": "Control",
+        "purpose": "Buttons, gateway rows, and menu actions."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Scope, status, and measurement labels; uppercase and tracked."
+      },
+      "code": {
+        "displayName": "Code",
+        "purpose": "Diffs, tool arguments, terminal output, and paths."
+      }
+    },
+    "shadows": [
+      {
+        "name": "hairline-lift",
+        "value": "0 1px 2px rgb(22 24 27 / 5%)",
+        "purpose": "Composer and low tonal cards."
+      },
+      {
+        "name": "popover-lift",
+        "value": "0 12px 40px rgb(22 24 27 / 14%), 0 2px 8px rgb(22 24 27 / 7%)",
+        "purpose": "Gateway switcher and model menus."
+      },
+      {
+        "name": "modal-lift",
+        "value": "0 24px 72px rgb(22 24 27 / 18%), 0 3px 10px rgb(22 24 27 / 7%)",
+        "purpose": "Settings, checkpoints, and memory graph dialogs."
+      },
+      {
+        "name": "drawer-edge",
+        "value": "-18px 0 60px rgb(22 24 27 / 15%)",
+        "purpose": "Capabilities drawer separating itself from the conversation."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Default easing for drawers, popovers, and route arrival."
+      },
+      {
+        "name": "route-arrive",
+        "value": "420ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "The active route leg lands after a gateway or profile switch."
+      },
+      {
+        "name": "drawer-in",
+        "value": "300ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Capabilities drawer entering from the right."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "prefers-reduced-motion: reduce",
+        "purpose": "All transitions collapse to 0.01ms; no state depends on motion."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "desktop-wide",
+        "value": "1380px",
+        "note": "Sidebar 232→220px; workspace 448→420px."
+      },
+      {
+        "name": "desktop-compact",
+        "value": "1220px",
+        "note": "Sidebar 208px; workspace 390px; rail labels yield before controls clip."
+      },
+      {
+        "name": "short-viewport",
+        "value": "820px height",
+        "note": "Chat rhythm tightens; session headline steps to 21px."
+      },
+      {
+        "name": "document-minimum",
+        "value": "1120px",
+        "note": "This is a desktop Operate surface, not a marketing page."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single strongest in-flow action, such as Approve or Save.",
+      "html": "<button class=\"ds-btn-primary\">Approve &amp; run</button>",
+      "css": ".ds-btn-primary { display:inline-flex; min-height:28px; align-items:center; justify-content:center; padding:0 10px; border:1px solid var(--ink, #16181b); border-radius:5px; background:var(--ink, #16181b); color:var(--paper, #f7f7f5); font:500 11px/1 'Schibsted Grotesk','PingFang SC',sans-serif; white-space:nowrap; cursor:pointer; transition:background-color 140ms ease; } .ds-btn-primary:hover { background:#30343a; } .ds-btn-primary:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Neutral action that needs a visible edge, such as Deny or Inspect.",
+      "html": "<button class=\"ds-btn-secondary\">Inspect</button>",
+      "css": ".ds-btn-secondary { display:inline-flex; min-height:28px; align-items:center; justify-content:center; padding:0 10px; border:1px solid var(--line-strong, #c9c9c1); border-radius:5px; background:var(--surface, #fff); color:var(--ink, #16181b); font:500 11px/1 'Schibsted Grotesk','PingFang SC',sans-serif; white-space:nowrap; cursor:pointer; transition:background-color 140ms ease,border-color 140ms ease; } .ds-btn-secondary:hover { border-color:#b6b6ad; background:var(--paper-raised, #fbfbf8); } .ds-btn-secondary:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:2px; }"
+    },
+    {
+      "name": "Quiet Button",
+      "kind": "button",
+      "refersTo": "button-quiet",
+      "description": "Tertiary action that stays invisible until hover or focus.",
+      "html": "<button class=\"ds-btn-quiet\">Manage</button>",
+      "css": ".ds-btn-quiet { display:inline-flex; min-height:28px; align-items:center; justify-content:center; padding:0 10px; border:1px solid transparent; border-radius:5px; background:transparent; color:var(--muted, #555a61); font:500 11px/1 'Schibsted Grotesk','PingFang SC',sans-serif; cursor:pointer; transition:background-color 140ms ease,color 140ms ease; } .ds-btn-quiet:hover { background:var(--hover, #ecece6); color:var(--ink, #16181b); } .ds-btn-quiet:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:2px; }"
+    },
+    {
+      "name": "Composer",
+      "kind": "input",
+      "refersTo": "input-composer",
+      "description": "The chat-first input with attachment, context, model, and send controls.",
+      "html": "<div class=\"ds-composer\"><div class=\"ds-composer-line\"><span>问 Hermes，或键入 / 和 @…</span><button class=\"ds-send\" aria-label=\"发送消息\">↑</button></div><div class=\"ds-composer-meta\"><span>+</span><span>@</span><span>/</span><span>Opus 4.5 · High</span></div></div>",
+      "css": ".ds-composer { width:100%; padding:8px 9px 7px; border:1px solid var(--line-strong, #c9c9c1); border-radius:9px; background:var(--surface, #fff); box-shadow:0 1px 2px rgb(22 24 27 / 5%); font:400 13.5px/1.58 'Schibsted Grotesk','PingFang SC',sans-serif; color:var(--faint, #676c73); } .ds-composer-line { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:32px; } .ds-send { width:26px; height:26px; border:0; border-radius:50%; background:var(--ink, #16181b); color:var(--paper, #f7f7f5); font:500 15px/1 sans-serif; cursor:pointer; } .ds-send:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:2px; } .ds-composer-meta { display:flex; gap:10px; padding-top:6px; color:var(--muted, #555a61); font:500 9px/1 'Spline Sans Mono',monospace; }"
+    },
+    {
+      "name": "Route String",
+      "kind": "custom",
+      "refersTo": "chip-route",
+      "description": "The signature execution-context strip: origin, gateway, profile, transport.",
+      "html": "<div class=\"ds-route\"><span class=\"ds-route-origin\">YOU</span><svg viewBox=\"0 0 26 8\" aria-hidden=\"true\"><path d=\"M0 4h22M18 1l4 3-4 3\" fill=\"none\" stroke=\"#b6b6ad\" stroke-width=\"1\"/></svg><b>HOMELAB</b><span class=\"ds-route-transport\">SSH</span><svg viewBox=\"0 0 18 8\" aria-hidden=\"true\"><path d=\"M0 4h14M10 1l4 3-4 3\" fill=\"none\" stroke=\"#b6b6ad\" stroke-width=\"1\"/></svg><span>@research</span></div>",
+      "css": ".ds-route { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:6px 9px; border:1px solid var(--line, #e2e2db); border-radius:5px; background:var(--paper, #f7f7f5); color:var(--ink, #16181b); font:500 8.5px/1.4 'Spline Sans Mono',monospace; letter-spacing:.04em; } .ds-route b { font-weight:600; } .ds-route span { color:var(--muted, #555a61); } .ds-route .ds-route-origin { color:var(--ink, #16181b); } .ds-route .ds-route-transport { padding:2px 4px; border:1px solid var(--line-strong, #c9c9c1); border-radius:2px; color:var(--muted, #555a61); font-size:7px; } .ds-route svg { width:26px; height:8px; flex:0 0 26px; }"
+    },
+    {
+      "name": "Status Chip",
+      "kind": "chip",
+      "refersTo": "chip-status",
+      "description": "Uppercase short status with a dot and a word; color is never the only signal.",
+      "html": "<span class=\"ds-status\"><i></i>REACHABLE · 24ms</span>",
+      "css": ".ds-status { display:inline-flex; align-items:center; gap:5px; min-height:20px; padding:2px 6px; border:1px solid var(--line, #e2e2db); border-radius:3px; background:var(--paper-deep, #f1f1ed); color:var(--ink-soft, #30343a); font:500 8.5px/1.4 'Spline Sans Mono',monospace; letter-spacing:.08em; text-transform:uppercase; } .ds-status i { width:5px; height:5px; border-radius:50%; background:var(--ok, #376d4a); box-shadow:0 0 0 2px #eef6ef; }"
+    },
+    {
+      "name": "Toggle Switch",
+      "kind": "input",
+      "refersTo": "toggle-switch",
+      "description": "Small state switch used for Skills, Channels, and preferences.",
+      "html": "<button class=\"ds-switch is-on\" role=\"switch\" aria-checked=\"true\" aria-label=\"Enable skill\"><span></span></button>",
+      "css": ".ds-switch { position:relative; width:28px; height:16px; padding:0; border:0; border-radius:999px; background:var(--line-strong, #c9c9c1); cursor:pointer; transition:background-color 160ms ease; } .ds-switch span { position:absolute; top:2px; left:2px; width:12px; height:12px; border-radius:50%; background:#fff; box-shadow:0 1px 2px rgb(22 24 27 / 20%); transition:transform 160ms ease; } .ds-switch.is-on { background:var(--ink, #16181b); } .ds-switch.is-on span { transform:translateX(12px); } .ds-switch:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:2px; }"
+    },
+    {
+      "name": "Gateway Row",
+      "kind": "card",
+      "refersTo": "gateway-row",
+      "description": "A single connection in the switcher or registry, with transport, health, and latency.",
+      "html": "<button class=\"ds-gateway\"><span class=\"ds-gateway-mark\">›_</span><span class=\"ds-gateway-copy\"><b>Homelab</b><em>SSH · omer@homelab.lan:22</em><span><i></i>在线 · 24 ms · Reachable · HTTP + WS</span></span><span class=\"ds-gateway-check\">✓</span></button>",
+      "css": ".ds-gateway { display:flex; width:100%; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--line, #e2e2db); border-radius:5px; background:var(--paper-raised, #fbfbf8); color:var(--ink, #16181b); text-align:left; cursor:pointer; } .ds-gateway:hover { border-color:var(--line-strong, #c9c9c1); background:#f7f7f4; } .ds-gateway:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:2px; } .ds-gateway-mark { display:grid; place-items:center; width:22px; height:22px; border:1px solid var(--line-strong, #c9c9c1); border-radius:3px; font:500 8px/1 'Spline Sans Mono',monospace; } .ds-gateway-copy { display:grid; flex:1; gap:2px; min-width:0; } .ds-gateway-copy b { font:600 11px/1.2 'Schibsted Grotesk','PingFang SC',sans-serif; } .ds-gateway-copy em { color:var(--faint, #676c73); font:400 7px/1.4 'Spline Sans Mono',monospace; font-style:normal; } .ds-gateway-copy span { display:flex; align-items:center; gap:4px; color:var(--muted, #555a61); font:400 7px/1.4 'Spline Sans Mono',monospace; } .ds-gateway-copy i { width:5px; height:5px; border-radius:50%; background:var(--ok, #376d4a); } .ds-gateway-check { color:var(--faint, #676c73); font:600 10px/1 sans-serif; }"
+    },
+    {
+      "name": "Command Palette Row",
+      "kind": "nav",
+      "refersTo": "palette-row",
+      "description": "One keyboard-selectable command in the ⌘K palette.",
+      "html": "<button class=\"ds-palette-row is-selected\"><span class=\"ds-palette-icon\">⌘</span><span><b>切换 Gateway / Profile</b><em>This device · @default</em></span><span class=\"ds-palette-enter\">↵</span></button>",
+      "css": ".ds-palette-row { display:flex; width:100%; align-items:center; gap:9px; padding:8px 9px; border:0; border-radius:3px; background:transparent; color:var(--ink, #16181b); text-align:left; cursor:pointer; } .ds-palette-row:hover,.ds-palette-row.is-selected { background:var(--paper-deep, #f1f1ed); } .ds-palette-row:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:0; } .ds-palette-icon { display:grid; place-items:center; width:22px; height:22px; border:1px solid var(--line, #e2e2db); border-radius:3px; background:var(--surface, #fff); color:var(--muted, #555a61); font:500 10px/1 'Spline Sans Mono',monospace; } .ds-palette-row > span:nth-child(2) { display:grid; flex:1; gap:2px; } .ds-palette-row b { font:500 10.5px/1.3 'Schibsted Grotesk','PingFang SC',sans-serif; } .ds-palette-row em { color:var(--faint, #676c73); font:400 8px/1.4 'Spline Sans Mono',monospace; font-style:normal; } .ds-palette-enter { color:var(--faint, #676c73); font:500 10px/1 'Spline Sans Mono',monospace; }"
+    },
+    {
+      "name": "Dangerous Approval Card",
+      "kind": "custom",
+      "refersTo": "card-approval",
+      "description": "The protected execution threshold: exact command, target host, and three explicit decisions.",
+      "html": "<section class=\"ds-approval\"><header><span>⚠ 需要批准：清理构建目录</span><em>DANGEROUS</em></header><code>rm -rf ./dist &amp;&amp; pnpm build</code><p>目标主机 Homelab · Profile @research-homelab · 工作目录 ~/hermes-web</p><footer><button class=\"ds-deny\">拒绝</button><button class=\"ds-inspect\">检查</button><button class=\"ds-approve\">批准并运行</button></footer></section>",
+      "css": ".ds-approval { display:grid; gap:9px; padding:9px 10px; border:1px solid var(--accent-line, #e6c1b7); border-radius:7px; background:var(--danger-soft, #fff7f3); color:var(--ink, #16181b); } .ds-approval header { display:flex; align-items:center; justify-content:space-between; gap:12px; color:var(--danger, #9e2d1e); font:600 10px/1.3 'Schibsted Grotesk','PingFang SC',sans-serif; } .ds-approval header em { color:var(--accent-text, #a73826); font:500 7px/1 'Spline Sans Mono',monospace; font-style:normal; letter-spacing:.08em; } .ds-approval code { padding:8px 9px; border:1px solid var(--accent-line, #e6c1b7); border-radius:3px; background:var(--surface, #fff); color:var(--danger, #9e2d1e); font:400 9px/1.4 'Spline Sans Mono',monospace; } .ds-approval p { margin:0; color:var(--faint, #676c73); font:400 7.5px/1.4 'Spline Sans Mono',monospace; } .ds-approval footer { display:flex; justify-content:flex-end; gap:6px; } .ds-approval button { min-height:27px; padding:0 10px; border:1px solid var(--line-strong, #c9c9c1); border-radius:5px; background:var(--surface, #fff); color:var(--ink, #16181b); font:500 10px/1 'Schibsted Grotesk','PingFang SC',sans-serif; cursor:pointer; } .ds-approval .ds-approve { border-color:var(--ink, #16181b); background:var(--ink, #16181b); color:var(--paper, #f7f7f5); } .ds-approval button:focus-visible { outline:2px solid var(--accent, #c8442e); outline-offset:2px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Relay",
+    "overview": "Hermes Desktop is a paper-and-ink operating surface for work that moves between machines. The conversation is the page; everything else waits in the margins. A persistent route string carries execution context as a path, not a badge, so the user can read where the next command will land without scanning a dashboard. The visual world borrows from postal routing slips, dispatch dockets, and technical documentation: thin rules, small measured labels, circled handoff marks, and one postal vermilion accent reserved for the active leg, focus, and the destructive threshold.",
+    "keyCharacteristics": [
+      "Paper-white field, near-black ink, and a single vermilion routing accent.",
+      "A 720px conversation column that stays visually still while scope changes.",
+      "Hairline structure, small radii, and almost no resting shadow.",
+      "Technical labels set in Spline Sans Mono, but never as decoration.",
+      "Local versus remote context readable in text at every width."
+    ],
+    "rules": [
+      {
+        "name": "The Postal Red Rule",
+        "body": "Vermilion occupies less than ten percent of any screen. If it starts filling surfaces, the route has stopped being a signal.",
+        "section": "colors"
+      },
+      {
+        "name": "The Heading Stands Alone Rule",
+        "body": "No kicker or eyebrow above a heading. Context belongs in a neighbouring control, a status line, or the heading's own words.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-At-Rest Rule",
+        "body": "If a surface stays in the document flow, it uses a border or a tonal step, never a shadow. Shadows are reserved for overlays.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Measurement Rule",
+        "body": "Monospace is for code, paths, model names, counts, and latency. It never carries a marketing sentence.",
+        "section": "typography"
+      }
+    ],
+    "dos": [
+      "Do keep the conversation column at 720px and let secondary capability overlay or hide.",
+      "Do repeat execution context in the route string, composer scope line, and status bar.",
+      "Do use postal vermilion for routing, focus, and destructive thresholds only.",
+      "Do pair every status color with a word, icon, or measured value.",
+      "Do preserve terminal scrollback and preview state when the workspace is hidden.",
+      "Do write Chinese UI copy with English Hermes terms kept intact."
+    ],
+    "donts": [
+      "Don't place a kicker or eyebrow above a heading.",
+      "Don't turn the gateway list into a permanent fleet dashboard on the resting screen.",
+      "Don't use a one-sided colored bar as a status device.",
+      "Don't use gradient text, glass decoration, or a zero-offset colored halo as depth.",
+      "Don't use monospace for prose or pack technical labels into every row.",
+      "Don't imply that simulated latency, SSH, Cloud, Telegram, or voice input is live."
+    ]
+  }
+}
