@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" viewBox="0 0 720 300" role="img" aria-labelledby="title desc">
+  <title id="title">Simulated gateway HTTP and WebSocket latency</title>
+  <desc id="desc">A compact vector chart comparing This device, Homelab, VPS-1 and Hermes Cloud. Prototype data only.</desc>
+  <rect width="720" height="300" fill="#f7f7f5"/>
+  <g font-family="Schibsted Grotesk, PingFang SC, sans-serif" fill="#16181b">
+    <text x="32" y="40" font-size="18" font-weight="600">Gateway latency</text>
+    <text x="32" y="61" font-size="10" fill="#767a81">HTTP + WS · five simulated samples</text>
+    <g font-size="9.5" fill="#61656c">
+      <text x="32" y="105">This device</text>
+      <text x="32" y="145">Homelab</text>
+      <text x="32" y="185">VPS-1</text>
+      <text x="32" y="225">Hermes Cloud</text>
+    </g>
+    <g fill="#e1e1da">
+      <rect x="128" y="96" width="486" height="1"/>
+      <rect x="128" y="136" width="486" height="1"/>
+      <rect x="128" y="176" width="486" height="1"/>
+      <rect x="128" y="216" width="486" height="1"/>
+    </g>
+    <g fill="#16181b">
+      <rect x="128" y="92" width="17" height="9"/>
+      <rect x="128" y="132" width="94" height="9"/>
+      <rect x="128" y="172" width="296" height="9"/>
+      <rect x="128" y="212" width="405" height="9"/>
+    </g>
+    <g font-family="Spline Sans Mono, monospace" font-size="9" fill="#61656c">
+      <text x="638" y="101">3 ms</text>
+      <text x="638" y="141">24 ms</text>
+      <text x="638" y="181">86 ms</text>
+      <text x="638" y="221">120 ms</text>
+    </g>
+    <rect x="32" y="260" width="656" height="1" fill="#e1e1da"/>
+    <text x="32" y="281" font-size="9" fill="#767a81">Both legs answered for every connected gateway. Prototype simulation.</text>
+  </g>
+</svg>
