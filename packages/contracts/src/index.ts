@@ -316,6 +316,149 @@ export interface GatewayCapabilitiesSummary {
   supportedActions: SupportedChatActions;
 }
 
+export const CAPABILITY_DOMAIN_IDS = [
+  "chat",
+  "approval",
+  "checkpoint",
+  "profile",
+  "session",
+  "skills",
+  "tools",
+  "mcp",
+  "cron",
+  "files_artifacts",
+  "terminal",
+  "subagents",
+  "settings",
+  "memory",
+  "messaging",
+  "plugins",
+  "git_worktree",
+  "voice",
+  "bots",
+  "memory_graph",
+  "kanban",
+] as const;
+
+export type CapabilityDomainId = (typeof CAPABILITY_DOMAIN_IDS)[number];
+
+export type CapabilityClassification = "native" | "read_only" | "deep_link" | "deferred";
+
+export type CapabilityGroup = "core" | "admin" | "exec" | "deferred";
+
+export type CapabilityRuntimeStatus =
+  | "available"
+  | "read_only"
+  | "degraded"
+  | "deep_link"
+  | "unavailable"
+  | "unknown";
+
+export type CapabilityMethodTier =
+  | "served"
+  | "older"
+  | "refused"
+  | "session_bound"
+  | "plugin_family"
+  | "unknown";
+
+export type CapabilitySource =
+  | "static_local"
+  | "runtime_describe"
+  | "client_capabilities"
+  | "probe"
+  | "alias"
+  | "deep_link"
+  | "deferred"
+  | "fallback";
+
+export interface CapabilityDeepLink {
+  kind: "cli" | "docs";
+  label: string;
+  cliCommand?: string;
+  url?: string;
+}
+
+export type CapabilityDegradationReason =
+  | "older"
+  | "method_not_found"
+  | "missing_server_requests"
+  | "timeout"
+  | "refused"
+  | "unconnected"
+  | "legacy_owner"
+  | "invalidated";
+
+export interface CapabilityDegradation {
+  reason: CapabilityDegradationReason;
+  missingMethods?: string[];
+  detail?: string;
+}
+
+export interface CapabilityEntry {
+  domain: CapabilityDomainId;
+  group: CapabilityGroup;
+  actionId: string;
+  labelKey: string;
+  hintKey?: string;
+  shortcut?: string;
+  classification: CapabilityClassification;
+  runtimeStatus: CapabilityRuntimeStatus;
+  source: CapabilitySource;
+  requiredMethods: string[];
+  handlerId: string;
+  evidenceTestId: string;
+  generation: number;
+  aliasUsed?: string;
+  deepLink?: CapabilityDeepLink;
+  degradation?: CapabilityDegradation;
+}
+
+export interface CapabilityDomainSummary {
+  domain: CapabilityDomainId;
+  group: CapabilityGroup;
+  classification: CapabilityClassification;
+  runtimeStatus: CapabilityRuntimeStatus;
+  labelKey: string;
+  probed: boolean;
+  probeMethod?: string;
+  degradation?: CapabilityDegradation;
+  deepLink?: CapabilityDeepLink;
+}
+
+export interface CapabilitySnapshotKey {
+  connectionId: string;
+  profileId: string;
+  ownerGeneration: number;
+  authorityEpoch: number;
+  gatewayVersionOrSha: string;
+}
+
+export interface CapabilitySnapshot {
+  key: CapabilitySnapshotKey;
+  generation: number;
+  capabilitiesReady: boolean;
+  serverRequestsSupported: boolean;
+  legacyOwner: boolean;
+  sessionCreateSpec?: {
+    sources: string[];
+    parameters: string[];
+  };
+  counts: {
+    total: 21;
+    native: 13;
+    readOnly: 3;
+    deepLink: 1;
+    reachable: 17;
+    deferred: 4;
+  };
+  domains: CapabilityDomainSummary[];
+  entries: CapabilityEntry[];
+  methodTiers: Record<string, CapabilityMethodTier>;
+  invalidatedReason?: string;
+  updatedAt: string;
+}
+
 export interface FleetSnapshot {
   connections: ConnectionHealthSummary[];
   profiles: ProfileSummary[];

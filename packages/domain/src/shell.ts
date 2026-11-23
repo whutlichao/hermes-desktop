@@ -2,6 +2,7 @@ import type {
   AppInfo,
   BridgeEvent,
   BridgeScope,
+  CapabilitySnapshot,
   ConnectionHealthSummary,
   LocalInspectResult,
   ProfileSummary,
@@ -11,6 +12,7 @@ import type {
   WorkspaceMode,
   WorkspaceTab,
 } from "@hermes/contracts";
+import { CapabilityRegistry } from "./capabilityRegistry";
 import { reduceTranscriptEvent } from "./gatewayProtocol";
 
 export type ViewportMode = "rail" | "popover";
@@ -37,6 +39,7 @@ export interface ShellState {
   chatBusy: boolean;
   localInspection: LocalInspectResult | null;
   diagnosticsReport: SanitizedDiagnosticsPayload | null;
+  capabilities: CapabilitySnapshot;
   workspace: {
     mode: WorkspaceMode;
     activeTab: WorkspaceTab;
@@ -61,6 +64,7 @@ export type ShellAction =
   | { type: "SET_CHAT_BUSY"; busy: boolean }
   | { type: "APPLY_LOCAL_INSPECTION"; inspection: LocalInspectResult }
   | { type: "APPLY_DIAGNOSTICS_REPORT"; report: SanitizedDiagnosticsPayload }
+  | { type: "APPLY_CAPABILITIES_SNAPSHOT"; snapshot: CapabilitySnapshot }
   | { type: "OPEN_SURFACE"; surface: OverlaySurface }
   | { type: "CLOSE_TOPMOST_SURFACE" }
   | { type: "CLOSE_SURFACE"; surface: OverlaySurface }
@@ -86,6 +90,7 @@ export function createInitialShellState(): ShellState {
     chatBusy: false,
     localInspection: null,
     diagnosticsReport: null,
+    capabilities: new CapabilityRegistry().getSnapshot(),
     workspace: {
       mode: "closed",
       activeTab: "artifacts",
@@ -146,6 +151,14 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
       return {
         ...state,
         diagnosticsReport: action.report,
+      };
+    case "APPLY_CAPABILITIES_SNAPSHOT":
+      if (action.snapshot.generation < state.capabilities.generation) {
+        return state;
+      }
+      return {
+        ...state,
+        capabilities: action.snapshot,
       };
     case "OPEN_SURFACE": {
       const filtered = state.surfaceStack.filter((item) => item !== action.surface);

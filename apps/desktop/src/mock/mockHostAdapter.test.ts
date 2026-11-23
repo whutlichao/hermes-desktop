@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { BridgeEvent, ConnectionMutationResponse, RegistrySnapshotView } from "@hermes/contracts";
+import type {
+  BridgeEvent,
+  CapabilitySnapshot,
+  ConnectionMutationResponse,
+  RegistrySnapshotView,
+} from "@hermes/contracts";
 import { createMockHostBridge } from "./mockHostAdapter";
 
 describe("MockHostBridge Local first-run contract (Ticket #25)", () => {
@@ -118,6 +123,37 @@ describe("MockHostBridge Ticket #28 chat/session parity", () => {
     expect(retryRes.ok).toBe(true);
     if (retryRes.ok) {
       expect(retryRes.value.ok).toBe(false);
+    }
+
+    unsub();
+  });
+
+  it("supports capabilities.describe envelope and capabilities topic snapshot (S0)", async () => {
+    const mock = createMockHostBridge();
+    const capEvents: BridgeEvent<CapabilitySnapshot>[] = [];
+    const unsub = mock.subscribe("capabilities", null, (ev) =>
+      capEvents.push(ev as BridgeEvent<CapabilitySnapshot>),
+    );
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(capEvents).toHaveLength(1);
+    expect(capEvents[0].topic).toBe("capabilities");
+    expect(capEvents[0].kind).toBe("snapshot");
+    expect(capEvents[0].seq).toBe(0);
+    expect(capEvents[0].payload.counts).toEqual({
+      total: 21,
+      native: 13,
+      readOnly: 3,
+      deepLink: 1,
+      reachable: 17,
+      deferred: 4,
+    });
+
+    const descRes = await mock.request<CapabilitySnapshot>("capabilities.describe", {});
+    expect(descRes.ok).toBe(true);
+    if (descRes.ok) {
+      expect(descRes.value.domains).toHaveLength(21);
+      expect(descRes.value.entries.some((e) => e.classification === "deferred")).toBe(false);
     }
 
     unsub();

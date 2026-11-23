@@ -139,6 +139,18 @@ const connectionSupervisor = new LocalConnectionSupervisor(localBackendManager, 
     registryStore.snapshot().connections.find((conn) => conn.id === "local")?.label ?? "This device",
 });
 
+registryBridge.subscribeRegistry((event) => {
+  if (
+    event.kind === "patch" &&
+    event.payload.diff &&
+    (event.payload.diff.dialMaterialChanged ||
+      event.payload.diff.credentialsChanged ||
+      event.payload.diff.changes.some((c) => c.dialMaterialChanged))
+  ) {
+    connectionSupervisor.invalidateCapabilities("registry_changed");
+  }
+});
+
 function shouldAutoDialLocalOnStartup(): boolean {
   if (process.env.HERMES_LOCAL_AUTO_DIAL === "1") return true;
   if (hermesHomeKind !== "temp") return true;
@@ -321,7 +333,8 @@ app.whenReady().then(async () => {
         args.topic === "sessions" ||
         args.topic === "session.transcript" ||
         args.topic === "prompt" ||
-        args.topic === "activity"
+        args.topic === "activity" ||
+        args.topic === "capabilities"
       ) {
         const unsub = connectionSupervisor.subscribe(args.topic, args.scope ?? null, (bridgeEvent) => {
           if (!event.sender.isDestroyed()) {

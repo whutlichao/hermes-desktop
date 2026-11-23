@@ -8,6 +8,9 @@ import {
 import type {
   AppCommand,
   BridgeScope,
+  CapabilityDomainId,
+  CapabilityEntry,
+  CapabilitySnapshot,
   FleetSnapshot,
   LocalInspectResult,
   LocalSafeActionId,
@@ -32,12 +35,15 @@ import {
   shellReducer,
 } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
+import { CapabilitiesDrawer } from "./components/CapabilitiesDrawer";
 import { ChatThread } from "./components/ChatThread";
+import { CommandPalette } from "./components/CommandPalette";
 import { DiagnosticsModal } from "./components/DiagnosticsModal";
 import { GatewaysSettings } from "./components/GatewaysSettings";
 import { HermesMark } from "./components/HermesMark";
 import { FocusDialog } from "./components/Modal";
 import { SessionRailList } from "./components/SessionRail";
+import { createCapabilityHandlers } from "./components/capabilityHandlers";
 
 const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string }> = [
   { id: "artifacts", label: "Artifacts" },
@@ -60,6 +66,7 @@ export default function App() {
   const trackerRef = useRef(createSequenceTracker());
   const registryTrackerRef = useRef(createSequenceTracker());
   const transcriptTrackerRef = useRef(createSequenceTracker());
+  const capabilitiesTrackerRef = useRef(createSequenceTracker());
 
   const viewportMode = deriveViewportMode(viewportWidth);
   const topmostSurface = getTopmostSurface(state);
@@ -287,6 +294,11 @@ export default function App() {
       dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: res.value });
     });
 
+    void host.request<CapabilitySnapshot>("capabilities.describe", {}).then((res) => {
+      if (!active || !res.ok) return;
+      dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+    });
+
     const unsubFleet = host.subscribe("fleet", null, (event) => {
       const accepted = trackerRef.current.accept(event);
       if (accepted.status === "applied") {
@@ -312,11 +324,31 @@ export default function App() {
       }
     });
 
+    const unsubCapabilities = host.subscribe("capabilities", null, (event) => {
+      const accepted = capabilitiesTrackerRef.current.accept(event);
+      if (accepted.status === "resync_required") {
+        capabilitiesTrackerRef.current.reset();
+        void host.request<CapabilitySnapshot>("capabilities.describe", {}).then((res) => {
+          if (active && res.ok) {
+            dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+          }
+        });
+        return;
+      }
+      if (accepted.status === "applied") {
+        dispatch({
+          type: "APPLY_CAPABILITIES_SNAPSHOT",
+          snapshot: event.payload as CapabilitySnapshot,
+        });
+      }
+    });
+
     const unsubCmd = host.onCommand(handleAppCommand);
     return () => {
       active = false;
       unsubFleet();
       unsubRegistry();
+      unsubCapabilities();
       unsubCmd();
     };
   }, [handleAppCommand]);
@@ -404,70 +436,94 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleAppCommand, state.appInfo?.mode, state.surfaceStack.length, state.workspace.mode]);
 
-  const paletteCommands = useMemo(
-    () => [
-      {
-        id: "cmd-new-session",
-        label: getCopy("palette.cmdNewSession"),
-        hint: getCopy("palette.cmdNewSessionHint"),
-        shortcut: "⌘N",
-        run: () => {
-          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
-          handleAppCommand({ type: "new_session" });
-        },
-      },
-      {
-        id: "cmd-settings",
-        label: getCopy("palette.cmdSettings"),
-        hint: getCopy("palette.cmdSettingsHint"),
-        shortcut: "⌘,",
-        run: () => {
-          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
-          handleAppCommand({ type: "open_settings" });
-        },
-      },
-      {
-        id: "cmd-workspace",
-        label: getCopy("palette.cmdWorkspace"),
-        hint: getCopy("palette.cmdWorkspaceHint"),
-        shortcut: "⌘B",
-        run: () => {
-          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
-          handleAppCommand({ type: "toggle_workspace" });
-        },
-      },
-      {
-        id: "cmd-capabilities",
-        label: getCopy("palette.cmdCapabilities"),
-        hint: getCopy("palette.cmdCapabilitiesHint"),
-        shortcut: "",
-        run: () => {
-          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
-          dispatch({ type: "OPEN_SURFACE", surface: "capabilities" });
-        },
-      },
-      {
-        id: "cmd-shortcuts",
-        label: getCopy("palette.cmdShortcuts"),
-        hint: getCopy("palette.cmdShortcutsHint"),
-        shortcut: "⌘?",
-        run: () => {
-          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
-          handleAppCommand({ type: "open_shortcuts" });
-        },
-      },
-    ],
-    [handleAppCommand],
+  const handleProbeDomain = useCallback(
+    async (domain: CapabilityDomainId) => {
+      dispatch({ type: "ANNOUNCE", message: getCopy("capabilities.probing") });
+      const res = await host.request<CapabilitySnapshot>(
+        "capabilities.describe",
+        { domain },
+        effectiveScope,
+      );
+      if (res.ok) {
+        dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+      }
+    },
+    [effectiveScope],
   );
 
-  const filteredCommands = useMemo(() => {
-    const q = paletteQuery.trim().toLowerCase();
-    if (!q) return paletteCommands;
-    return paletteCommands.filter(
-      (item) =>
-        item.label.toLowerCase().includes(q) || item.hint.toLowerCase().includes(q),
-    );
-  }, [paletteCommands, paletteQuery]);
+  const capabilityHandlers = useMemo(
+    () =>
+      createCapabilityHandlers({
+        focusComposer: () => {
+          composerRef.current?.focus();
+        },
+        stopTurn: handleStopTurn,
+        inspectApproval: async (_entry: CapabilityEntry) => {
+          await handleProbeDomain("approval");
+          dispatch({ type: "OPEN_SURFACE", surface: "capabilities" });
+        },
+        createSession: handleCreateSession,
+        openSessions: () => {
+          if (viewportMode === "popover") {
+            dispatch({ type: "OPEN_SURFACE", surface: "sessionsPopover" });
+          } else {
+            dispatch({ type: "ANNOUNCE", message: getCopy("nav.sessionsTab") });
+          }
+        },
+        resumeActiveSession: async () => {
+          const firstSession = scopedSessions[0];
+          if (firstSession) {
+            await handleSelectSession(firstSession);
+          } else {
+            dispatch({ type: "ANNOUNCE", message: getCopy("nav.sessionsEmptyTitle") });
+          }
+        },
+        copyCli: async (entry: CapabilityEntry) => {
+          const cmd = entry.deepLink?.cliCommand;
+          if (cmd && navigator.clipboard?.writeText) {
+            try {
+              await navigator.clipboard.writeText(cmd);
+            } catch {
+              // Ignore clipboard rejection in restricted contexts
+            }
+          }
+          dispatch({
+            type: "ANNOUNCE",
+            message: cmd ? `${getCopy("capabilities.copiedCliNotice")}: ${cmd}` : getCopy("capabilities.copiedCliNotice"),
+          });
+        },
+        openWorkspaceTab: (tab) => {
+          dispatch({ type: "SET_WORKSPACE_MODE", mode: "open" });
+          dispatch({ type: "SET_WORKSPACE_TAB", tab });
+        },
+        toggleWorkspace: () => {
+          handleAppCommand({ type: "toggle_workspace" });
+        },
+        openSettings: () => {
+          handleAppCommand({ type: "open_settings" });
+        },
+        openCapabilities: () => {
+          dispatch({ type: "OPEN_SURFACE", surface: "capabilities" });
+          dispatch({ type: "ANNOUNCE", message: getCopy("capabilities.title") });
+        },
+        openShortcuts: () => {
+          handleAppCommand({ type: "open_shortcuts" });
+        },
+        openScopePopover: () => {
+          dispatch({ type: "OPEN_SURFACE", surface: "scopePopover" });
+        },
+        probeDomain: handleProbeDomain,
+      }),
+    [
+      handleAppCommand,
+      handleCreateSession,
+      handleProbeDomain,
+      handleSelectSession,
+      handleStopTurn,
+      scopedSessions,
+      viewportMode,
+    ],
+  );
 
   const handleLocalAction = useCallback(async (action: LocalSafeActionId) => {
     setLocalBusy(true);
@@ -804,43 +860,19 @@ export default function App() {
       </div>
 
       {/* Modal surfaces live outside the inert app shell */}
-      <FocusDialog
+      <CommandPalette
         open={state.surfaceStack.includes("palette")}
-        title={getCopy("palette.title")}
-        closeLabel={getCopy("shortcuts.close")}
-        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "palette" })}
-      >
-        <label htmlFor="palette-search-input" className="sr-only">
-          {getCopy("palette.placeholder")}
-        </label>
-        <input
-          id="palette-search-input"
-          className="palette-search"
-          value={paletteQuery}
-          onChange={(event) => setPaletteQuery(event.target.value)}
-          placeholder={getCopy("palette.placeholder")}
-        />
-        {filteredCommands.length === 0 ? (
-          <p>{getCopy("palette.empty")}</p>
-        ) : (
-          filteredCommands.map((cmd) => (
-            <button
-              key={cmd.id}
-              type="button"
-              className="palette-item"
-              onClick={cmd.run}
-            >
-              <span>
-                <strong>{cmd.label}</strong>
-                <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
-                  {cmd.hint}
-                </span>
-              </span>
-              {cmd.shortcut && <kbd className="kbd">{cmd.shortcut}</kbd>}
-            </button>
-          ))
-        )}
-      </FocusDialog>
+        query={paletteQuery}
+        entries={state.capabilities.entries}
+        countsSummary={getCopy("capabilities.countsLine")}
+        handlers={capabilityHandlers}
+        onQueryChange={setPaletteQuery}
+        onClose={() => {
+          setPaletteQuery("");
+          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
+        }}
+        onAnnounce={(message) => dispatch({ type: "ANNOUNCE", message })}
+      />
 
       <FocusDialog
         open={state.surfaceStack.includes("settings")}
@@ -875,16 +907,12 @@ export default function App() {
         </section>
       </FocusDialog>
 
-      <FocusDialog
+      <CapabilitiesDrawer
         open={state.surfaceStack.includes("capabilities")}
-        title={getCopy("capabilities.title")}
-        description={getCopy("capabilities.summary")}
-        closeLabel={getCopy("capabilities.close")}
+        snapshot={state.capabilities}
+        handlers={capabilityHandlers}
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "capabilities" })}
-      >
-        <p>{getCopy("empty.body")}</p>
-        <div className="deferred-footnote">{getCopy("capabilities.deferredFootnote")}</div>
-      </FocusDialog>
+      />
 
       <FocusDialog
         open={state.surfaceStack.includes("shortcuts")}

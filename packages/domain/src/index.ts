@@ -5,3 +5,4 @@ export * from "./localBackend";
 export * from "./registry";
 export * from "./appInfo";
 export * from "./gatewayProtocol";
+export * from "./capabilityRegistry";

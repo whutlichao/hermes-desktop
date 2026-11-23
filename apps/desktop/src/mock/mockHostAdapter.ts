@@ -6,6 +6,7 @@ import {
   type BridgeEvent,
   type BridgeResult,
   type BridgeScope,
+  type CapabilitySnapshot,
   type ConnectionMutationInput,
   type ConnectionMutationResponse,
   type FleetSnapshot,
@@ -20,6 +21,7 @@ import {
   type RegistrySnapshotView,
 } from "@hermes/contracts";
 import {
+  CapabilityRegistry,
   createBridgeDispatcher,
   createEmptyRegistryDocument,
   diffRegistries,
@@ -119,6 +121,7 @@ function isSafeExternalHttpUrl(rawUrl: string): boolean {
 export function createMockHostBridge(): HermesHost {
   let reqSeq = 0;
   const commandListeners = new Set<(cmd: AppCommand) => void>();
+  const capabilityRegistry = new CapabilityRegistry();
   const mockAppInfo = createMockAppInfo();
   const currentInspection = createInitialMockInspection();
 
@@ -434,6 +437,7 @@ export function createMockHostBridge(): HermesHost {
       inspection: currentInspection,
     }),
     "local.diagnose": async (): Promise<SanitizedDiagnosticsPayload> => buildMockDiagnostics(),
+    "capabilities.describe": async (): Promise<CapabilitySnapshot> => capabilityRegistry.getSnapshot(),
     "diagnostics.export": async () => ({
       ...buildMockDiagnostics(),
       appInfo: mockAppInfo,
@@ -508,6 +512,17 @@ export function createMockHostBridge(): HermesHost {
             seq: 0,
             revision: 1,
             payload: { sessions: EMPTY_FLEET.sessions },
+          });
+        });
+      } else if (topic === "capabilities") {
+        queueMicrotask(() => {
+          listener({
+            topic: "capabilities",
+            scope: null,
+            kind: "snapshot",
+            seq: 0,
+            revision: 1,
+            payload: capabilityRegistry.getSnapshot(),
           });
         });
       } else if (topic === "registry") {
