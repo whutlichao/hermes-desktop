@@ -1005,3 +1005,37 @@ export function lintCopyCatalog(catalog: Record<string, string>): TerminologyVio
   }
   return violations;
 }
+
+export interface CopyLintSourceFile {
+  path: string;
+  content: string;
+}
+
+const VISIBLE_ERROR_LITERAL =
+  /(?:makeTurnError|makeBridgeError|new Error)\s*\([\s\S]{0,240}?(["'`])((?:\\.|(?!\1)[^\\])*?[\u4e00-\u9fff](?:\\.|(?!\1)[^\\])*?)\1/g;
+
+export function lintVisibleErrorLiterals(
+  files: readonly CopyLintSourceFile[],
+  allowedCounts: Readonly<Record<string, Readonly<Record<string, number>>>>,
+): TerminologyViolation[] {
+  const violations: TerminologyViolation[] = [];
+  for (const file of files) {
+    const counts = new Map<string, number>();
+    for (const match of file.content.matchAll(VISIBLE_ERROR_LITERAL)) {
+      const literal = match[2] ?? "";
+      if (!literal || literal.includes("\n")) continue;
+      counts.set(literal, (counts.get(literal) ?? 0) + 1);
+    }
+    for (const [literal, count] of counts) {
+      const allowed = allowedCounts[file.path]?.[literal] ?? 0;
+      if (count > allowed) {
+        violations.push({
+          key: file.path,
+          reason: `用户可见错误文案必须来自 copy catalog（新增 ${count - allowed} 处）`,
+          text: literal,
+        });
+      }
+    }
+  }
+  return violations;
+}

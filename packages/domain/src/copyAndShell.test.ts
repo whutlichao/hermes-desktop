@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   COPY_CATALOG,
@@ -6,9 +9,85 @@ import {
   getCopy,
   getTopmostSurface,
   lintCopyCatalog,
+  lintVisibleErrorLiterals,
   shellReducer,
   validateTerminology,
 } from "@hermes/domain";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const LEGACY_VISIBLE_ERROR_LITERALS = {
+  "apps/desktop/src/main/chatSessionStateStore.ts": {
+    "当前 Draft 体积超过 1 MiB 上限，请清理部分内容或导出后缩减。": 1,
+  },
+  "apps/desktop/src/main/connectionSupervisor.ts": {
+    "Gateway 尚未就绪": 1,
+    "应用正在退出": 1,
+    "当前 Gateway 未提供此能力": 1,
+    "Gateway 连接中断或超时": 1,
+    "Gateway 执行请求失败": 1,
+    "请求失败": 1,
+    "请填写任务名称、Cron 表达式与执行提示词": 1,
+    "当前 Gateway 不支持新建 Cron 任务": 1,
+    "缺少 Cron 任务 ID": 2,
+    "当前 Gateway 不支持取消 Cron 任务": 1,
+    "当前 Gateway 不支持恢复 Cron 任务": 1,
+    "缺少目标 Session": 3,
+    "当前 Gateway 不支持新建 Session": 1,
+    "请输入对话内容后再发送": 1,
+    "当前 Gateway 不支持发送对话": 2,
+    "当前没有可停止的 Turn": 1,
+    "当前 Gateway 不支持停止当前 Turn": 1,
+    "请输入内容后再排队": 1,
+    "缺少排队 admissionId": 1,
+    "当前 Gateway 不支持取消排队": 1,
+    "缺少补充指令内容": 1,
+    "当前 Gateway 不支持中途纠偏": 1,
+    "当前 Gateway 已拒绝 Subagents 能力": 1,
+    "未选择要查看 Tail 的 Subagent": 1,
+    "当前 Gateway 未提供 Subagent Tail 能力": 1,
+    "请输入针对该 Subagent 的补充指令": 1,
+    "当前 Gateway 不支持 Subagent 补充指令": 1,
+    "未选择要停止的 Subagent": 1,
+    "当前 Gateway 不支持停止 Subagent": 1,
+    "Gateway 未确认停止该 Subagent，当前运行状态保持不变": 1,
+    "当前 Gateway 未提供 Checkpoint 列表能力": 1,
+    "未选择要对比的 Checkpoint": 1,
+    "当前 Gateway 未提供 Checkpoint Diff 能力": 1,
+    "恢复 Checkpoint 需要显式确认": 1,
+    "当前 Gateway 未提供 rollback.restore 能力，仅支持只读浏览与 Diff 对比": 1,
+    "Gateway 未能恢复到所选 Checkpoint": 1,
+    "不支持更新该配置项": 1,
+    "当前 Gateway 拒绝更新配置": 1,
+    "当前 Gateway 未提供 config.update 能力": 1,
+    "更新配置失败": 1,
+    "当前 Gateway 未连接，无法校验待处理 Approval": 1,
+    "所属 Gateway 连接代次已变更，旧 Approval 已失效": 1,
+  },
+  "apps/desktop/src/main/registryBridge.ts": {
+    "OAuth 授权管理器不可用": 1,
+  },
+  "packages/domain/src/turnRecoveryCoordinator.ts": {
+    "当前 Session 没有待处理的丢失 Turn": 1,
+    "丢失 Turn 的 admission_id 不匹配": 1,
+    "丢失 Turn 的 execution_generation 不匹配": 1,
+    "正在放弃丢失的 Turn，请等待完成": 1,
+    "Gateway 未确认放弃丢失 Turn": 1,
+    "当前没有运行中的 Turn 可停止": 1,
+    "目标 Turn 的 Execution 代际已变更，无法跨代际停止": 1,
+    "请输入内容后再排队": 1,
+    "未找到待重试的排队记录": 1,
+    "未找到目标排队条目": 2,
+  },
+} as const;
+
+function collectSourceFiles(directory: string): string[] {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) return collectSourceFiles(absolute);
+    if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) return [];
+    return [absolute];
+  });
+}
 
 describe("zh-CN copy catalog & terminology lint", () => {
   it("contains zero missing/raw keys and passes terminology lint", () => {
@@ -28,6 +107,31 @@ describe("zh-CN copy catalog & terminology lint", () => {
     expect(validateTerminology("确定")).not.toEqual([]);
     expect(validateTerminology("取消")).not.toEqual([]);
     expect(validateTerminology("在当前 Scope 新建 Session")).toEqual([]);
+  });
+
+  it("rejects new user-visible error literals in Main/domain unless they use the copy catalog", () => {
+    const sourceFiles = [
+      ...collectSourceFiles(path.join(REPO_ROOT, "apps/desktop/src/main")),
+      ...collectSourceFiles(path.join(REPO_ROOT, "packages/domain/src")),
+    ]
+      .filter((file) => file !== path.join(REPO_ROOT, "packages/domain/src/copy.ts"))
+      .map((file) => ({
+        path: path.relative(REPO_ROOT, file).split(path.sep).join("/"),
+        content: fs.readFileSync(file, "utf8"),
+      }));
+
+    expect(lintVisibleErrorLiterals(sourceFiles, LEGACY_VISIBLE_ERROR_LITERALS)).toEqual([]);
+    expect(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/newSurface.ts",
+            content: 'throw makeBridgeError("invalid_request", "新的未入目录错误");',
+          },
+        ],
+        LEGACY_VISIBLE_ERROR_LITERALS,
+      ),
+    ).toHaveLength(1);
   });
 });
 
@@ -186,10 +290,12 @@ describe("Quiet Relay shell state & layout invariants", () => {
     expect(getCopy("cron.title")).toBe("Cron 定时任务");
   });
 
-  it("starts with an empty polite live region and dedupes the same event id without dropping new events", () => {
+  it("starts with empty polite/assertive live regions and dedupes each event id independently", () => {
     let state = createInitialShellState();
     expect(state.liveAnnouncement).toBe("");
     expect(state.liveAnnouncementEventId).toBeNull();
+    expect(state.assertiveAnnouncement).toBe("");
+    expect(state.assertiveAnnouncementEventId).toBeNull();
 
     state = shellReducer(state, {
       type: "ANNOUNCE",
