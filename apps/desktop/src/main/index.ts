@@ -11,8 +11,9 @@ import {
 import { createBridgeDispatcher, formatAppInfoDisplay, validateHostTopic } from "@hermes/domain";
 import { createMainAppInfo, type EmbeddedBuildMeta } from "./appInfo";
 import { ChatSessionStateStore } from "./chatSessionStateStore";
-import { LocalConnectionSupervisor } from "./connectionSupervisor";
+import { ConnectionSupervisor } from "./connectionSupervisor";
 import { LocalBackendManager, createNodeLocalBackendPorts } from "./localBackendManager";
+import { RemoteAuthManager } from "./remoteGateway";
 import {
   buildAppMenuSpec,
   buildCspHeader,
@@ -40,7 +41,6 @@ const registryStore = new RegistryStore({
   allowRealHome: sandbox.isRealHomeAllowed,
 });
 registryStore.startWatching();
-const registryBridge = createRegistryBridgeHandlers(registryStore);
 const activeSubscriptions = new Map<string, () => void>();
 
 const embeddedBuildMeta =
@@ -148,10 +148,43 @@ const chatSessionStateStore = new ChatSessionStateStore({
   userDataDir: sandbox.userDataDir,
   allowRealHome: sandbox.isRealHomeAllowed,
 });
-const connectionSupervisor = new LocalConnectionSupervisor(localBackendManager, {
+let connectionSupervisor: ConnectionSupervisor;
+const remoteAuthManager = new RemoteAuthManager({
+  registryStore,
+  openExternal: async (targetUrl) => {
+    if (!isAllowedExternalUrl(targetUrl)) {
+      const err = new Error("Unsupported URL scheme");
+      (err as { code?: string }).code = "permission_denied";
+      throw err;
+    }
+    await shell.openExternal(targetUrl);
+  },
+  onConnectionAuthorized: (connectionId) => {
+    void connectionSupervisor?.connectRemote(connectionId, {
+      forceReconnect: true,
+      activate: true,
+    });
+  },
+});
+connectionSupervisor = new ConnectionSupervisor(localBackendManager, {
   getLocalLabel: () =>
     registryStore.snapshot().connections.find((conn) => conn.id === "local")?.label ?? "This device",
+  registryStore,
+  authManager: remoteAuthManager,
   chatSessionStateStore,
+});
+const registryBridge = createRegistryBridgeHandlers(registryStore, {
+  authManager: remoteAuthManager,
+  onConnectionCommitted: ({ action, connectionId, snapshot, activate }) => {
+    const conn = snapshot.connections.find((c) => c.id === connectionId);
+    if (!conn || conn.kind !== "remote" || !conn.dialable) return;
+    if (action === "add" || activate) {
+      void connectionSupervisor.connectRemote(connectionId, {
+        forceReconnect: true,
+        activate: true,
+      });
+    }
+  },
 });
 
 registryBridge.subscribeRegistry((event) => {
@@ -363,6 +396,13 @@ app.whenReady().then(async () => {
           }
         });
         activeSubscriptions.set(args.subscriptionId, unsub);
+      } else if (args.topic === "auth.state") {
+        const unsub = registryBridge.subscribeAuthState((authEvent) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send("hermes:event", args.subscriptionId, authEvent);
+          }
+        });
+        activeSubscriptions.set(args.subscriptionId, unsub);
       } else if (
         args.topic === "fleet" ||
         args.topic === "connection.health" ||
@@ -413,6 +453,7 @@ app.whenReady().then(async () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  remoteAuthManager.dispose();
   for (const unsub of activeSubscriptions.values()) {
     unsub();
   }

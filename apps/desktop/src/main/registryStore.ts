@@ -230,6 +230,7 @@ export class RegistryStore {
   private lastOAuthIds = new Set<string>();
   private readOnlyReason: "registry_corrupt" | "registry_unsupported" | "registry_unavailable" | undefined;
   private stickyIssues: RegistryIssue[] = [];
+  private tokenSyncFailedIds = new Set<string>();
   private hadFileOnDisk = false;
   private pendingPreDropRaw: string | null = null;
   private preDropWrittenForHash: string | null = null;
@@ -471,10 +472,46 @@ export class RegistryStore {
     }
   }
 
+  private getCombinedExtraIssues(): RegistryIssue[] {
+    const syncIssues: RegistryIssue[] = [...this.tokenSyncFailedIds].map((connectionId) => ({
+      code: "token_sync_failed",
+      severity: "warning",
+      connectionId,
+      messageKey: "registry.issue.tokenSyncFailed",
+    }));
+    return [...this.stickyIssues, ...syncIssues];
+  }
+
+  markTokenSyncFailed(connectionId: string): void {
+    if (!connectionId || this.disposed) return;
+    if (this.tokenSyncFailedIds.has(connectionId)) return;
+    const prevIssues = this.getCombinedExtraIssues();
+    this.tokenSyncFailedIds.add(connectionId);
+    const nextIssues = this.getCombinedExtraIssues();
+    const diff = diffRegistries(this.lastNormalized, this.lastNormalized, {
+      extraPrevIssues: prevIssues,
+      extraNextIssues: nextIssues,
+    });
+    this.emit({ snapshot: this.snapshot(), diff, reason: "mutation" });
+  }
+
+  clearTokenSyncFailed(connectionId: string): void {
+    if (!connectionId || !this.tokenSyncFailedIds.has(connectionId)) return;
+    const prevIssues = this.getCombinedExtraIssues();
+    this.tokenSyncFailedIds.delete(connectionId);
+    if (this.disposed) return;
+    const nextIssues = this.getCombinedExtraIssues();
+    const diff = diffRegistries(this.lastNormalized, this.lastNormalized, {
+      extraPrevIssues: prevIssues,
+      extraNextIssues: nextIssues,
+    });
+    this.emit({ snapshot: this.snapshot(), diff, reason: "mutation" });
+  }
+
   snapshot(): RegistrySnapshotView {
     return projectRegistrySnapshot(this.lastNormalized, {
       oauthTokenIds: this.lastOAuthIds,
-      extraIssues: this.stickyIssues,
+      extraIssues: this.getCombinedExtraIssues(),
       readOnly: Boolean(this.readOnlyReason),
       readOnlyReason: this.readOnlyReason,
     });
@@ -560,6 +597,7 @@ export class RegistryStore {
         };
       }
       const nextConnections = currentDoc.connections.filter((c) => c.id !== connectionId);
+      this.tokenSyncFailedIds.delete(connectionId);
       return {
         ok: true,
         nextDoc: {
@@ -845,6 +883,9 @@ export class RegistryStore {
 
           const prevNorm = this.lastNormalized;
           this.lastNormalized = currentNorm;
+          if (conn) {
+            this.tokenSyncFailedIds.delete(conn.id);
+          }
           const diff = diffRegistries(prevNorm, this.lastNormalized, {
             credentialsChanged: tokenResult,
           });

@@ -37,6 +37,7 @@ export const HOST_COMMANDS = [
   "connections.exportSafeSummary",
   "registry.refresh",
   "profiles.list",
+  "scopes.switch",
   "auth.start",
   "auth.cancel",
   "sessions.list",
@@ -788,6 +789,7 @@ export interface ConnectionMutationInput {
   authMode?: RemoteAuthMode;
   token?: string;
   clearToken?: boolean;
+  authSessionId?: string;
   headers?: Record<string, string>;
   host?: string;
   user?: string;
@@ -797,6 +799,57 @@ export interface ConnectionMutationInput {
   remoteProfile?: string;
   org?: string;
   name?: string;
+}
+
+export type RemoteTestActionId =
+  | "edit_endpoint"
+  | "edit_auth"
+  | "retry_test"
+  | "reauthorize_oauth"
+  | "save_connection";
+
+export type RemoteTestLegOutcome = "ok" | "failed" | "skipped";
+
+export interface RemoteTestLegResult {
+  ok: boolean;
+  status: RemoteTestLegOutcome;
+  statusCode?: number;
+  latencyMs?: number;
+  errorCode?: ErrorCode;
+  messageKey?: string;
+}
+
+export interface RemoteTestResult {
+  ok: boolean;
+  kind: ConnectionKind;
+  originDisplay?: string;
+  authMode?: RemoteAuthMode;
+  httpLeg: RemoteTestLegResult;
+  wsLeg: RemoteTestLegResult;
+  failedStage?: "validation" | "http" | "auth" | "ws";
+  errorCode?: ErrorCode;
+  messageKey?: string;
+  actions: RemoteTestActionId[];
+  checkedAt: string;
+}
+
+export type AuthFlowStatus = "waiting" | "granted" | "cancelled" | "failed";
+
+export interface AuthStateSnapshot {
+  authSessionId: string;
+  connectionId?: string;
+  originDisplay?: string;
+  status: AuthFlowStatus;
+  errorCode?: ErrorCode;
+  messageKey?: string;
+  updatedAt: string;
+}
+
+export type AuthStartResult = AuthStateSnapshot;
+
+export interface AuthCancelResult {
+  cancelled: boolean;
+  snapshot: AuthStateSnapshot;
 }
 
 export interface ConnectionMutationResponse {

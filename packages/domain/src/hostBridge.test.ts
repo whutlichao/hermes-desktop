@@ -209,6 +209,28 @@ describe("HostBridge v1 contracts & invariants", () => {
     });
     expect(originCheck.originDisplay).toBe("https://vps.example.com/v1");
     expect(originCheck.hostDisplay).toBe("[REDACTED_URL]");
+
+    const oauthCheck = redactSensitiveData({
+      authSessionId: "auth-1",
+      status: "granted",
+      accessToken: "oauth-access-secret",
+      refreshToken: "oauth-refresh-secret",
+      codeVerifier: "pkce-verifier-secret",
+      authCode: "auth-code-secret",
+      clientSecret: "client-secret-xyz",
+      oauthTokenSet: { accessToken: "nested-oauth", tokenType: "Bearer" },
+      idToken: "jwt-id-secret",
+    });
+    const oauthSerialized = JSON.stringify(oauthCheck);
+    expect(oauthSerialized).not.toContain("oauth-access-secret");
+    expect(oauthSerialized).not.toContain("oauth-refresh-secret");
+    expect(oauthSerialized).not.toContain("pkce-verifier-secret");
+    expect(oauthSerialized).not.toContain("auth-code-secret");
+    expect(oauthSerialized).not.toContain("client-secret-xyz");
+    expect(oauthSerialized).not.toContain("nested-oauth");
+    expect(oauthSerialized).not.toContain("jwt-id-secret");
+    expect(oauthCheck.status).toBe("granted");
+    expect(oauthCheck.authSessionId).toBe("auth-1");
   });
 
   it("enforces snapshot (seq:0) -> monotonic seq patch -> gap resync_required", () => {

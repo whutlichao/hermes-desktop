@@ -38,6 +38,9 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("settings modal");
     await settingsDialog.getByRole("button", { name: "添加连接" }).click();
     await checkAxe("settings gateways add form");
+    await settingsDialog.getByLabel("Gateway 地址").fill("https://ws-fail.example.com");
+    await settingsDialog.getByRole("button", { name: "测试连接" }).click();
+    await checkAxe("settings remote wizard test failure card");
     await page.keyboard.press("Escape");
 
     // Capabilities drawer

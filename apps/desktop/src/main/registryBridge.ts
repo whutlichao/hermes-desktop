@@ -1,13 +1,17 @@
 import type {
+  AuthStateSnapshot,
   BridgeEvent,
   ConnectionMutationInput,
   ConnectionMutationResponse,
   LaunchMode,
   RegistryDiff,
+  RegistryIssue,
   RegistrySnapshotView,
 } from "@hermes/contracts";
 import type { HostCommandHandler } from "@hermes/domain";
+import type { GatewayClientTlsOptions } from "./gatewayClient";
 import type { RegistryMutationResult, RegistryStore } from "./registryStore";
+import { type RemoteAuthManager, testRemoteConnection } from "./remoteGateway";
 
 function toMutationResponse(result: RegistryMutationResult): ConnectionMutationResponse {
   if (result.ok) {
@@ -37,6 +41,7 @@ function asConnectionInput(payload: Record<string, unknown>): ConnectionMutation
     url: typeof payload.url === "string" ? payload.url : undefined,
     authMode: payload.authMode === "oauth" ? "oauth" : payload.authMode === "token" ? "token" : undefined,
     token: typeof payload.token === "string" ? payload.token : undefined,
+    authSessionId: typeof payload.authSessionId === "string" ? payload.authSessionId : undefined,
     clearToken: Boolean(payload.clearToken),
     host: typeof payload.host === "string" ? payload.host : undefined,
     user: typeof payload.user === "string" ? payload.user : undefined,
@@ -55,20 +60,135 @@ export interface RegistryBridgePayload {
   diff?: RegistryDiff;
 }
 
-export function createRegistryBridgeHandlers(store: RegistryStore) {
+export interface RegistryBridgeDeps {
+  authManager?: RemoteAuthManager;
+  tls?: GatewayClientTlsOptions;
+  onConnectionCommitted?: (params: {
+    action: "add" | "update";
+    connectionId: string;
+    snapshot: RegistrySnapshotView;
+    activate?: boolean;
+  }) => void;
+}
+
+export function createRegistryBridgeHandlers(
+  store: RegistryStore,
+  deps?: RegistryBridgeDeps,
+) {
+  const bindOAuthTokenAfterCommit = (
+    connectionId: string,
+    input: ConnectionMutationInput,
+    baseSnapshot: RegistrySnapshotView,
+    baseWarnings: RegistryIssue[],
+  ): { snapshot: RegistrySnapshotView; warnings: RegistryIssue[] } => {
+    const conn = baseSnapshot.connections.find((c) => c.id === connectionId);
+    if (!conn || conn.kind !== "remote") {
+      return { snapshot: baseSnapshot, warnings: baseWarnings };
+    }
+    if (input.authMode === "token" && input.token) {
+      store.clearTokenSyncFailed(connectionId);
+      return { snapshot: store.snapshot(), warnings: baseWarnings };
+    }
+    if (input.authMode === "oauth" && input.authSessionId && deps?.authManager) {
+      const pending = deps.authManager.consumePendingToken(
+        input.authSessionId,
+        conn.originDisplay ?? undefined,
+      );
+      if (pending) {
+        const secretRes = store.writeSecret({
+          kind: "oauth",
+          connectionId,
+          baseUrl: pending.origin,
+          tokenSet: pending.tokenSet,
+        });
+        if (!secretRes.ok) {
+          store.markTokenSyncFailed(connectionId);
+          return {
+            snapshot: store.snapshot(),
+            warnings: [
+              ...baseWarnings,
+              {
+                code: "token_sync_failed",
+                severity: "warning",
+                connectionId,
+                messageKey: "registry.issue.tokenSyncFailed",
+              },
+            ],
+          };
+        }
+        store.clearTokenSyncFailed(connectionId);
+        return { snapshot: secretRes.snapshot, warnings: baseWarnings };
+      }
+    }
+    return { snapshot: baseSnapshot, warnings: baseWarnings };
+  };
+
   const handlers: Record<string, HostCommandHandler> = {
     "connections.list": async () => {
       const registry = store.snapshot();
       return { connections: registry.connections, registry };
     },
+    "connections.test": async (payload) => {
+      return testRemoteConnection({
+        input: {
+          kind: typeof payload.kind === "string" ? payload.kind : "remote",
+          url: typeof payload.url === "string" ? payload.url : "",
+          authMode: payload.authMode === "oauth" ? "oauth" : "token",
+          token: typeof payload.token === "string" ? payload.token : undefined,
+          authSessionId: typeof payload.authSessionId === "string" ? payload.authSessionId : undefined,
+          connectionId: typeof payload.connectionId === "string" ? payload.connectionId : undefined,
+        },
+        registryStore: store,
+        authManager: deps?.authManager,
+        tls: deps?.tls,
+      });
+    },
     "connections.add": async (payload) => {
-      const res = store.add(asConnectionInput(payload));
-      return toMutationResponse(res);
+      const prevIds = new Set(store.snapshot().connections.map((c) => c.id));
+      const input = asConnectionInput(payload);
+      const res = store.add(input);
+      if (!res.ok) {
+        return toMutationResponse(res);
+      }
+      const added = res.snapshot.connections.find((c) => !prevIds.has(c.id));
+      let snapshot = res.snapshot;
+      let warnings = [...res.warnings];
+      if (added) {
+        const bound = bindOAuthTokenAfterCommit(added.id, input, snapshot, warnings);
+        snapshot = bound.snapshot;
+        warnings = bound.warnings;
+        deps?.onConnectionCommitted?.({
+          action: "add",
+          connectionId: added.id,
+          snapshot,
+          activate: payload.activate !== false,
+        });
+      }
+      return {
+        committed: true,
+        snapshot,
+        warnings,
+      } satisfies ConnectionMutationResponse;
     },
     "connections.update": async (payload) => {
       const connectionId = asString(payload.connectionId);
-      const res = store.update(connectionId, asConnectionInput(payload));
-      return toMutationResponse(res);
+      const input = asConnectionInput(payload);
+      const res = store.update(connectionId, input);
+      if (!res.ok) {
+        return toMutationResponse(res);
+      }
+      const bound = bindOAuthTokenAfterCommit(connectionId, input, res.snapshot, [...res.warnings]);
+      deps?.onConnectionCommitted?.({
+        action: "update",
+        connectionId,
+        snapshot: bound.snapshot,
+        activate: payload.activate === true,
+      });
+      return {
+        committed: true,
+        snapshot: bound.snapshot,
+        warnings: bound.warnings,
+      } satisfies ConnectionMutationResponse;
     },
     "connections.remove": async (payload) => {
       const connectionId = asString(payload.connectionId);
@@ -99,6 +219,24 @@ export function createRegistryBridgeHandlers(store: RegistryStore) {
     },
     "registry.refresh": async () => {
       return { registry: store.refresh() };
+    },
+    "auth.start": async (payload) => {
+      if (!deps?.authManager) {
+        const err = new Error("OAuth 授权管理器不可用");
+        (err as { code?: string }).code = "capability_unavailable";
+        throw err;
+      }
+      return deps.authManager.startAuth({
+        kind: typeof payload.kind === "string" ? payload.kind : undefined,
+        url: typeof payload.url === "string" ? payload.url : undefined,
+        connectionId: typeof payload.connectionId === "string" ? payload.connectionId : undefined,
+      });
+    },
+    "auth.cancel": async (payload) => {
+      if (!deps?.authManager) {
+        return { cancelled: false, authSessionId: asString(payload.authSessionId) };
+      }
+      return deps.authManager.cancelAuth(asString(payload.authSessionId));
     },
   };
 
@@ -132,5 +270,14 @@ export function createRegistryBridgeHandlers(store: RegistryStore) {
     });
   }
 
-  return { handlers, subscribeRegistry };
+  function subscribeAuthState(
+    listener: (event: BridgeEvent<AuthStateSnapshot>) => void,
+  ): () => void {
+    if (!deps?.authManager) {
+      return () => {};
+    }
+    return deps.authManager.subscribe(listener);
+  }
+
+  return { handlers, subscribeRegistry, subscribeAuthState };
 }

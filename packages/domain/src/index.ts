@@ -7,3 +7,4 @@ export * from "./appInfo";
 export * from "./gatewayProtocol";
 export * from "./capabilityRegistry";
 export * from "./activeChatResolver";
+export * from "./remoteGateway";
