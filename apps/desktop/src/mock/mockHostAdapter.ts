@@ -23,6 +23,7 @@ import {
   createBridgeDispatcher,
   createEmptyRegistryDocument,
   diffRegistries,
+  formatAppInfoDisplay,
   formatDisplaySafeCliSummary,
   mapLocalFailure,
   normalizeRegistryDocument,
@@ -34,6 +35,18 @@ import {
   type NormalizedRegistryResult,
 } from "@hermes/domain";
 
+declare const __HERMES_MOCK_BUILD_META__:
+  | {
+      gitSha: string;
+      gitDirty: boolean;
+      source: "git" | "unknown";
+      appVersion: string;
+      electronVersion: string;
+      chromiumVersion: string;
+      nodeVersion: string;
+    }
+  | undefined;
+
 const VALID_TOPICS = new Set<string>(HOST_TOPICS);
 
 const EMPTY_FLEET: FleetSnapshot = {
@@ -43,6 +56,38 @@ const EMPTY_FLEET: FleetSnapshot = {
   activeScope: null,
   activeSessionId: null,
 };
+
+function createMockAppInfo(): AppInfo {
+  const meta =
+    typeof __HERMES_MOCK_BUILD_META__ !== "undefined"
+      ? __HERMES_MOCK_BUILD_META__
+      : {
+          gitSha: "unknown",
+          gitDirty: false,
+          source: "unknown" as const,
+          appVersion: "0.1.0",
+          electronVersion: "45.4.1",
+          chromiumVersion: "134.0.0.0",
+          nodeVersion: "22.13.0",
+        };
+  return {
+    bridgeVersion: HOST_BRIDGE_VERSION,
+    appName: "Hermes Desktop",
+    appVersion: meta.appVersion,
+    gitSha: meta.gitSha,
+    gitDirty: meta.gitDirty,
+    buildMode: "dev",
+    distribution: "local-unsigned",
+    electronVersion: meta.electronVersion,
+    chromiumVersion: meta.chromiumVersion,
+    nodeVersion: meta.nodeVersion,
+    arch: "arm64",
+    source: meta.source,
+    mode: "mock",
+    platform: "darwin",
+    capabilitiesReady: false,
+  };
+}
 
 function createInitialMockInspection(): LocalInspectResult {
   return {
@@ -74,6 +119,7 @@ function isSafeExternalHttpUrl(rawUrl: string): boolean {
 export function createMockHostBridge(): HermesHost {
   let reqSeq = 0;
   const commandListeners = new Set<(cmd: AppCommand) => void>();
+  const mockAppInfo = createMockAppInfo();
   const currentInspection = createInitialMockInspection();
 
   const registryListeners = new Set<
@@ -89,7 +135,7 @@ export function createMockHostBridge(): HermesHost {
     sanitizeDiagnosticsPayload({
       generatedAt: "2026-11-23T06:00:00.000Z",
       appName: "Hermes Desktop",
-      appVersion: "0.1.0",
+      appVersion: mockAppInfo.appVersion,
       bridgeVersion: HOST_BRIDGE_VERSION,
       buildMode: "mock",
       mode: "mock",
@@ -148,15 +194,7 @@ export function createMockHostBridge(): HermesHost {
   }
 
   const dispatcher = createBridgeDispatcher({
-    "bridge.hello": async (): Promise<AppInfo> => ({
-      bridgeVersion: HOST_BRIDGE_VERSION,
-      appName: "Hermes Desktop",
-      appVersion: "0.1.0",
-      mode: "mock",
-      platform: "web",
-      arch: "wasm",
-      capabilitiesReady: false,
-    }),
+    "bridge.hello": async (): Promise<AppInfo> => mockAppInfo,
     "connections.list": async () => {
       const registry = projectRegistrySnapshot(currentNorm);
       return { connections: registry.connections, registry };
@@ -360,7 +398,11 @@ export function createMockHostBridge(): HermesHost {
       inspection: currentInspection,
     }),
     "local.diagnose": async (): Promise<SanitizedDiagnosticsPayload> => buildMockDiagnostics(),
-    "diagnostics.export": async (): Promise<SanitizedDiagnosticsPayload> => buildMockDiagnostics(),
+    "diagnostics.export": async () => ({
+      ...buildMockDiagnostics(),
+      appInfo: mockAppInfo,
+      display: formatAppInfoDisplay(mockAppInfo),
+    }),
     "links.openExternal": async (payload) => {
       const rawUrl = typeof payload.url === "string" ? payload.url : "";
       if (!isSafeExternalHttpUrl(rawUrl)) {

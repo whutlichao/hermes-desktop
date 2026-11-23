@@ -58,6 +58,28 @@ export function resolveSandboxPaths(options: SandboxPathOptions): SandboxPaths {
   };
 }
 
+export function requiresRealHomeConfirmation(sandbox: SandboxPaths): boolean {
+  return sandbox.isRealHomeAllowed;
+}
+
+export async function confirmRealHomeAccess(options: {
+  sandbox: SandboxPaths;
+  showConfirmDialog: (prompt: {
+    title: string;
+    message: string;
+    detail: string;
+  }) => Promise<boolean> | boolean;
+}): Promise<boolean> {
+  if (!requiresRealHomeConfirmation(options.sandbox)) {
+    return true;
+  }
+  return options.showConfirmDialog({
+    title: "确认连接真实 ~/.hermes",
+    message: "即将以开发模式连接真实本机 Hermes 配置目录",
+    detail: "此操作可能读取真实 Gateway Connection 与本地状态，仅在明确需要调试本机环境时继续。",
+  });
+}
+
 export interface HardenedWebPreferences {
   preload: string;
   contextIsolation: true;
@@ -128,6 +150,11 @@ export function buildAppMenuSpec(
     {
       label: "Hermes Desktop",
       submenu: [
+        {
+          label: "关于 Hermes Desktop",
+          click: () => dispatchCommand({ type: "open_about" }),
+        },
+        { type: "separator" },
         {
           label: "Settings…",
           accelerator: "CmdOrCtrl+,",

@@ -5,5 +5,5 @@ export default defineConfig({
   retries: 0,
   reporter: "list",
   testDir: "./tests/electron",
-  testMatch: /smoke\.spec\.ts/,
+  testMatch: process.env.HERMES_PACKAGED_APP_PATH ? /packaged\.spec\.ts/ : /smoke\.spec\.ts/,
 });

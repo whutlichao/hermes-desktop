@@ -765,6 +765,54 @@ button {
   color: var(--ink);
 }
 
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-section:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.settings-section-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.settings-section-body {
+  margin: 0;
+  color: var(--muted);
+}
+
+.settings-about-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--paper-raised);
+}
+
+.settings-about-headline {
+  margin: 0;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.settings-about-meta {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

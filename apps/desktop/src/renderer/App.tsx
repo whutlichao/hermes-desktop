@@ -21,6 +21,7 @@ import {
   createInitialShellState,
   createSequenceTracker,
   deriveViewportMode,
+  formatAppInfoDisplay,
   getCopy,
   getTopmostSurface,
   shellReducer,
@@ -95,6 +96,7 @@ export default function App() {
         dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" });
         dispatch({ type: "ANNOUNCE", message: getCopy("shortcuts.title") });
         break;
+      case "open_about":
       case "close_window":
       case "focus_scope":
         break;
@@ -633,6 +635,25 @@ export default function App() {
           onSnapshotChange={setRegistrySnapshot}
           onAnnounce={(message) => dispatch({ type: "ANNOUNCE", message })}
         />
+
+        <section className="settings-section" aria-label={getCopy("settings.aboutTitle")}>
+          <h3 className="settings-section-title">{getCopy("settings.aboutTitle")}</h3>
+          {state.appInfo && (() => {
+            const display = formatAppInfoDisplay(state.appInfo);
+            return (
+              <div className="settings-about-card">
+                <p className="settings-about-headline">{display.headline}</p>
+                <p className="settings-about-meta">{display.buildLine}</p>
+                <p className="settings-about-meta">{display.runtimeLine}</p>
+              </div>
+            );
+          })()}
+        </section>
+
+        <section className="settings-section" aria-label={getCopy("settings.updatesTitle")}>
+          <h3 className="settings-section-title">{getCopy("settings.updatesTitle")}</h3>
+          <p className="settings-section-body">{getCopy("settings.updatesNotice")}</p>
+        </section>
       </FocusDialog>
 
       <FocusDialog

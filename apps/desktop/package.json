@@ -7,6 +7,7 @@
   "scripts": {
     "dev:web": "VITE_HOST_MODE=mock vite --config vite.web.config.ts",
     "dev:electron": "electron-vite dev",
+    "dev:electron:real": "HERMES_ALLOW_REAL_HOME=1 HERMES_HOME=\"$HOME/.hermes\" electron-vite dev",
     "build": "electron-vite build",
     "build:web": "VITE_HOST_MODE=mock vite build --config vite.web.config.ts",
     "preview:web": "vite preview --config vite.web.config.ts --port 4173 --strictPort"

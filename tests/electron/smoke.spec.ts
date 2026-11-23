@@ -113,6 +113,42 @@ test.describe("Electron hardened smoke", () => {
       expect(fs.existsSync(regFile)).toBe(true);
       expect(fs.statSync(regFile).mode & 0o777).toBe(0o600);
 
+      // Verify same-source AppInfo across bridge.hello, diagnostics.export, and Settings -> About/Updates
+      const diagnosticsCheck = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: {
+            request: (cmd: string, payload?: Record<string, unknown>) => Promise<{ ok: boolean; value: unknown }>;
+          };
+        };
+        const hello = await w.hermesHost.request("bridge.hello", {});
+        const diag = await w.hermesHost.request("diagnostics.export", {});
+        return { hello, diag };
+      });
+      expect(diagnosticsCheck.hello.ok).toBe(true);
+      expect(diagnosticsCheck.diag.ok).toBe(true);
+
+      const helloInfo = diagnosticsCheck.hello.value as {
+        appVersion: string;
+        gitSha: string;
+        buildMode: string;
+        distribution: string;
+        arch: string;
+      };
+      const diagPayload = diagnosticsCheck.diag.value as {
+        appInfo: typeof helloInfo;
+        display: { headline: string; buildLine: string; runtimeLine: string; updatesNotice: string };
+      };
+      expect(diagPayload.appInfo).toEqual(helloInfo);
+      expect(helloInfo.buildMode).toBe("dev");
+      expect(helloInfo.distribution).toBe("local-unsigned");
+      expect(JSON.stringify(diagPayload)).not.toContain(process.cwd());
+
+      await expect(settings).toContainText(diagPayload.display.headline);
+      await expect(settings).toContainText(diagPayload.display.buildLine);
+      await expect(settings).toContainText(diagPayload.display.runtimeLine);
+      await expect(settings).toContainText("本地开发构建，不检查更新");
+      await expect(settings.getByRole("button", { name: /检查更新|Update/i })).toHaveCount(0);
+
       passed = true;
     } finally {
       await electronApp.close();
