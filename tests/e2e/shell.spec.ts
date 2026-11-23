@@ -1913,3 +1913,288 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     );
   });
 });
+
+test.describe("Ticket #41 Subagents (list/steer/interrupt/tail) and Checkpoint (list/diff/restore) & degradations", () => {
+  test("Subagents and Checkpoints enter via ⌘K / CapabilitiesDrawer, bind CapabilityEntry + evidenceTestId, enforce bounded tail & generation invalidation, handle -32601 read-only degradation, and confirm scope-bound checkpoint restore", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      const longTailLines = Array.from({ length: 240 }, (_, i) => `tail-line-${i + 1}`);
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              availability: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-41",
+              title: "Session 41",
+              preview: "Subagents and Checkpoints",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-41" },
+          activeSessionId: "sess-41",
+        },
+        chatState: {
+          windowId: "primary",
+          paneId: "main",
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-41" },
+          lastSessionByScope: { "local::default": "sess-41" },
+          lastValidProfileByConnection: { local: "default" },
+          lastValidScopes: [{ connectionId: "local", profileId: "default" }],
+          sessionSummaries: {},
+          activeStatus: "ready",
+          lastKnownUnverified: false,
+          missingSession: null,
+          routeBanner: null,
+        },
+        agents: {
+          "sess-41": [
+            {
+              agentId: "sub-1",
+              name: "Code Explorer",
+              status: "running",
+              summary: "Scanning packages",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+            },
+            {
+              agentId: "sub-2",
+              name: "Test Runner",
+              status: "completed",
+              summary: "All unit tests green",
+              updatedAt: "2026-11-23T09:01:00.000Z",
+            },
+          ],
+        },
+        subagentTails: {
+          "sess-41::sub-1": longTailLines,
+        },
+        checkpoints: {
+          "sess-41": [
+            {
+              checkpointId: "ckpt-1",
+              title: "Before refactor",
+              summary: "Clean baseline state",
+              createdAt: "2026-11-23T08:50:00.000Z",
+            },
+            {
+              checkpointId: "ckpt-2",
+              title: "After schema update",
+              summary: "Added contracts and domain state",
+              createdAt: "2026-11-23T08:55:00.000Z",
+            },
+          ],
+        },
+        checkpointDiffs: {
+          "sess-41::ckpt-2": "--- a/packages/contracts/src/index.ts\n+++ b/packages/contracts/src/index.ts\n@@ -1,2 +1,4 @@\n+export interface WorkspaceCheckpointItem {}",
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // 1. Open Command Palette (⌘K) and enter Subagents via capability action `subagents.list`
+    await expect(page.getByRole("button", { name: /能力 17 可达 4 延期/ })).toBeVisible();
+    await page.getByRole("button", { name: "命令面板 ⌘K" }).click();
+    const cmdDialog = page.getByRole("dialog", { name: "命令面板" });
+    await expect(cmdDialog).toBeVisible();
+    const subagentsCmdBtn = cmdDialog.getByTestId("cap-action-subagents-list");
+    await expect(subagentsCmdBtn).toHaveAttribute("data-action-id", "subagents.list");
+    await subagentsCmdBtn.click();
+
+    const drawer = page.getByRole("complementary", { name: "Workspace" });
+    await expect(drawer).toBeVisible();
+    await expect(drawer.getByRole("tab", { name: "Agents" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // 2. Verify Subagents roster, CapabilityEntry + evidenceTestId bindings, and bounded tail (200 lines max)
+    const sub1Chip = drawer.getByTestId("workspace-agent-item-sub-1");
+    await expect(sub1Chip).toContainText("Code Explorer (running)");
+
+    const tailBtn = drawer.getByTestId("workspace-agent-tail-btn");
+    const interruptBtn = drawer.getByTestId("workspace-agent-interrupt-btn");
+    const steerBtn = drawer.getByTestId("workspace-agent-steer-btn");
+    await expect(tailBtn).toHaveAttribute("data-evidence-testid", "cap-action-subagents-tail");
+    await expect(interruptBtn).toHaveAttribute("data-evidence-testid", "cap-action-subagents-interrupt");
+    await expect(steerBtn).toHaveAttribute("data-evidence-testid", "cap-action-subagents-steer");
+
+    await expect(drawer.getByTestId("workspace-agent-tail-truncated")).toContainText("已截断至最近有界窗口");
+    const tailText = await drawer.getByTestId("workspace-agent-tail-content").innerText();
+    expect(tailText).toContain("tail-line-41");
+    expect(tailText).toContain("tail-line-240");
+    expect(tailText).not.toContain("tail-line-40\n");
+
+    // 3. Steer Subagent
+    const steerInput = drawer.getByLabel("向选中 Subagent 发送补充指令");
+    await steerInput.fill("Prioritize contract tests");
+    await steerBtn.click();
+    await expect(steerInput).toHaveValue("");
+
+    // 4. Failed interrupt must NOT pretend stop succeeded, shows safe typed error code + retry/details
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      fix.subagentErrorByAction = {
+        "subagents.interrupt": {
+          code: "timeout",
+          message: "请求超时，请检查目标主机响应状态后重试。",
+        },
+      };
+    });
+    await interruptBtn.click();
+    await expect(drawer.getByTestId("workspace-agent-error")).toBeVisible();
+    await expect(drawer.getByTestId("workspace-agent-error-code")).toHaveText("[timeout]");
+    await expect(sub1Chip).toContainText("Code Explorer (running)");
+
+    await drawer.getByTestId("workspace-agent-error-details").click();
+    await expect(drawer.getByTestId("workspace-agent-error-detail-body")).toContainText(
+      "code=timeout requestId=",
+    );
+
+    // Clear error injection and retry interrupt -> succeeds and updates status to stopped
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      fix.subagentErrorByAction = {};
+    });
+    await drawer.getByTestId("workspace-agent-error-retry").click();
+    await expect(drawer.getByTestId("workspace-agent-error")).toHaveCount(0);
+    await expect(sub1Chip).toContainText("Code Explorer (stopped)");
+
+    // 5. Generation change invalidates old tail
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      fix.bumpGenerationCount = 1;
+    });
+    await drawer.getByRole("button", { name: "刷新 Workspace" }).click();
+    await expect(drawer.getByTestId("workspace-agent-tail-invalidated")).toContainText(
+      "连接世代已变更，旧输出已失效",
+    );
+
+    // Clicking refresh tail fetches fresh tail for the new generation
+    await tailBtn.click();
+    await expect(drawer.getByTestId("workspace-agent-tail-invalidated")).toHaveCount(0);
+    await expect(drawer.getByTestId("workspace-agent-tail-content")).toContainText("tail-line-240");
+
+    // 6. -32601 on subagent.list degrades to read-only last-known roster and hides steer/interrupt
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      fix.subagentNotFoundMethods = ["subagent.list"];
+    });
+    await drawer.getByRole("button", { name: "刷新 Workspace" }).click();
+    await expect(drawer.getByTestId("workspace-agents-readonly-notice")).toBeVisible();
+    await expect(drawer.getByTestId("workspace-agent-lastknown-sub-1")).toHaveText("上次已知");
+    await expect(drawer.getByTestId("workspace-agent-steer-btn")).toHaveCount(0);
+    await expect(drawer.getByTestId("workspace-agent-interrupt-btn")).toHaveCount(0);
+
+    // 7. Hide Workspace, then enter Checkpoints from CapabilitiesDrawer (`checkpoint.list`)
+    await drawer.getByRole("button", { name: "隐藏 Workspace" }).click();
+    await expect(drawer).toHaveCount(0);
+    const capTriggerBtn = page.getByRole("button", { name: /能力 \d+ 可达 \d+ 延期/ });
+    await capTriggerBtn.click();
+    const capDialog = page.getByRole("dialog", { name: "能力目录" });
+    await expect(capDialog).toBeVisible();
+    const ckptListAction = capDialog.getByTestId("cap-action-checkpoint-list");
+    await expect(ckptListAction).toHaveAttribute("data-action-id", "checkpoint.list");
+    await ckptListAction.click();
+    await expect(capDialog).toHaveCount(0);
+
+    await expect(drawer.getByRole("tab", { name: "Checkpoints" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await expect(drawer.getByTestId("workspace-checkpoint-item-ckpt-1")).toContainText(
+      "Before refactor",
+    );
+    const ckpt2Chip = drawer.getByTestId("workspace-checkpoint-item-ckpt-2");
+    await expect(ckpt2Chip).toContainText("After schema update");
+    await ckpt2Chip.click();
+
+    // 8. View Checkpoint diff and initiate explicit confirmation restore bound to session/connection/profile/generation
+    const ckptDiffBtn = drawer.getByTestId("workspace-checkpoint-diff-btn");
+    const ckptRestoreBtn = drawer.getByTestId("workspace-checkpoint-restore-btn");
+    await expect(ckptDiffBtn).toHaveAttribute("data-evidence-testid", "cap-action-checkpoint-diff");
+    await expect(ckptRestoreBtn).toHaveAttribute("data-evidence-testid", "cap-action-checkpoint-restore");
+
+    await expect(drawer.getByTestId("workspace-checkpoint-diff-preview")).toContainText(
+      "export interface WorkspaceCheckpointItem",
+    );
+
+    await ckptRestoreBtn.click();
+    const confirmCard = drawer.getByTestId("workspace-checkpoint-confirm-card");
+    await expect(confirmCard).toBeVisible();
+    await expect(drawer.getByTestId("workspace-checkpoint-confirm-binding")).toContainText(
+      "local / default / sess-41 · gen",
+    );
+
+    // 9. Restore failure preserves checkpoint selection and provides safe recovery action
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      fix.checkpointErrorByAction = {
+        "checkpoints.restore": {
+          code: "timeout",
+          message: "请求超时，请检查目标主机响应状态后重试。",
+        },
+      };
+    });
+    await drawer.getByTestId("workspace-checkpoint-confirm-btn").click();
+    await expect(drawer.getByTestId("workspace-checkpoint-error")).toBeVisible();
+    await expect(drawer.getByTestId("workspace-checkpoint-error-code")).toHaveText("[timeout]");
+    await expect(ckpt2Chip).toHaveClass(/is-active/);
+
+    // Clear error and retry restore -> succeeds and marks checkpoint restored
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      fix.checkpointErrorByAction = {};
+    });
+    await drawer.getByTestId("workspace-checkpoint-error-retry").click();
+    await expect(drawer.getByTestId("workspace-checkpoint-error")).toHaveCount(0);
+    await expect(drawer.getByTestId("workspace-checkpoint-restored-ckpt-2")).toHaveText("已恢复");
+
+    // 10. Missing `rollback.restore` (-32601) keeps list/diff read-only and hides Restore button
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      fix.checkpointNotFoundMethods = ["rollback.restore"];
+    });
+    await drawer.getByRole("button", { name: "刷新 Workspace" }).click();
+    await expect(drawer.getByTestId("workspace-checkpoints-readonly-notice")).toBeVisible();
+    await expect(drawer.getByTestId("workspace-checkpoint-restore-btn")).toHaveCount(0);
+    await expect(drawer.getByTestId("workspace-checkpoint-diff-btn")).toBeVisible();
+    await expect(drawer.getByTestId("workspace-checkpoint-diff-preview")).toContainText(
+      "export interface WorkspaceCheckpointItem",
+    );
+  });
+});

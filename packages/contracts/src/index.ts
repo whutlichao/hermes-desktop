@@ -61,6 +61,13 @@ export const HOST_COMMANDS = [
   "terminal.close",
   "artifacts.list",
   "artifacts.read",
+  "subagents.list",
+  "subagents.steer",
+  "subagents.interrupt",
+  "subagents.tail",
+  "checkpoints.list",
+  "checkpoints.diff",
+  "checkpoints.restore",
   "diagnostics.export",
   "local.inspect",
   "local.selectCli",
@@ -541,7 +548,7 @@ export interface ActiveChatRef {
 
 export type WorkspaceMode = "closed" | "hidden" | "open";
 
-export type WorkspaceTab = "artifacts" | "files" | "git" | "agents" | "terminal";
+export type WorkspaceTab = "artifacts" | "files" | "git" | "agents" | "checkpoints" | "terminal";
 
 export type WorkspaceTabBinding = "active_chat" | "scope";
 
@@ -608,8 +615,49 @@ export interface WorkspaceAgentItem {
   agentId: string;
   name: string;
   role: string;
-  status: "running" | "idle" | "completed" | "failed";
+  status: "running" | "idle" | "completed" | "failed" | "stopped";
   summary?: string;
+  updatedAt?: string;
+  lastKnown?: boolean;
+}
+
+export interface SubagentTailSnapshot {
+  agentId: string;
+  lines: string[];
+  truncated: boolean;
+  generation: number;
+  updatedAt: string;
+}
+
+export interface WorkspaceCheckpointItem {
+  checkpointId: string;
+  title: string;
+  summary?: string;
+  createdAt: string;
+  turnId?: string;
+}
+
+export interface CheckpointDiffSnapshot {
+  checkpointId: string;
+  summary: string;
+  patch: string;
+  filesChanged?: number;
+}
+
+export interface CheckpointRestoreBinding {
+  connectionId: string;
+  profileId: string;
+  sessionId: string;
+  checkpointId: string;
+  generation: number;
+}
+
+export interface WorkspaceDomainError {
+  code: ErrorCode;
+  message: string;
+  retryable: boolean;
+  actionId?: string;
+  detail?: string;
 }
 
 export interface PaneState {

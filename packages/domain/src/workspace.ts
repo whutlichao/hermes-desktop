@@ -1,9 +1,15 @@
 import type {
   ArtifactAnnotation,
   BridgeScope,
+  CheckpointDiffSnapshot,
+  CheckpointRestoreBinding,
+  ErrorCode,
   ProjectedArtifactAnnotation,
+  SubagentTailSnapshot,
   WorkspaceAgentItem,
   WorkspaceArtifactItem,
+  WorkspaceCheckpointItem,
+  WorkspaceDomainError,
   WorkspaceFileEntry,
   WorkspaceFrame,
   WorkspaceGitDiffItem,
@@ -12,6 +18,9 @@ import type {
   WorkspaceTabBinding,
 } from "@hermes/contracts";
 import { makeScopeKey, makeSessionKey } from "./activeChatResolver";
+
+export const MAX_SUBAGENT_TAIL_LINES = 200;
+export const MAX_SUBAGENT_TAIL_BYTES = 32 * 1024;
 
 export interface ActiveChatWorkspaceView {
   chatKey: string;
@@ -24,6 +33,17 @@ export interface ActiveChatWorkspaceView {
   agents: WorkspaceAgentItem[];
   selectedAgentId: string | null;
   steerText: string;
+  agentsReadOnly: boolean;
+  agentTailById: Record<string, SubagentTailSnapshot>;
+  tailInvalidatedById: Record<string, boolean>;
+  agentError: WorkspaceDomainError | null;
+  checkpoints: WorkspaceCheckpointItem[];
+  selectedCheckpointId: string | null;
+  checkpointsCanRestore: boolean;
+  checkpointDiffById: Record<string, CheckpointDiffSnapshot>;
+  checkpointRestorePendingId: string | null;
+  restoredCheckpointIds: string[];
+  checkpointError: WorkspaceDomainError | null;
 }
 
 export interface ScopeWorkspaceView {
@@ -57,6 +77,7 @@ export function getWorkspaceTabBinding(tab: WorkspaceTab): WorkspaceTabBinding {
   switch (tab) {
     case "artifacts":
     case "agents":
+    case "checkpoints":
       return "active_chat";
     case "files":
     case "git":
@@ -95,6 +116,17 @@ export function createEmptyChatWorkspaceView(chatKey: string): ActiveChatWorkspa
     agents: [],
     selectedAgentId: null,
     steerText: "",
+    agentsReadOnly: false,
+    agentTailById: {},
+    tailInvalidatedById: {},
+    agentError: null,
+    checkpoints: [],
+    selectedCheckpointId: null,
+    checkpointsCanRestore: true,
+    checkpointDiffById: {},
+    checkpointRestorePendingId: null,
+    restoredCheckpointIds: [],
+    checkpointError: null,
   };
 }
 
@@ -198,6 +230,9 @@ export function closeWorkspace(state: WorkspaceSessionState): WorkspaceSessionSt
         zoom: 100,
         selectedAgentId: null,
         steerText: "",
+        agentError: null,
+        checkpointRestorePendingId: null,
+        checkpointError: null,
         // Annotations belong to Draft and MUST NOT be deleted on Close
         annotations: [...chatView.annotations],
       },
@@ -624,6 +659,7 @@ export function reconcileWorkspaceAgents(
   state: WorkspaceSessionState,
   targetScope: BridgeScope | null,
   agents: WorkspaceAgentItem[],
+  options?: { readOnly?: boolean; lastKnown?: boolean },
 ): WorkspaceSessionState {
   const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
   const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
@@ -631,17 +667,312 @@ export function reconcileWorkspaceAgents(
     current.selectedAgentId && agents.some((a) => a.agentId === current.selectedAgentId)
       ? current.selectedAgentId
       : (agents[0]?.agentId ?? null);
+  const markLastKnown = Boolean(options?.lastKnown);
   return {
     ...state,
     byChatKey: {
       ...state.byChatKey,
       [chatKey]: {
         ...current,
-        agents: agents.map((a) => ({ ...a })),
+        agents: agents.map((a) => ({
+          ...a,
+          ...(markLastKnown ? { lastKnown: true } : {}),
+        })),
         selectedAgentId: nextSelectedId,
+        agentsReadOnly: options?.readOnly ?? current.agentsReadOnly,
       },
     },
   };
+}
+
+export function boundSubagentTailLines(
+  rawLines: readonly string[],
+  maxLines: number = MAX_SUBAGENT_TAIL_LINES,
+  maxBytes: number = MAX_SUBAGENT_TAIL_BYTES,
+): { lines: string[]; truncated: boolean } {
+  let truncated = false;
+  let sliced = [...rawLines];
+  if (sliced.length > maxLines) {
+    sliced = sliced.slice(sliced.length - maxLines);
+    truncated = true;
+  }
+
+  const encoder = new TextEncoder();
+  let totalBytes = 0;
+  const keptReversed: string[] = [];
+  for (let i = sliced.length - 1; i >= 0; i -= 1) {
+    const line = sliced[i];
+    const lineBytes = encoder.encode(line).length;
+    if (totalBytes + lineBytes > maxBytes && keptReversed.length > 0) {
+      truncated = true;
+      break;
+    }
+    totalBytes += lineBytes;
+    keptReversed.push(line);
+  }
+
+  return {
+    lines: keptReversed.reverse(),
+    truncated,
+  };
+}
+
+export function setWorkspaceAgentTail(
+  state: WorkspaceSessionState,
+  tail: SubagentTailSnapshot,
+  targetScope?: BridgeScope | null,
+): WorkspaceSessionState {
+  const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
+  const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
+  const bounded = boundSubagentTailLines(tail.lines);
+  const nextInvalidated = { ...current.tailInvalidatedById };
+  delete nextInvalidated[tail.agentId];
+
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [chatKey]: {
+        ...current,
+        agentTailById: {
+          ...current.agentTailById,
+          [tail.agentId]: {
+            ...tail,
+            lines: bounded.lines,
+            truncated: Boolean(tail.truncated || bounded.truncated),
+          },
+        },
+        tailInvalidatedById: nextInvalidated,
+      },
+    },
+  };
+}
+
+export function setWorkspaceAgentError(
+  state: WorkspaceSessionState,
+  error: WorkspaceDomainError | null,
+  targetScope?: BridgeScope | null,
+): WorkspaceSessionState {
+  const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
+  const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [chatKey]: {
+        ...current,
+        agentError: error,
+      },
+    },
+  };
+}
+
+export function invalidateWorkspaceGeneration(
+  state: WorkspaceSessionState,
+  nextGeneration: number,
+): WorkspaceSessionState {
+  const nextByChatKey: Record<string, ActiveChatWorkspaceView> = {};
+  for (const [chatKey, view] of Object.entries(state.byChatKey)) {
+    const nextTailById: Record<string, SubagentTailSnapshot> = {};
+    const nextInvalidatedById: Record<string, boolean> = { ...view.tailInvalidatedById };
+    let changed = false;
+
+    for (const [agentId, snapshot] of Object.entries(view.agentTailById)) {
+      if (snapshot.generation !== nextGeneration) {
+        nextInvalidatedById[agentId] = true;
+        changed = true;
+      } else {
+        nextTailById[agentId] = snapshot;
+      }
+    }
+
+    if (changed || view.checkpointRestorePendingId !== null) {
+      nextByChatKey[chatKey] = {
+        ...view,
+        agentTailById: nextTailById,
+        tailInvalidatedById: nextInvalidatedById,
+        checkpointRestorePendingId: null,
+      };
+    } else {
+      nextByChatKey[chatKey] = view;
+    }
+  }
+
+  return {
+    ...state,
+    byChatKey: nextByChatKey,
+  };
+}
+
+export function reconcileWorkspaceCheckpoints(
+  state: WorkspaceSessionState,
+  targetScope: BridgeScope | null,
+  checkpoints: WorkspaceCheckpointItem[],
+  options?: { canRestore?: boolean },
+): WorkspaceSessionState {
+  const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
+  const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
+  const nextSelectedId =
+    current.selectedCheckpointId &&
+    checkpoints.some((c) => c.checkpointId === current.selectedCheckpointId)
+      ? current.selectedCheckpointId
+      : (checkpoints[0]?.checkpointId ?? null);
+
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [chatKey]: {
+        ...current,
+        checkpoints: checkpoints.map((c) => ({ ...c })),
+        selectedCheckpointId: nextSelectedId,
+        checkpointsCanRestore: options?.canRestore ?? current.checkpointsCanRestore,
+      },
+    },
+  };
+}
+
+export function selectWorkspaceCheckpoint(
+  state: WorkspaceSessionState,
+  checkpointId: string | null,
+): WorkspaceSessionState {
+  const current = getActiveChatWorkspaceView(state);
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [state.activeChatKey]: {
+        ...current,
+        selectedCheckpointId: checkpointId,
+        checkpointRestorePendingId:
+          current.checkpointRestorePendingId === checkpointId
+            ? current.checkpointRestorePendingId
+            : null,
+      },
+    },
+  };
+}
+
+export function setWorkspaceCheckpointDiff(
+  state: WorkspaceSessionState,
+  diff: CheckpointDiffSnapshot,
+  targetScope?: BridgeScope | null,
+): WorkspaceSessionState {
+  const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
+  const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [chatKey]: {
+        ...current,
+        checkpointDiffById: {
+          ...current.checkpointDiffById,
+          [diff.checkpointId]: { ...diff },
+        },
+      },
+    },
+  };
+}
+
+export function setWorkspaceCheckpointRestorePending(
+  state: WorkspaceSessionState,
+  checkpointId: string | null,
+  targetScope?: BridgeScope | null,
+): WorkspaceSessionState {
+  const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
+  const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [chatKey]: {
+        ...current,
+        checkpointRestorePendingId: checkpointId,
+      },
+    },
+  };
+}
+
+export function markWorkspaceCheckpointRestored(
+  state: WorkspaceSessionState,
+  checkpointId: string,
+  targetScope?: BridgeScope | null,
+): WorkspaceSessionState {
+  const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
+  const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
+  const nextRestored = current.restoredCheckpointIds.includes(checkpointId)
+    ? current.restoredCheckpointIds
+    : [...current.restoredCheckpointIds, checkpointId];
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [chatKey]: {
+        ...current,
+        checkpointRestorePendingId: null,
+        restoredCheckpointIds: nextRestored,
+      },
+    },
+  };
+}
+
+export function setWorkspaceCheckpointError(
+  state: WorkspaceSessionState,
+  error: WorkspaceDomainError | null,
+  targetScope?: BridgeScope | null,
+): WorkspaceSessionState {
+  const chatKey = targetScope ? resolveWorkspaceChatKey(targetScope) : state.activeChatKey;
+  const current = state.byChatKey[chatKey] ?? createEmptyChatWorkspaceView(chatKey);
+  return {
+    ...state,
+    byChatKey: {
+      ...state.byChatKey,
+      [chatKey]: {
+        ...current,
+        checkpointError: error,
+      },
+    },
+  };
+}
+
+export function validateCheckpointRestoreBinding(
+  binding: CheckpointRestoreBinding,
+  activeScope: BridgeScope | null | undefined,
+  currentGeneration: number,
+): { valid: true } | { valid: false; code: ErrorCode; message: string } {
+  if (
+    !activeScope ||
+    !activeScope.connectionId ||
+    !activeScope.sessionId ||
+    binding.connectionId !== activeScope.connectionId ||
+    binding.profileId !== (activeScope.profileId ?? "default") ||
+    binding.sessionId !== activeScope.sessionId
+  ) {
+    return {
+      valid: false,
+      code: "scope_mismatch",
+      message: "Checkpoint 恢复绑定与当前活动 Scope 不匹配，已拒绝跨 Scope 回滚。",
+    };
+  }
+
+  if (binding.generation !== currentGeneration) {
+    return {
+      valid: false,
+      code: "conflict",
+      message: "连接代际（Generation）已变更，请重新确认后再恢复 Checkpoint。",
+    };
+  }
+
+  if (!binding.checkpointId || binding.checkpointId.trim() === "") {
+    return {
+      valid: false,
+      code: "invalid_request",
+      message: "未指定要恢复的 Checkpoint。",
+    };
+  }
+
+  return { valid: true };
 }
 
 export function reconcileWorkspaceGitDiffs(

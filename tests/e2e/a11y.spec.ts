@@ -314,6 +314,33 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
             },
           ],
         },
+        agents: {
+          "sess-a11y": [
+            {
+              agentId: "sub-a11y",
+              name: "A11y Subagent",
+              status: "running",
+              summary: "Checking accessibility",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+            },
+          ],
+        },
+        subagentTails: {
+          "sess-a11y::sub-a11y": ["line 1: starting", "line 2: running checks"],
+        },
+        checkpoints: {
+          "sess-a11y": [
+            {
+              checkpointId: "ckpt-a11y",
+              title: "Initial A11y Checkpoint",
+              summary: "Snapshot before edits",
+              createdAt: "2026-11-23T08:00:00.000Z",
+            },
+          ],
+        },
+        checkpointDiffs: {
+          "sess-a11y::ckpt-a11y": "--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1 @@\n-export const ready = false;\n+export const ready = true;",
+        },
       };
     });
 
@@ -336,7 +363,14 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("workspace git tab");
 
     await drawer.getByRole("tab", { name: "Agents" }).click();
+    await expect(drawer.getByTestId("workspace-agent-item-sub-a11y")).toBeVisible();
     await checkAxe("workspace agents tab");
+
+    await drawer.getByRole("tab", { name: "Checkpoints" }).click();
+    await expect(drawer.getByTestId("workspace-checkpoint-item-ckpt-a11y")).toBeVisible();
+    await drawer.getByTestId("workspace-checkpoint-restore-btn").click();
+    await expect(drawer.getByTestId("workspace-checkpoint-confirm-card")).toBeVisible();
+    await checkAxe("workspace checkpoints tab + restore confirmation");
 
     await drawer.getByRole("tab", { name: "Terminal" }).click();
     await checkAxe("workspace terminal tab");

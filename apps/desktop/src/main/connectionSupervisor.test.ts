@@ -1762,4 +1762,399 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   });
+
+  it("handles Subagents (list/steer/interrupt/tail, -32601 read-only last-known, failed stop never pretending stopped, bounded tail & generation invalidation) and Checkpoint (list/diff/restore, missing rollback.restore read-only, explicit confirm & scope/generation binding) (Ticket #41)", async () => {
+    const sandbox = createTestSandbox("hermes-s1-subagents-checkpoints-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_sub_ckpt_1", "tkt_sub_ckpt_2"]);
+
+    let subagentListNotFound = false;
+    let subagentSteerNotFound = false;
+    let subagentInterruptShouldFail = false;
+    let subagentStatus: "running" | "stopped" = "running";
+    let checkpointRestoreEnabled = false;
+    let checkpointRestoreShouldFail = false;
+
+    const baseServedMethods = [
+      "runtime.describe",
+      "client.capabilities",
+      "subscribe",
+      "profiles.list",
+      "session.list",
+      "session.create",
+      "session.resume",
+      "session.transcript",
+      "prompt.submit",
+      "prompt.cancel",
+      "session.steer",
+      "subagent.list",
+      "subagent.steer",
+      "subagent.interrupt",
+      "subagent.tail",
+      "rollback.list",
+      "rollback.diff",
+    ];
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [...baseServedMethods, "rollback.restore"],
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-1", title: "Main Session" },
+        { profile_id: "ops", session_id: "sess-ops", title: "Ops Session" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "runtime.describe") {
+          ctx.replyResult({
+            runtime_protocol: 1,
+            capabilities: ["session-authority-v1", "host-scope-interactive"],
+            served_methods: checkpointRestoreEnabled
+              ? [...baseServedMethods, "rollback.restore"]
+              : baseServedMethods,
+            session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
+          });
+          return true;
+        }
+        if (method === "subagent.list") {
+          if (subagentListNotFound) {
+            ctx.replyError(-32601, "Method not found: subagent.list");
+            return true;
+          }
+          ctx.replyResult({
+            agents: [
+              {
+                agent_id: "sub-alpha",
+                name: "Alpha Researcher",
+                role: "Codebase Explorer",
+                status: subagentStatus,
+                summary: "Scanning packages/domain",
+                updated_at: "2026-11-23T09:00:00Z",
+              },
+            ],
+          });
+          return true;
+        }
+        if (method === "subagent.tail") {
+          const manyLines = Array.from({ length: 240 }, (_, idx) => `tail-line-${idx + 1}`);
+          ctx.replyResult({
+            agent_id: params.agent_id,
+            lines: manyLines,
+          });
+          return true;
+        }
+        if (method === "subagent.steer") {
+          if (subagentSteerNotFound) {
+            ctx.replyError(-32601, "Method not found: subagent.steer");
+            return true;
+          }
+          ctx.replyResult({
+            steered: true,
+            agent_id: params.agent_id,
+            text: params.text,
+          });
+          return true;
+        }
+        if (method === "subagent.interrupt") {
+          if (subagentInterruptShouldFail) {
+            ctx.replyError(-32000, "Subagent is in an uninterruptible atomic write");
+            return true;
+          }
+          subagentStatus = "stopped";
+          ctx.replyResult({
+            interrupted: true,
+            agent_id: params.agent_id,
+            status: "stopped",
+          });
+          return true;
+        }
+        if (method === "rollback.list") {
+          ctx.replyResult({
+            checkpoints: [
+              {
+                checkpoint_id: "ckpt-101",
+                title: "Pre-refactor baseline",
+                summary: "Clean worktree",
+                created_at: "2026-11-23T08:30:00Z",
+                turn_id: "turn-1",
+              },
+            ],
+          });
+          return true;
+        }
+        if (method === "rollback.diff") {
+          ctx.replyResult({
+            checkpoint_id: params.checkpoint_id,
+            summary: "1 file changed (+8 -2)",
+            patch: "@@ -1,2 +1,8 @@\n+export const check = true;",
+            files_changed: 1,
+          });
+          return true;
+        }
+        if (method === "rollback.restore") {
+          if (checkpointRestoreShouldFail) {
+            ctx.replyError(-32000, "Worktree has locked index");
+            return true;
+          }
+          ctx.replyResult({
+            restored: true,
+            checkpoint_id: params.checkpoint_id,
+            session_id: params.session_id,
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      const backend = new LocalBackendManager(ports);
+      const supervisor = new LocalConnectionSupervisor(backend);
+      await supervisor.connectLocal("default");
+
+      const scope = { connectionId: "local", profileId: "default", sessionId: "sess-1" };
+
+      // 1. Subagents list returns live roster
+      const listRes = (await supervisor.handlers["subagents.list"]({}, scope)) as {
+        agents: Array<{ agentId: string; status: string; lastKnown?: boolean }>;
+        readOnly: boolean;
+        lastKnown: boolean;
+        generation: number;
+      };
+      expect(listRes.readOnly).toBe(false);
+      expect(listRes.lastKnown).toBe(false);
+      expect(listRes.agents).toHaveLength(1);
+      expect(listRes.agents[0]).toMatchObject({
+        agentId: "sub-alpha",
+        status: "running",
+      });
+
+      // 2. Subagents tail is bounded to MAX_SUBAGENT_TAIL_LINES (200) and carries current capability generation
+      const tailRes = (await supervisor.handlers["subagents.tail"](
+        { agentId: "sub-alpha" },
+        scope,
+      )) as {
+        tail: { agentId: string; lines: string[]; truncated: boolean; generation: number };
+      };
+      expect(tailRes.tail.agentId).toBe("sub-alpha");
+      expect(tailRes.tail.truncated).toBe(true);
+      expect(tailRes.tail.lines).toHaveLength(200);
+      expect(tailRes.tail.lines[0]).toBe("tail-line-41");
+      expect(tailRes.tail.lines[199]).toBe("tail-line-240");
+      const genBeforeReconnect = tailRes.tail.generation;
+
+      // 3. Subagents steer succeeds
+      const steerRes = (await supervisor.handlers["subagents.steer"](
+        { agentId: "sub-alpha", text: "Prioritize edge cases" },
+        scope,
+      )) as { steered: boolean; agentId: string };
+      expect(steerRes).toEqual({ steered: true, agentId: "sub-alpha" });
+
+      // 4. Failed subagents.interrupt NEVER pretends stop succeeded!
+      subagentInterruptShouldFail = true;
+      await expect(
+        supervisor.handlers["subagents.interrupt"]({ agentId: "sub-alpha" }, scope),
+      ).rejects.toMatchObject({ code: "internal" });
+      const listAfterFailedStop = (await supervisor.handlers["subagents.list"]({}, scope)) as {
+        agents: Array<{ agentId: string; status: string }>;
+      };
+      expect(listAfterFailedStop.agents[0].status).toBe("running");
+
+      // Successful interrupt updates status to "stopped"
+      subagentInterruptShouldFail = false;
+      const interruptRes = (await supervisor.handlers["subagents.interrupt"](
+        { agentId: "sub-alpha" },
+        scope,
+      )) as { interrupted: boolean; agentId: string; status: string };
+      expect(interruptRes).toEqual({
+        interrupted: true,
+        agentId: "sub-alpha",
+        status: "stopped",
+      });
+
+      // 5. -32601 on subagent.steer degrades subagents.steer capability; -32601 on subagent.list returns last-known roster in read-only mode
+      subagentSteerNotFound = true;
+      await expect(
+        supervisor.handlers["subagents.steer"]({ agentId: "sub-alpha", text: "retry" }, scope),
+      ).rejects.toMatchObject({ code: "capability_unavailable" });
+      const capAfterSteer404 = (await supervisor.handlers["capabilities.describe"](
+        {},
+        null,
+      )) as CapabilitySnapshot;
+      expect(
+        capAfterSteer404.entries.find((e) => e.actionId === "subagents.steer")?.runtimeStatus,
+      ).toBe("unavailable");
+
+      subagentListNotFound = true;
+      const listFallback = (await supervisor.handlers["subagents.list"]({}, scope)) as {
+        agents: Array<{ agentId: string; status: string; lastKnown?: boolean }>;
+        readOnly: boolean;
+        lastKnown: boolean;
+      };
+      expect(listFallback.readOnly).toBe(true);
+      expect(listFallback.lastKnown).toBe(true);
+      expect(listFallback.agents).toHaveLength(1);
+      expect(listFallback.agents[0]).toMatchObject({
+        agentId: "sub-alpha",
+        status: "stopped",
+        lastKnown: true,
+      });
+
+      // 6. Checkpoints: list & diff work, while missing rollback.restore reports canRestore: false and rejects restore with capability_unavailable
+      const ckptList = (await supervisor.handlers["checkpoints.list"]({}, scope)) as {
+        checkpoints: Array<{ checkpointId: string; title: string }>;
+        canRestore: boolean;
+      };
+      expect(ckptList.canRestore).toBe(false);
+      expect(ckptList.checkpoints).toHaveLength(1);
+      expect(ckptList.checkpoints[0].checkpointId).toBe("ckpt-101");
+
+      const ckptDiff = (await supervisor.handlers["checkpoints.diff"](
+        { checkpointId: "ckpt-101" },
+        scope,
+      )) as { diff: { checkpointId: string; filesChanged: number; patch: string } };
+      expect(ckptDiff.diff.checkpointId).toBe("ckpt-101");
+      expect(ckptDiff.diff.filesChanged).toBe(1);
+
+      const currentCap = (await supervisor.handlers["capabilities.describe"](
+        {},
+        null,
+      )) as CapabilitySnapshot;
+      await expect(
+        supervisor.handlers["checkpoints.restore"](
+          {
+            checkpointId: "ckpt-101",
+            confirmed: true,
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-1",
+            generation: currentCap.generation,
+          },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "capability_unavailable" });
+
+      // 7. Reconnect with rollback.restore enabled -> generation bumps (invalidating old tail generation) and restore enforces confirmation + scope + generation
+      checkpointRestoreEnabled = true;
+      await supervisor.handlers["connections.retry"]({ connectionId: "local" }, null);
+      const capAfterReconnect = (await supervisor.handlers["capabilities.describe"](
+        {},
+        null,
+      )) as CapabilitySnapshot;
+      expect(capAfterReconnect.generation).toBeGreaterThan(genBeforeReconnect);
+      expect(
+        capAfterReconnect.entries.find((e) => e.actionId === "checkpoint.restore")?.runtimeStatus,
+      ).toBe("available");
+
+      // Missing confirmed: true -> invalid_request
+      await expect(
+        supervisor.handlers["checkpoints.restore"](
+          {
+            checkpointId: "ckpt-101",
+            confirmed: false,
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-1",
+            generation: capAfterReconnect.generation,
+          },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+
+      // Cross-scope binding (profileId: "ops" vs active "default") -> scope_mismatch
+      await expect(
+        supervisor.handlers["checkpoints.restore"](
+          {
+            checkpointId: "ckpt-101",
+            confirmed: true,
+            connectionId: "local",
+            profileId: "ops",
+            sessionId: "sess-1",
+            generation: capAfterReconnect.generation,
+          },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "scope_mismatch" });
+
+      // Stale generation -> conflict
+      await expect(
+        supervisor.handlers["checkpoints.restore"](
+          {
+            checkpointId: "ckpt-101",
+            confirmed: true,
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-1",
+            generation: genBeforeReconnect,
+          },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "conflict" });
+
+      // Gateway RPC failure on restore -> safe error code without crashing
+      checkpointRestoreShouldFail = true;
+      await expect(
+        supervisor.handlers["checkpoints.restore"](
+          {
+            checkpointId: "ckpt-101",
+            confirmed: true,
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-1",
+            generation: capAfterReconnect.generation,
+          },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "internal" });
+
+      // Valid confirmed restore with matching scope & generation -> succeeds
+      checkpointRestoreShouldFail = false;
+      const restoreRes = (await supervisor.handlers["checkpoints.restore"](
+        {
+          checkpointId: "ckpt-101",
+          confirmed: true,
+          connectionId: "local",
+          profileId: "default",
+          sessionId: "sess-1",
+          generation: capAfterReconnect.generation,
+        },
+        scope,
+      )) as { restored: boolean; checkpointId: string; sessionId: string };
+      expect(restoreRes).toEqual({
+        restored: true,
+        checkpointId: "ckpt-101",
+        sessionId: "sess-1",
+      });
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

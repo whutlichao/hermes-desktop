@@ -432,4 +432,100 @@ describe("CapabilityRegistry 21-domain matrix, explicit aliases & invariants (S0
       returnTargetId: null,
     });
   });
+
+  it("models Subagents (list/steer/interrupt/tail) and Checkpoint (list/diff/restore) with explicit aliases, per-action -32601 degradation, and missing rollback.restore hiding restore (Ticket #41)", () => {
+    expect(resolveExplicitMethodAlias("subagents.list")).toBe("subagent.list");
+    expect(resolveExplicitMethodAlias("subagents.steer")).toBe("subagent.steer");
+    expect(resolveExplicitMethodAlias("subagents.interrupt")).toBe("subagent.interrupt");
+    expect(resolveExplicitMethodAlias("subagents.tail")).toBe("subagent.tail");
+    expect(resolveExplicitMethodAlias("checkpoint.list")).toBe("rollback.list");
+    expect(resolveExplicitMethodAlias("checkpoint.diff")).toBe("rollback.diff");
+    expect(resolveExplicitMethodAlias("checkpoint.restore")).toBe("rollback.restore");
+
+    const registry = new CapabilityRegistry();
+    const snap = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 3,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "sha_ckpt_sub",
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: [
+          "prompt.submit",
+          "session.list",
+          "subagent.list",
+          "subagent.steer",
+          "subagent.interrupt",
+          "subagent.tail",
+          "rollback.list",
+          "rollback.diff",
+          // Note: rollback.restore is intentionally absent!
+        ],
+        refused_methods: ["subagent.delete"],
+      },
+    });
+
+    const subEntries = snap.entries.filter((e) => e.domain === "subagents");
+    expect(subEntries.map((e) => e.actionId)).toEqual([
+      "subagents.list",
+      "subagents.steer",
+      "subagents.interrupt",
+      "subagents.tail",
+    ]);
+    for (const entry of subEntries) {
+      expect(entry.runtimeStatus).toBe("available");
+      expect(entry.evidenceTestId).toBeTruthy();
+      expect(entry.handlerId).toBeTruthy();
+    }
+
+    const ckptEntries = snap.entries.filter((e) => e.domain === "checkpoint");
+    expect(ckptEntries.map((e) => e.actionId)).toEqual([
+      "checkpoint.list",
+      "checkpoint.diff",
+      "checkpoint.restore",
+    ]);
+    expect(ckptEntries.find((e) => e.actionId === "checkpoint.list")?.runtimeStatus).toBe("available");
+    expect(ckptEntries.find((e) => e.actionId === "checkpoint.diff")?.runtimeStatus).toBe("available");
+    expect(ckptEntries.find((e) => e.actionId === "checkpoint.restore")?.runtimeStatus).toBe("unavailable");
+
+    // -32601 on subagent.steer and subagent.interrupt degrades steer/interrupt while keeping list/tail available
+    registry.markMethodNotFound({
+      method: "subagent.steer",
+      expectedOwnerGeneration: 3,
+      expectedAuthorityEpoch: 1,
+    });
+    const afterSubNotFound = registry.markMethodNotFound({
+      method: "subagent.interrupt",
+      expectedOwnerGeneration: 3,
+      expectedAuthorityEpoch: 1,
+    });
+    expect(
+      afterSubNotFound.entries.find((e) => e.actionId === "subagents.list")?.runtimeStatus,
+    ).toBe("available");
+    expect(
+      afterSubNotFound.entries.find((e) => e.actionId === "subagents.tail")?.runtimeStatus,
+    ).toBe("available");
+    expect(
+      afterSubNotFound.entries.find((e) => e.actionId === "subagents.steer")?.runtimeStatus,
+    ).toBe("unavailable");
+    expect(
+      afterSubNotFound.entries.find((e) => e.actionId === "subagents.interrupt")?.runtimeStatus,
+    ).toBe("unavailable");
+
+    // If rollback.restore is in refused_methods, checkpoint.restore entry is omitted completely
+    const refusedSnap = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 4,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "sha_refused",
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: ["rollback.list", "rollback.diff"],
+        refused_methods: ["rollback.restore"],
+      },
+    });
+    expect(refusedSnap.entries.some((e) => e.actionId === "checkpoint.restore")).toBe(false);
+  });
 });

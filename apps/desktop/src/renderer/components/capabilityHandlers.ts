@@ -20,6 +20,7 @@ export const CAPABILITY_HANDLER_IDS = [
   "workspace.openFiles",
   "workspace.openGit",
   "workspace.openAgents",
+  "workspace.openCheckpoints",
 ] as const;
 
 export type CapabilityHandlerId = (typeof CAPABILITY_HANDLER_IDS)[number];
@@ -34,7 +35,7 @@ export interface CapabilityHandlerDependencies {
   openSessions: () => void;
   resumeActiveSession: () => void | Promise<void>;
   copyCli: (entry: CapabilityEntry) => void | Promise<void>;
-  openWorkspaceTab: (tab: "artifacts" | "files" | "git" | "agents" | "terminal") => void;
+  openWorkspaceTab: (tab: "artifacts" | "files" | "git" | "agents" | "checkpoints" | "terminal") => void;
   toggleWorkspace: () => void;
   openSettings: () => void;
   openCapabilities: () => void;
@@ -90,6 +91,9 @@ export function createCapabilityHandlers(
     },
     "workspace.openAgents": () => {
       deps.openWorkspaceTab("agents");
+    },
+    "workspace.openCheckpoints": () => {
+      deps.openWorkspaceTab("checkpoints");
     },
   };
 }
