@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client"],
+    "paths": {
+      "@hermes/host-adapter": ["./src/renderer/host/electronAdapter.ts"]
+    }
+  },
+  "references": [
+    { "path": "../../packages/contracts" },
+    { "path": "../../packages/domain" }
+  ],
+  "include": [
+    "vite.web.config.ts",
+    "src/renderer/**/*",
+    "src/mock/**/*"
+  ]
+}

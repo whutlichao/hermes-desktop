@@ -1,0 +1,608 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+  Command,
+  PanelRight,
+  Plus,
+  Settings2,
+} from "lucide-react";
+import type {
+  AppCommand,
+  FleetSnapshot,
+  WorkspaceTab,
+} from "@hermes/contracts";
+import {
+  createInitialShellState,
+  createSequenceTracker,
+  deriveViewportMode,
+  getCopy,
+  getTopmostSurface,
+  shellReducer,
+} from "@hermes/domain";
+import { host } from "@hermes/host-adapter";
+import { HermesMark } from "./components/HermesMark";
+import { FocusDialog } from "./components/Modal";
+
+const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string }> = [
+  { id: "artifacts", label: "Artifacts" },
+  { id: "files", label: "Files" },
+  { id: "git", label: "Git" },
+  { id: "agents", label: "Agents" },
+  { id: "terminal", label: "Terminal" },
+];
+
+export default function App() {
+  const [state, dispatch] = useReducer(shellReducer, undefined, createInitialShellState);
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const trackerRef = useRef(createSequenceTracker());
+
+  const viewportMode = deriveViewportMode(viewportWidth);
+  const topmostSurface = getTopmostSurface(state);
+  const hasModal = topmostSurface !== null;
+
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Keep background inert when a modal dialog is open (useLayoutEffect ensures inert is cleared before focus returns)
+  useLayoutEffect(() => {
+    const el = shellRef.current;
+    if (!el) return;
+    if (hasModal) {
+      el.setAttribute("inert", "");
+    } else {
+      el.removeAttribute("inert");
+    }
+  }, [hasModal]);
+
+  const handleAppCommand = useCallback((command: AppCommand) => {
+    switch (command.type) {
+      case "open_palette":
+        dispatch({ type: "OPEN_SURFACE", surface: "palette" });
+        dispatch({ type: "ANNOUNCE", message: getCopy("palette.title") });
+        break;
+      case "open_settings":
+        dispatch({ type: "OPEN_SURFACE", surface: "settings" });
+        dispatch({ type: "ANNOUNCE", message: getCopy("settings.title") });
+        break;
+      case "toggle_workspace":
+        dispatch({ type: "TOGGLE_WORKSPACE" });
+        break;
+      case "new_session":
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy("empty.body"),
+        });
+        break;
+      case "open_shortcuts":
+        dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" });
+        dispatch({ type: "ANNOUNCE", message: getCopy("shortcuts.title") });
+        break;
+      case "close_window":
+      case "focus_scope":
+        break;
+    }
+  }, []);
+
+  // HostBridge bootstrap: hello + fleet subscription + native command listener
+  useEffect(() => {
+    let active = true;
+    void host.request("bridge.hello", {}).then((res) => {
+      if (!active || !res.ok) return;
+      dispatch({ type: "HYDRATE_HELLO", appInfo: res.value as NonNullable<typeof state.appInfo> });
+    });
+
+    const unsubFleet = host.subscribe("fleet", null, (event) => {
+      const accepted = trackerRef.current.accept(event);
+      if (accepted.status === "applied") {
+        const snapshot = event.payload as FleetSnapshot;
+        dispatch({
+          type: "APPLY_FLEET_SNAPSHOT",
+          connections: snapshot.connections,
+          profiles: snapshot.profiles,
+          sessions: snapshot.sessions,
+          activeScope: snapshot.activeScope,
+          activeSessionId: snapshot.activeSessionId,
+        });
+      }
+    });
+
+    const unsubCmd = host.onCommand(handleAppCommand);
+    return () => {
+      active = false;
+      unsubFleet();
+      unsubCmd();
+    };
+  }, [handleAppCommand]);
+
+  // Global keyboard handler (Esc single-layer dismissal; web-mode shortcuts)
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing) return;
+
+      if (event.key === "Escape") {
+        if (state.surfaceStack.length > 0) {
+          event.preventDefault();
+          dispatch({ type: "CLOSE_TOPMOST_SURFACE" });
+          return;
+        }
+        if (state.workspace.mode === "open") {
+          event.preventDefault();
+          dispatch({ type: "SET_WORKSPACE_MODE", mode: "hidden" });
+        }
+        return;
+      }
+
+      // In Electron mode, native menu accelerators dispatch AppCommands via IPC
+      if (state.appInfo?.mode === "electron") return;
+
+      const mod = event.metaKey || event.ctrlKey;
+      if (!mod) return;
+      const key = event.key.toLowerCase();
+
+      if (key === "k") {
+        event.preventDefault();
+        handleAppCommand({ type: "open_palette" });
+      } else if (event.key === ",") {
+        event.preventDefault();
+        handleAppCommand({ type: "open_settings" });
+      } else if (key === "b") {
+        event.preventDefault();
+        handleAppCommand({ type: "toggle_workspace" });
+      } else if (key === "n") {
+        event.preventDefault();
+        handleAppCommand({ type: "new_session" });
+      } else if (event.key === "?" || (event.shiftKey && event.key === "/")) {
+        event.preventDefault();
+        handleAppCommand({ type: "open_shortcuts" });
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleAppCommand, state.appInfo?.mode, state.surfaceStack.length, state.workspace.mode]);
+
+  const paletteCommands = useMemo(
+    () => [
+      {
+        id: "cmd-new-session",
+        label: getCopy("palette.cmdNewSession"),
+        hint: getCopy("palette.cmdNewSessionHint"),
+        shortcut: "⌘N",
+        run: () => {
+          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
+          handleAppCommand({ type: "new_session" });
+        },
+      },
+      {
+        id: "cmd-settings",
+        label: getCopy("palette.cmdSettings"),
+        hint: getCopy("palette.cmdSettingsHint"),
+        shortcut: "⌘,",
+        run: () => {
+          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
+          handleAppCommand({ type: "open_settings" });
+        },
+      },
+      {
+        id: "cmd-workspace",
+        label: getCopy("palette.cmdWorkspace"),
+        hint: getCopy("palette.cmdWorkspaceHint"),
+        shortcut: "⌘B",
+        run: () => {
+          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
+          handleAppCommand({ type: "toggle_workspace" });
+        },
+      },
+      {
+        id: "cmd-capabilities",
+        label: getCopy("palette.cmdCapabilities"),
+        hint: getCopy("palette.cmdCapabilitiesHint"),
+        shortcut: "",
+        run: () => {
+          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
+          dispatch({ type: "OPEN_SURFACE", surface: "capabilities" });
+        },
+      },
+      {
+        id: "cmd-shortcuts",
+        label: getCopy("palette.cmdShortcuts"),
+        hint: getCopy("palette.cmdShortcutsHint"),
+        shortcut: "⌘?",
+        run: () => {
+          dispatch({ type: "CLOSE_SURFACE", surface: "palette" });
+          handleAppCommand({ type: "open_shortcuts" });
+        },
+      },
+    ],
+    [handleAppCommand],
+  );
+
+  const filteredCommands = useMemo(() => {
+    const q = paletteQuery.trim().toLowerCase();
+    if (!q) return paletteCommands;
+    return paletteCommands.filter(
+      (item) =>
+        item.label.toLowerCase().includes(q) || item.hint.toLowerCase().includes(q),
+    );
+  }, [paletteCommands, paletteQuery]);
+
+  const isMockMode = state.appInfo?.mode === "mock";
+
+  return (
+    <>
+      <div ref={shellRef} className="app-window">
+        <a
+          href="#composer-input"
+          className="skip-link"
+          onClick={(event) => {
+            event.preventDefault();
+            composerRef.current?.focus();
+          }}
+        >
+          {getCopy("skip.toComposer")}
+        </a>
+
+        <header className="window-titlebar">
+          <div className="window-title">
+            <HermesMark size={14} />
+            <span>HERMES DESKTOP</span>
+            <span className="window-title-sub">{getCopy("app.subtitle")}</span>
+          </div>
+          <div className="window-meta">
+            <button
+              type="button"
+              className="route-chip"
+              onClick={() => dispatch({ type: "OPEN_SURFACE", surface: "palette" })}
+            >
+              <Command size={12} aria-hidden="true" />
+              <span>{getCopy("palette.title")}</span>
+              <kbd className="kbd">⌘K</kbd>
+            </button>
+          </div>
+        </header>
+
+        <div className="app-shell">
+          {viewportMode === "rail" && (
+            <nav className="sidebar" aria-label={getCopy("nav.sessionsLandmark")}>
+              <div className="sidebar-head">
+                <span className="sidebar-title">{getCopy("nav.sessionsTab")}</span>
+                <span className="sidebar-count">{state.sessions.length}</span>
+              </div>
+
+              <button
+                type="button"
+                className="sidebar-new-btn"
+                onClick={() => handleAppCommand({ type: "new_session" })}
+              >
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <Plus size={13} aria-hidden="true" />
+                  {getCopy("nav.newSession")}
+                </span>
+                <kbd className="kbd">⌘N</kbd>
+              </button>
+
+              <div className="sidebar-empty">
+                <strong>{getCopy("nav.sessionsEmptyTitle")}</strong>
+                <p>{getCopy("nav.sessionsEmptyBody")}</p>
+              </div>
+
+              <div className="sidebar-footer">
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  style={{ width: "100%", justifyContent: "space-between" }}
+                  onClick={() => dispatch({ type: "OPEN_SURFACE", surface: "settings" })}
+                >
+                  <span>{getCopy("nav.openScopeSettings")}</span>
+                  <Settings2 size={13} aria-hidden="true" />
+                </button>
+              </div>
+            </nav>
+          )}
+
+          <main id="main-content" className="main-column">
+            <div className="route-strip">
+              {viewportMode === "popover" && (
+                <button
+                  type="button"
+                  className="route-chip"
+                  onClick={() =>
+                    dispatch({ type: "OPEN_SURFACE", surface: "sessionsPopover" })
+                  }
+                >
+                  <span>
+                    {getCopy("nav.sessionsCount")} {state.sessions.length}
+                  </span>
+                </button>
+              )}
+
+              <div className="route-chain" aria-label="当前路由上下文">
+                <span>{getCopy("route.you")}</span>
+                <span className="route-arrow" aria-hidden="true">
+                  →
+                </span>
+                <span>{getCopy("route.unconnectedGateway")}</span>
+                <span className="route-arrow" aria-hidden="true">
+                  →
+                </span>
+                <span>{getCopy("route.noProfile")}</span>
+              </div>
+
+              <button
+                type="button"
+                className="route-chip"
+                onClick={() => dispatch({ type: "OPEN_SURFACE", surface: "scopePopover" })}
+              >
+                <span className="status-dot" aria-hidden="true" />
+                <span>{getCopy("route.statusUnconnected")}</span>
+              </button>
+
+              <div className="route-actions">
+                <button
+                  type="button"
+                  className="route-chip"
+                  onClick={() =>
+                    dispatch({ type: "OPEN_SURFACE", surface: "capabilities" })
+                  }
+                >
+                  {getCopy("route.openCapabilities")}
+                </button>
+                <button
+                  type="button"
+                  className="route-chip"
+                  aria-expanded={state.workspace.mode === "open"}
+                  onClick={() => dispatch({ type: "TOGGLE_WORKSPACE" })}
+                >
+                  <PanelRight size={13} aria-hidden="true" />
+                  <span>Workspace</span>
+                  <kbd className="kbd">⌘B</kbd>
+                </button>
+              </div>
+            </div>
+
+            <div className="thread-viewport">
+              <div className="thread-column">
+                <section className="empty-relay-card" aria-labelledby="empty-relay-heading">
+                  <h1 id="empty-relay-heading">{getCopy("empty.title")}</h1>
+                  <p>{getCopy("empty.body")}</p>
+                  <div className="empty-relay-actions">
+                    <button
+                      type="button"
+                      className="button button-primary"
+                      onClick={() =>
+                        dispatch({ type: "OPEN_SURFACE", surface: "settings" })
+                      }
+                    >
+                      {getCopy("empty.actionSettings")}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() =>
+                        dispatch({ type: "OPEN_SURFACE", surface: "palette" })
+                      }
+                    >
+                      {getCopy("empty.actionPalette")}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() =>
+                        dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" })
+                      }
+                    >
+                      {getCopy("empty.actionShortcuts")}
+                    </button>
+                  </div>
+                </section>
+
+                <form
+                  className="composer-shell"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                  }}
+                >
+                  <label htmlFor="composer-input" className="sr-only">
+                    {getCopy("composer.label")}
+                  </label>
+                  <textarea
+                    id="composer-input"
+                    ref={composerRef}
+                    className="composer-textarea"
+                    rows={2}
+                    readOnly
+                    aria-disabled="true"
+                    placeholder={getCopy("composer.placeholder")}
+                  />
+                  <div className="composer-bar">
+                    <span className="composer-hint">{getCopy("composer.unconnectedHint")}</span>
+                    <button type="submit" className="button button-primary" disabled>
+                      {getCopy("composer.send")}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </main>
+
+          {state.workspace.mode === "open" && (
+            <aside className="workspace-drawer" aria-label={getCopy("workspace.title")}>
+              <div className="workspace-header">
+                <strong>{getCopy("workspace.title")}</strong>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() =>
+                      dispatch({ type: "SET_WORKSPACE_MODE", mode: "hidden" })
+                    }
+                  >
+                    {getCopy("workspace.hide")}
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={() =>
+                      dispatch({ type: "SET_WORKSPACE_MODE", mode: "closed" })
+                    }
+                  >
+                    {getCopy("workspace.close")}
+                  </button>
+                </div>
+              </div>
+
+              <div className="workspace-tabs" role="tablist" aria-label="Workspace 面板标签">
+                {WORKSPACE_TABS.map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={state.workspace.activeTab === tab.id}
+                    className={[
+                      "workspace-tab",
+                      state.workspace.activeTab === tab.id && "is-active",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    onClick={() => dispatch({ type: "SET_WORKSPACE_TAB", tab: tab.id })}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="workspace-empty">{getCopy("workspace.emptyBody")}</div>
+            </aside>
+          )}
+        </div>
+
+        <footer className="status-footer">
+          <span>{getCopy("status.footer")}</span>
+          <span>
+            {isMockMode ? getCopy("status.modeMock") : getCopy("status.modeElectron")}
+          </span>
+          <span>{getCopy("route.capabilitiesBadge")}</span>
+        </footer>
+
+        <div className="sr-only" aria-live="polite" role="status">
+          {state.liveAnnouncement}
+        </div>
+      </div>
+
+      {/* Modal surfaces live outside the inert app shell */}
+      <FocusDialog
+        open={state.surfaceStack.includes("palette")}
+        title={getCopy("palette.title")}
+        closeLabel={getCopy("shortcuts.close")}
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "palette" })}
+      >
+        <label htmlFor="palette-search-input" className="sr-only">
+          {getCopy("palette.placeholder")}
+        </label>
+        <input
+          id="palette-search-input"
+          className="palette-search"
+          value={paletteQuery}
+          onChange={(event) => setPaletteQuery(event.target.value)}
+          placeholder={getCopy("palette.placeholder")}
+        />
+        {filteredCommands.length === 0 ? (
+          <p>{getCopy("palette.empty")}</p>
+        ) : (
+          filteredCommands.map((cmd) => (
+            <button
+              key={cmd.id}
+              type="button"
+              className="palette-item"
+              onClick={cmd.run}
+            >
+              <span>
+                <strong>{cmd.label}</strong>
+                <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
+                  {cmd.hint}
+                </span>
+              </span>
+              {cmd.shortcut && <kbd className="kbd">{cmd.shortcut}</kbd>}
+            </button>
+          ))
+        )}
+      </FocusDialog>
+
+      <FocusDialog
+        open={state.surfaceStack.includes("settings")}
+        title={getCopy("settings.title")}
+        description={getCopy("settings.description")}
+        closeLabel={getCopy("settings.close")}
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "settings" })}
+      >
+        <p>{getCopy("settings.emptyGateways")}</p>
+      </FocusDialog>
+
+      <FocusDialog
+        open={state.surfaceStack.includes("capabilities")}
+        title={getCopy("capabilities.title")}
+        description={getCopy("capabilities.summary")}
+        closeLabel={getCopy("capabilities.close")}
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "capabilities" })}
+      >
+        <p>{getCopy("empty.body")}</p>
+        <div className="deferred-footnote">{getCopy("capabilities.deferredFootnote")}</div>
+      </FocusDialog>
+
+      <FocusDialog
+        open={state.surfaceStack.includes("shortcuts")}
+        title={getCopy("shortcuts.title")}
+        description={getCopy("shortcuts.description")}
+        closeLabel={getCopy("shortcuts.close")}
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "shortcuts" })}
+      >
+        <div className="shortcut-row">
+          <span>{getCopy("palette.title")}</span>
+          <kbd className="kbd">⌘K</kbd>
+        </div>
+        <div className="shortcut-row">
+          <span>{getCopy("settings.title")}</span>
+          <kbd className="kbd">⌘,</kbd>
+        </div>
+        <div className="shortcut-row">
+          <span>{getCopy("palette.cmdWorkspace")}</span>
+          <kbd className="kbd">⌘B</kbd>
+        </div>
+        <div className="shortcut-row">
+          <span>{getCopy("nav.newSession")}</span>
+          <kbd className="kbd">⌘N</kbd>
+        </div>
+        <div className="shortcut-row">
+          <span>{getCopy("shortcuts.title")}</span>
+          <kbd className="kbd">⌘?</kbd>
+        </div>
+      </FocusDialog>
+
+      <FocusDialog
+        open={state.surfaceStack.includes("sessionsPopover")}
+        title={getCopy("popover.sessionsTitle")}
+        closeLabel={getCopy("popover.close")}
+        className="is-popover"
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" })}
+      >
+        <strong>{getCopy("nav.sessionsEmptyTitle")}</strong>
+        <p>{getCopy("nav.sessionsEmptyBody")}</p>
+      </FocusDialog>
+
+      <FocusDialog
+        open={state.surfaceStack.includes("scopePopover")}
+        title={getCopy("scope.popoverTitle")}
+        closeLabel={getCopy("scope.close")}
+        className="is-popover"
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" })}
+      >
+        <p>{getCopy("scope.empty")}</p>
+      </FocusDialog>
+    </>
+  );
+}
