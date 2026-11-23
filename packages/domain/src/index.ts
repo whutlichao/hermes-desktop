@@ -15,3 +15,4 @@ export * from "./settingsAndScope";
 export * from "./fleetLifecycle";
 export * from "./backgroundJournal";
 export * from "./approvalCoordinator";
+export * from "./terminal";

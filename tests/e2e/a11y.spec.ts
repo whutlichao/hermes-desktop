@@ -676,6 +676,26 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await page.getByRole("button", { name: /Sessions\s+2/ }).click();
     await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
     await checkAxe("1280 popover with attention badges");
+    await page.keyboard.press("Escape");
+
+    // Workspace Git deep links & Terminal running + busy inline confirmation a11y
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.getByRole("button", { name: /Workspace/ }).click();
+    const workspace = page.getByRole("complementary", { name: "Workspace" });
+    await expect(workspace).toBeVisible();
+
+    await workspace.getByRole("tab", { name: "Git" }).click();
+    await expect(workspace.getByTestId("workspace-git-panel")).toBeVisible();
+    await checkAxe("workspace Git deep links tab");
+
+    await workspace.getByRole("tab", { name: "Terminal" }).click();
+    await workspace.getByTestId("workspace-terminal-open-btn").click();
+    await expect(workspace.getByTestId("workspace-terminal-status")).toContainText("运行中");
+    await workspace.getByTestId("workspace-terminal-input").fill("sleep 30");
+    await workspace.getByTestId("workspace-terminal-send-btn").click();
+    await workspace.getByTestId("workspace-terminal-close-btn").click();
+    await expect(workspace.getByTestId("workspace-terminal-busy-confirm")).toBeVisible();
+    await checkAxe("workspace Terminal tab with inline busy close confirmation");
   });
 
 

@@ -41,7 +41,11 @@ import {
   type ArtifactAnnotation,
   type CheckpointDiffSnapshot,
   type ErrorCode,
+  type ExternalAttribution,
   type SubagentTailSnapshot,
+  type TerminalCloseResult,
+  type TerminalOpenResult,
+  type TerminalSnapshot,
   type WorkspaceAgentItem,
   type WorkspaceArtifactItem,
   type WorkspaceCheckpointItem,
@@ -54,12 +58,17 @@ import {
   CAPABILITY_DOMAIN_CATALOG,
   CapabilityRegistry,
   SETTINGS_FIELD_CATALOG,
+  TERMINAL_DEFAULT_COLS,
+  TERMINAL_DEFAULT_ROWS,
+  appendTerminalChunk,
   boundSubagentTailLines,
   computeSessionPinned,
   assertApprovalDismissPayloadSafe,
   assertApprovalRespondPayloadSafe,
   createBridgeDispatcher,
   createEmptyRegistryDocument,
+  createEmptyTerminalSnapshot,
+  createTerminalScrollbackState,
   diffRegistries,
   formatAppInfoDisplay,
   formatDisplaySafeCliSummary,
@@ -68,10 +77,13 @@ import {
   getCopy,
   getSshFailureCopy,
   isAllowedGatewayConfigKey,
+  makeScopeKey,
   mapLocalFailure,
   normalizeRegistryDocument,
   projectRegistrySnapshot,
+  projectTerminalScrollbackLines,
   redactSensitiveData,
+  resolveExternalAttribution,
   sanitizeDiagnosticsPayload,
   validateCheckpointRestoreBinding,
   validateClientAddConnection,
@@ -81,6 +93,7 @@ import {
   validateSshTargetInput,
   type ApprovalIngestInput,
   type NormalizedRegistryResult,
+  type TerminalScrollbackState,
 } from "@hermes/domain";
 
 declare const __HERMES_MOCK_BUILD_META__:
@@ -188,6 +201,14 @@ interface MockE2EFixture {
   approvals?: ApprovalIngestInput[];
   highRiskConfirmResult?: boolean;
   approvalRespondOutcome?: "settled" | "settled_elsewhere_by_server";
+  terminal?: {
+    denyFirstGrant?: boolean;
+    denyRootGrant?: boolean;
+    initialLines?: string[];
+    foregroundBusy?: boolean;
+    foregroundProcessName?: string;
+    attribution?: ExternalAttribution;
+  };
 }
 
 function readE2EFixture(): MockE2EFixture | undefined {
@@ -288,6 +309,127 @@ export function createMockHostBridge(): HermesHost {
     listener: (event: BridgeEvent) => void;
   }>();
 
+  interface MockTerminalRecord {
+    scopeKey: string;
+    scope: BridgeScope;
+    terminalId: string | null;
+    status: TerminalSnapshot["status"];
+    cols: number;
+    rows: number;
+    granted: boolean;
+    rootGranted: boolean;
+    hasForegroundProcess: boolean;
+    foregroundProcessName?: string;
+    scrollback: TerminalScrollbackState;
+    exitCode: number | null;
+    revision: number;
+    attribution: ExternalAttribution;
+  }
+
+  const MOCK_TERMINAL_STORAGE_KEY = "hermes-mock-terminal-state";
+  const mockTerminals = new Map<string, MockTerminalRecord>();
+  const terminalListeners = new Set<{
+    scopeKey: string;
+    seq: number;
+    listener: (event: BridgeEvent<TerminalSnapshot>) => void;
+  }>();
+
+  try {
+    if (typeof window !== "undefined" && window.sessionStorage) {
+      const savedRaw = window.sessionStorage.getItem(MOCK_TERMINAL_STORAGE_KEY);
+      if (savedRaw) {
+        const parsed = JSON.parse(savedRaw) as Record<string, MockTerminalRecord>;
+        for (const [k, rec] of Object.entries(parsed)) {
+          mockTerminals.set(k, rec);
+        }
+      }
+    }
+  } catch {
+    // Ignore storage read issues in non-browser/restricted mode
+  }
+
+  function persistMockTerminals() {
+    try {
+      if (typeof window !== "undefined" && window.sessionStorage) {
+        const serializable: Record<string, MockTerminalRecord> = {};
+        for (const [k, rec] of mockTerminals.entries()) {
+          serializable[k] = rec;
+        }
+        window.sessionStorage.setItem(MOCK_TERMINAL_STORAGE_KEY, JSON.stringify(serializable));
+      }
+    } catch {
+      // Ignore storage quota issues
+    }
+  }
+
+  function getMockTerminalRecord(scope: BridgeScope): MockTerminalRecord {
+    const cid = scope.connectionId;
+    const pid = scope.profileId ?? "default";
+    const key = makeScopeKey(cid, pid);
+    let rec = mockTerminals.get(key);
+    if (!rec) {
+      rec = {
+        scopeKey: key,
+        scope: { connectionId: cid, profileId: pid },
+        terminalId: null,
+        status: "idle",
+        cols: TERMINAL_DEFAULT_COLS,
+        rows: TERMINAL_DEFAULT_ROWS,
+        granted: false,
+        rootGranted: false,
+        hasForegroundProcess: false,
+        scrollback: createTerminalScrollbackState(),
+        exitCode: null,
+        revision: 0,
+        attribution:
+          readE2EFixture()?.terminal?.attribution ??
+          fixture?.terminal?.attribution ??
+          resolveExternalAttribution({ source: "bundled" }),
+      };
+      mockTerminals.set(key, rec);
+    }
+    return rec;
+  }
+
+  function toMockTerminalSnapshot(rec: MockTerminalRecord): TerminalSnapshot {
+    const lines = projectTerminalScrollbackLines(rec.scrollback);
+    return {
+      terminalId: rec.terminalId,
+      scope: { ...rec.scope },
+      status: rec.status,
+      cols: rec.cols,
+      rows: rec.rows,
+      granted: rec.granted,
+      rootGranted: rec.rootGranted,
+      hasForegroundProcess: rec.hasForegroundProcess,
+      ...(rec.foregroundProcessName ? { foregroundProcessName: rec.foregroundProcessName } : {}),
+      lines,
+      trimmedOldest: rec.scrollback.trimmedOldest,
+      totalBytes: rec.scrollback.totalBytes,
+      lineCount: lines.length,
+      exitCode: rec.exitCode,
+      attribution: rec.attribution,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  function emitMockTerminalSnapshot(rec: MockTerminalRecord) {
+    rec.revision += 1;
+    const snapshot = toMockTerminalSnapshot(rec);
+    for (const sub of terminalListeners) {
+      if (sub.scopeKey !== rec.scopeKey) continue;
+      sub.seq += 1;
+      sub.listener({
+        topic: "terminal",
+        scope: { ...rec.scope },
+        kind: "patch",
+        seq: sub.seq,
+        revision: rec.revision,
+        payload: snapshot,
+      });
+    }
+  }
+
   let currentFleet: FleetSnapshot = fixture?.fleet
     ? structuredClone(fixture.fleet)
     : EMPTY_FLEET;
@@ -328,6 +470,11 @@ export function createMockHostBridge(): HermesHost {
     toolsShowCalls: 0,
     mcpListCalls: 0,
     mcpReloadCalls: 0,
+    terminalOpenCalls: 0,
+    terminalWriteCalls: 0,
+    terminalResizeCalls: 0,
+    terminalCloseCalls: 0,
+    externalLinksOpened: [] as string[],
   };
   if (fixture) {
     (globalThis as { __HERMES_E2E_COUNTS__?: typeof e2eCounts }).__HERMES_E2E_COUNTS__ = e2eCounts;
@@ -2997,6 +3144,7 @@ export function createMockHostBridge(): HermesHost {
         (err as { code?: string }).code = "permission_denied";
         throw err;
       }
+      e2eCounts.externalLinksOpened.push(rawUrl);
       return { opened: true };
     },
     "approvals.list": async (): Promise<ApprovalTopicSnapshot> => {
@@ -3010,6 +3158,239 @@ export function createMockHostBridge(): HermesHost {
     "approvals.dismissOrphaned": async (payload) => {
       const { approvalKey } = assertApprovalDismissPayloadSafe(payload);
       return approvalCoordinator.dismissOrphaned(approvalKey);
+    },
+    "terminal.get": async (_payload, scope) => {
+      const targetScope = scope?.connectionId ? scope : mockActiveScope;
+      if (!targetScope?.connectionId) {
+        return { snapshot: createEmptyTerminalSnapshot(null) };
+      }
+      const rec = getMockTerminalRecord(targetScope);
+      return { snapshot: toMockTerminalSnapshot(rec) };
+    },
+    "terminal.open": async (payload, scope): Promise<TerminalOpenResult> => {
+      e2eCounts.terminalOpenCalls += 1;
+      const targetScope = scope?.connectionId ? scope : mockActiveScope;
+      if (!targetScope?.connectionId) {
+        const err = new Error("Scope required for terminal.open");
+        (err as { code?: string }).code = "invalid_request";
+        throw err;
+      }
+      const liveFixture = readE2EFixture() ?? fixture;
+      const rec = getMockTerminalRecord(targetScope);
+      const cols =
+        typeof payload.cols === "number" && Number.isFinite(payload.cols)
+          ? Math.max(20, Math.round(payload.cols))
+          : rec.cols;
+      const rows =
+        typeof payload.rows === "number" && Number.isFinite(payload.rows)
+          ? Math.max(5, Math.round(payload.rows))
+          : rec.rows;
+      const mode =
+        payload.mode === "new" || payload.mode === "grant_root" ? payload.mode : "open";
+      const wantGrantRoot = Boolean(payload.grantRoot) || mode === "grant_root";
+
+      if (rec.status === "ended" && mode === "open" && !wantGrantRoot) {
+        return {
+          ok: false,
+          granted: rec.granted,
+          snapshot: toMockTerminalSnapshot(rec),
+        };
+      }
+
+      if ((rec.status === "running" || rec.status === "detached") && rec.terminalId) {
+        if (wantGrantRoot && !rec.rootGranted) {
+          if (liveFixture?.terminal?.denyRootGrant) {
+            return {
+              ok: false,
+              granted: false,
+              deniedReason: "root_denied",
+              snapshot: toMockTerminalSnapshot(rec),
+            };
+          }
+          rec.rootGranted = true;
+        }
+        rec.status = "running";
+        rec.cols = cols;
+        rec.rows = rows;
+        persistMockTerminals();
+        emitMockTerminalSnapshot(rec);
+        return { ok: true, granted: true, snapshot: toMockTerminalSnapshot(rec) };
+      }
+
+      if (wantGrantRoot && !rec.rootGranted) {
+        if (liveFixture?.terminal?.denyRootGrant) {
+          rec.status = "grant_denied";
+          rec.granted = false;
+          rec.rootGranted = false;
+          persistMockTerminals();
+          emitMockTerminalSnapshot(rec);
+          return {
+            ok: false,
+            granted: false,
+            deniedReason: "root_denied",
+            snapshot: toMockTerminalSnapshot(rec),
+          };
+        }
+        rec.granted = true;
+        rec.rootGranted = true;
+      } else if (!rec.granted) {
+        if (liveFixture?.terminal?.denyFirstGrant) {
+          rec.status = "grant_denied";
+          rec.granted = false;
+          persistMockTerminals();
+          emitMockTerminalSnapshot(rec);
+          return {
+            ok: false,
+            granted: false,
+            deniedReason: "user_denied",
+            snapshot: toMockTerminalSnapshot(rec),
+          };
+        }
+        rec.granted = true;
+      }
+
+      rec.terminalId = `term_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      rec.status = "running";
+      rec.cols = cols;
+      rec.rows = rows;
+      rec.exitCode = null;
+      rec.hasForegroundProcess = Boolean(liveFixture?.terminal?.foregroundBusy);
+      rec.foregroundProcessName = liveFixture?.terminal?.foregroundProcessName;
+      rec.scrollback = createTerminalScrollbackState();
+      if (liveFixture?.terminal?.initialLines?.length) {
+        rec.scrollback = appendTerminalChunk(
+          rec.scrollback,
+          `${liveFixture.terminal.initialLines.join("\n")}\n`,
+        );
+      } else {
+        rec.scrollback = appendTerminalChunk(rec.scrollback, "$ \n");
+      }
+      if (liveFixture?.terminal?.attribution) {
+        rec.attribution = liveFixture.terminal.attribution;
+      }
+      persistMockTerminals();
+      emitMockTerminalSnapshot(rec);
+      return {
+        ok: true,
+        granted: true,
+        snapshot: toMockTerminalSnapshot(rec),
+      };
+    },
+    "terminal.write": async (payload, scope) => {
+      e2eCounts.terminalWriteCalls += 1;
+      const targetScope = scope?.connectionId ? scope : mockActiveScope;
+      if (!targetScope?.connectionId) {
+        const err = new Error("Scope required");
+        (err as { code?: string }).code = "invalid_request";
+        throw err;
+      }
+      const rec = getMockTerminalRecord(targetScope);
+      if (!rec.terminalId || (rec.status !== "running" && rec.status !== "detached")) {
+        const err = new Error("Terminal not active");
+        (err as { code?: string }).code = "not_found";
+        throw err;
+      }
+      const data = typeof payload.data === "string" ? payload.data : "";
+      const cmd = data.replace(/\r?\n$/, "").trim();
+      let chunk = `$ ${cmd}\n`;
+      if (cmd === "exit") {
+        chunk += "[process exited 0]\n";
+        rec.scrollback = appendTerminalChunk(rec.scrollback, chunk);
+        rec.terminalId = null;
+        rec.status = "ended";
+        rec.hasForegroundProcess = false;
+        rec.foregroundProcessName = undefined;
+        rec.exitCode = 0;
+      } else if (cmd.startsWith("sleep")) {
+        rec.hasForegroundProcess = true;
+        rec.foregroundProcessName = "sleep";
+        chunk += "[foreground running: sleep]\n";
+        rec.scrollback = appendTerminalChunk(rec.scrollback, chunk);
+      } else if (cmd.startsWith("burst:")) {
+        const count = Math.min(12_000, Math.max(1, Number(cmd.slice(6)) || 10_050));
+        const bulk = Array.from({ length: count }, (_, idx) => `burst-line-${idx + 1}`).join("\n");
+        rec.scrollback = appendTerminalChunk(rec.scrollback, `${chunk}${bulk}\n`);
+      } else if (cmd.startsWith("echo ")) {
+        chunk += `${cmd.slice(5)}\n`;
+        rec.scrollback = appendTerminalChunk(rec.scrollback, chunk);
+      } else if (cmd) {
+        chunk += `mock-pty: ${cmd} (cols=${rec.cols}, rows=${rec.rows})\n`;
+        rec.scrollback = appendTerminalChunk(rec.scrollback, chunk);
+      }
+      persistMockTerminals();
+      emitMockTerminalSnapshot(rec);
+      return { ok: true };
+    },
+    "terminal.resize": async (payload, scope) => {
+      e2eCounts.terminalResizeCalls += 1;
+      const targetScope = scope?.connectionId ? scope : mockActiveScope;
+      if (!targetScope?.connectionId) {
+        const err = new Error("Scope required");
+        (err as { code?: string }).code = "invalid_request";
+        throw err;
+      }
+      const rec = getMockTerminalRecord(targetScope);
+      if (!rec.terminalId || (rec.status !== "running" && rec.status !== "detached")) {
+        const err = new Error("Terminal not active");
+        (err as { code?: string }).code = "not_found";
+        throw err;
+      }
+      rec.cols =
+        typeof payload.cols === "number" && Number.isFinite(payload.cols)
+          ? Math.max(20, Math.round(payload.cols))
+          : rec.cols;
+      rec.rows =
+        typeof payload.rows === "number" && Number.isFinite(payload.rows)
+          ? Math.max(5, Math.round(payload.rows))
+          : rec.rows;
+      persistMockTerminals();
+      emitMockTerminalSnapshot(rec);
+      return { ok: true, cols: rec.cols, rows: rec.rows };
+    },
+    "terminal.close": async (payload, scope): Promise<TerminalCloseResult> => {
+      e2eCounts.terminalCloseCalls += 1;
+      const targetScope = scope?.connectionId ? scope : mockActiveScope;
+      if (!targetScope?.connectionId) {
+        const err = new Error("Scope required");
+        (err as { code?: string }).code = "invalid_request";
+        throw err;
+      }
+      const rec = getMockTerminalRecord(targetScope);
+      const mode =
+        payload.mode === "detach" || payload.mode === "terminate" ? payload.mode : "auto";
+      if (!rec.terminalId || (rec.status !== "running" && rec.status !== "detached")) {
+        rec.terminalId = null;
+        rec.status = "idle";
+        rec.hasForegroundProcess = false;
+        rec.foregroundProcessName = undefined;
+        rec.exitCode = null;
+        rec.scrollback = createTerminalScrollbackState();
+        persistMockTerminals();
+        emitMockTerminalSnapshot(rec);
+        return { ok: true, outcome: "closed", snapshot: toMockTerminalSnapshot(rec) };
+      }
+      if (mode === "detach") {
+        rec.status = "detached";
+        persistMockTerminals();
+        emitMockTerminalSnapshot(rec);
+        return { ok: true, outcome: "detached", snapshot: toMockTerminalSnapshot(rec) };
+      }
+      if (mode === "auto" && rec.hasForegroundProcess) {
+        return { ok: false, outcome: "confirm_required", snapshot: toMockTerminalSnapshot(rec) };
+      }
+      rec.terminalId = null;
+      rec.hasForegroundProcess = false;
+      rec.foregroundProcessName = undefined;
+      rec.scrollback = createTerminalScrollbackState();
+      rec.status = mode === "terminate" ? "ended" : "idle";
+      rec.exitCode = 0;
+      persistMockTerminals();
+      emitMockTerminalSnapshot(rec);
+      return {
+        ok: true,
+        outcome: mode === "terminate" ? "terminated" : "closed",
+        snapshot: toMockTerminalSnapshot(rec),
+      };
     },
   });
 
@@ -3283,6 +3664,32 @@ export function createMockHostBridge(): HermesHost {
         return () => {
           approvalListeners.delete(typed);
         };
+      } else if (topic === "terminal") {
+        const targetScope = scope?.connectionId ? scope : mockActiveScope;
+        if (targetScope?.connectionId) {
+          const scopeKey = makeScopeKey(targetScope.connectionId, targetScope.profileId ?? "default");
+          const entry = {
+            scopeKey,
+            seq: 0,
+            listener: listener as (event: BridgeEvent<TerminalSnapshot>) => void,
+          };
+          terminalListeners.add(entry);
+          queueMicrotask(() => {
+            if (!terminalListeners.has(entry)) return;
+            const rec = getMockTerminalRecord(targetScope);
+            entry.listener({
+              topic: "terminal",
+              scope: { ...rec.scope },
+              kind: "snapshot",
+              seq: 0,
+              revision: rec.revision,
+              payload: toMockTerminalSnapshot(rec),
+            });
+          });
+          return () => {
+            terminalListeners.delete(entry);
+          };
+        }
       }
       return () => {
         // No background network resources in MockHostBridge

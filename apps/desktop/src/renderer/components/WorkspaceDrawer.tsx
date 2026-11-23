@@ -1,13 +1,23 @@
-import { useId, useMemo, useState, type FormEvent } from "react";
-import type { BridgeScope, CapabilityEntry, CapabilitySnapshot, WorkspaceTab } from "@hermes/contracts";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
+import type {
+  BridgeScope,
+  CapabilityEntry,
+  CapabilitySnapshot,
+  TerminalSnapshot,
+  WorkspaceTab,
+} from "@hermes/contracts";
 import {
+  buildGitWorktreeDeepLinks,
+  createEmptyTerminalSnapshot,
   getActiveChatWorkspaceView,
   getActiveScopeWorkspaceView,
   getCopy,
   getWorkspaceTabBinding,
   projectArtifactAnnotations,
+  type CopyKey,
   type WorkspaceSessionState,
 } from "@hermes/domain";
+import { AttributionBadge } from "./AttributionBadge";
 
 const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string }> = [
   { id: "artifacts", label: "Artifacts" },
@@ -34,7 +44,7 @@ interface WorkspaceDrawerProps {
   onToggleDir: (relativePath: string) => void;
   onSelectFile: (relativePath: string) => void;
   onSelectFileLine: (line: number) => void;
-  onSelectGitDiff: (relativePath: string) => void;
+  onSelectGitDiff?: (relativePath: string) => void;
   onSelectAgent: (agentId: string) => void;
   onChangeSteerText: (text: string) => void;
   onSteerAgent?: () => void;
@@ -47,6 +57,15 @@ interface WorkspaceDrawerProps {
   onConfirmRestoreCheckpoint?: () => void;
   onCancelRestoreCheckpoint?: () => void;
   onRetryCheckpointAction?: () => void;
+  terminalBusyConfirmOpen?: boolean;
+  onOpenTerminal?: (options?: { mode?: "open" | "new" | "grant_root"; grantRoot?: boolean }) => void;
+  onWriteTerminal?: (data: string) => void;
+  onResizeTerminal?: (cols: number, rows: number) => void;
+  onCloseTerminal?: (mode?: "auto" | "detach" | "terminate") => void;
+  onCancelTerminalBusyConfirm?: () => void;
+  onCopyGitCommand?: (command: string) => void;
+  onOpenExternalUrl?: (url: string) => void;
+  terminalCloseBtnRef?: React.RefObject<HTMLButtonElement>;
 }
 
 export function WorkspaceDrawer({
@@ -65,7 +84,6 @@ export function WorkspaceDrawer({
   onToggleDir,
   onSelectFile,
   onSelectFileLine,
-  onSelectGitDiff,
   onSelectAgent,
   onChangeSteerText,
   onSteerAgent,
@@ -78,16 +96,35 @@ export function WorkspaceDrawer({
   onConfirmRestoreCheckpoint,
   onCancelRestoreCheckpoint,
   onRetryCheckpointAction,
+  terminalBusyConfirmOpen = false,
+  onOpenTerminal,
+  onWriteTerminal,
+  onResizeTerminal,
+  onCloseTerminal,
+  onCancelTerminalBusyConfirm,
+  onCopyGitCommand,
+  onOpenExternalUrl,
+  terminalCloseBtnRef,
 }: WorkspaceDrawerProps) {
   const [xInput, setXInput] = useState("25");
   const [yInput, setYInput] = useState("25");
   const [commentInput, setCommentInput] = useState("");
   const [showAgentErrorDetail, setShowAgentErrorDetail] = useState(false);
   const [showCheckpointErrorDetail, setShowCheckpointErrorDetail] = useState(false);
+  const [terminalInput, setTerminalInput] = useState("");
+  const [colsInput, setColsInput] = useState("80");
+  const [rowsInput, setRowsInput] = useState("24");
+  const [copiedGitId, setCopiedGitId] = useState<string | null>(null);
+  const detachBtnRef = useRef<HTMLButtonElement>(null);
+  const fallbackCloseBtnRef = useRef<HTMLButtonElement>(null);
+  const effectiveCloseBtnRef = terminalCloseBtnRef ?? fallbackCloseBtnRef;
   const xInputId = useId();
   const yInputId = useId();
   const commentInputId = useId();
   const steerInputId = useId();
+  const terminalInputId = useId();
+  const colsInputId = useId();
+  const rowsInputId = useId();
 
   const activeTab = workspaceState.frame.activeTab;
   const binding = getWorkspaceTabBinding(activeTab);
@@ -185,6 +222,44 @@ export function WorkspaceDrawer({
     if (!selectedFile?.content) return [];
     return selectedFile.content.split(/\r?\n/);
   }, [selectedFile?.content]);
+
+  const gitDeepLinks = useMemo(() => buildGitWorktreeDeepLinks(), []);
+  const terminalSnapshot: TerminalSnapshot = useMemo(() => {
+    if (scopeView.terminalSnapshot) {
+      return scopeView.terminalSnapshot;
+    }
+    return createEmptyTerminalSnapshot(activeChatScope, {
+      lines: scopeView.terminalScrollback,
+      lineCount: scopeView.terminalScrollback.length,
+    });
+  }, [activeChatScope, scopeView.terminalScrollback, scopeView.terminalSnapshot]);
+
+  useEffect(() => {
+    setColsInput(String(terminalSnapshot.cols));
+    setRowsInput(String(terminalSnapshot.rows));
+  }, [terminalSnapshot.cols, terminalSnapshot.rows]);
+
+  useEffect(() => {
+    if (terminalBusyConfirmOpen && activeTab === "terminal") {
+      detachBtnRef.current?.focus();
+    }
+  }, [activeTab, terminalBusyConfirmOpen]);
+
+  const getTerminalStatusLabel = (status: TerminalSnapshot["status"]): string => {
+    switch (status) {
+      case "grant_denied":
+        return getCopy("workspace.terminal.statusGrantDenied");
+      case "running":
+        return getCopy("workspace.terminal.statusRunning");
+      case "detached":
+        return getCopy("workspace.terminal.statusDetached");
+      case "ended":
+        return getCopy("workspace.terminal.statusEnded");
+      case "idle":
+      default:
+        return getCopy("workspace.terminal.statusIdle");
+    }
+  };
 
   const isStale =
     binding === "active_chat"
@@ -575,28 +650,93 @@ export function WorkspaceDrawer({
         )}
 
         {activeTab === "git" && (
-          <div className="workspace-panel">
-            {scopeView.gitDiffs.length === 0 ? (
-              <div className="workspace-empty">{getCopy("workspace.git.empty")}</div>
-            ) : (
-              <div className="workspace-item-list">
-                {scopeView.gitDiffs.map((diff) => {
-                  const isSelected = diff.relativePath === scopeView.selectedDiffPath;
-                  return (
-                    <button
-                      key={diff.relativePath}
-                      type="button"
-                      className={["workspace-item-chip", isSelected && "is-active"]
-                        .filter(Boolean)
-                        .join(" ")}
-                      onClick={() => onSelectGitDiff(diff.relativePath)}
-                    >
-                      {diff.status.toUpperCase()} · {diff.relativePath}
-                    </button>
-                  );
-                })}
+          <div className="workspace-panel" data-testid="workspace-git-panel">
+            <div className="cap-notice" role="status" data-testid="workspace-git-boundary">
+              <strong>{getCopy("workspace.git.title")}</strong>
+              <p style={{ margin: "4px 0 0" }}>{gitDeepLinks.boundaryNote}</p>
+            </div>
+
+            <div className="workspace-preview-card" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                type="button"
+                className="button button-secondary"
+                data-testid="workspace-git-open-terminal-btn"
+                onClick={() => onSelectTab("terminal")}
+              >
+                {getCopy("workspace.git.openTerminalAction")}
+              </button>
+              {copiedGitId && (
+                <span className="status-pill is-ok" role="status" data-testid="workspace-git-copied-notice">
+                  {getCopy("workspace.git.copiedNotice")}
+                </span>
+              )}
+            </div>
+
+            <div className="workspace-preview-card">
+              <strong style={{ display: "block", marginBottom: 8 }}>
+                {getCopy("workspace.git.cliSectionTitle")}
+              </strong>
+              <div className="git-deeplink-list">
+                {gitDeepLinks.cliItems.map((item) => (
+                  <div key={item.id} className="git-deeplink-row" data-testid={`workspace-git-cli-item-${item.id}`}>
+                    <div className="git-deeplink-row-head">
+                      <span>{getCopy(item.labelKey as CopyKey)}</span>
+                      <AttributionBadge
+                        attribution={item.attribution}
+                        testId={`workspace-git-attribution-${item.id}`}
+                      />
+                    </div>
+                    <code className="git-deeplink-command">{item.command}</code>
+                    <div className="git-deeplink-row-actions">
+                      <span className="git-never-executed" data-testid={`workspace-git-never-executed-${item.id}`}>
+                        {item.executionNote}
+                      </span>
+                      <button
+                        type="button"
+                        className="button button-secondary"
+                        data-testid={`workspace-git-copy-${item.id}`}
+                        onClick={() => {
+                          onCopyGitCommand?.(item.command);
+                          setCopiedGitId(item.id);
+                        }}
+                      >
+                        {getCopy("workspace.git.copyAction")}
+                      </button>
+                    </div>
+                  </div>
+                ))}
               </div>
-            )}
+            </div>
+
+            <div className="workspace-preview-card">
+              <strong style={{ display: "block", marginBottom: 8 }}>
+                {getCopy("workspace.git.docsSectionTitle")}
+              </strong>
+              <div className="git-deeplink-list">
+                {gitDeepLinks.docLinks.map((doc) => (
+                  <div key={doc.id} className="git-deeplink-row" data-testid={`workspace-git-doc-item-${doc.id}`}>
+                    <div className="git-deeplink-row-head">
+                      <span>{getCopy(doc.labelKey as CopyKey)}</span>
+                      <AttributionBadge
+                        attribution={doc.attribution}
+                        testId={`workspace-git-doc-attribution-${doc.id}`}
+                      />
+                    </div>
+                    <div className="git-deeplink-row-actions">
+                      <span className="git-never-executed">{doc.url}</span>
+                      <button
+                        type="button"
+                        className="button button-secondary"
+                        data-testid={`workspace-git-doc-${doc.id}`}
+                        onClick={() => onOpenExternalUrl?.(doc.url)}
+                      >
+                        {getCopy("workspace.git.openDocsAction")}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         )}
 
@@ -1027,16 +1167,277 @@ export function WorkspaceDrawer({
         )}
 
         {activeTab === "terminal" && (
-          <div className="workspace-panel">
-            {scopeView.terminalScrollback.length === 0 ? (
-              <div className="workspace-empty">{getCopy("workspace.terminal.empty")}</div>
+          <div className="workspace-panel" data-testid="workspace-terminal-panel">
+            <div className="workspace-preview-card">
+              <div className="terminal-status-header">
+                <strong>{getCopy("workspace.terminal.title")}</strong>
+                <div className="terminal-badges">
+                  <span
+                    className={[
+                      "status-pill",
+                      terminalSnapshot.status === "running" && "is-ok",
+                      (terminalSnapshot.status === "grant_denied" || terminalSnapshot.status === "ended") && "is-warn",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    data-testid="workspace-terminal-status"
+                  >
+                    {getTerminalStatusLabel(terminalSnapshot.status)}
+                  </span>
+                  <AttributionBadge
+                    attribution={terminalSnapshot.attribution}
+                    testId="workspace-terminal-attribution"
+                  />
+                </div>
+              </div>
+
+              <div className="terminal-meta-row">
+                <span style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                  {getCopy("workspace.terminal.scopeHint")}
+                </span>
+                {terminalSnapshot.terminalId && (
+                  <code className="terminal-id-chip" data-testid="workspace-terminal-id">
+                    {terminalSnapshot.terminalId}
+                  </code>
+                )}
+                {(terminalSnapshot.status === "running" || terminalSnapshot.status === "detached") && (
+                  <span
+                    className={["status-pill", terminalSnapshot.hasForegroundProcess && "is-warn"]
+                      .filter(Boolean)
+                      .join(" ")}
+                    data-testid="workspace-terminal-fg-badge"
+                  >
+                    {terminalSnapshot.hasForegroundProcess
+                      ? `${getCopy("workspace.terminal.fgBusyBadge")}${terminalSnapshot.foregroundProcessName ? ` (${terminalSnapshot.foregroundProcessName})` : ""}`
+                      : getCopy("workspace.terminal.fgIdleBadge")}
+                  </span>
+                )}
+                {terminalSnapshot.rootGranted && (
+                  <span className="status-pill is-ok" data-testid="workspace-terminal-root-badge">
+                    {getCopy("workspace.terminal.rootGrantedBadge")}
+                  </span>
+                )}
+              </div>
+
+              <div className="terminal-action-bar">
+                {(terminalSnapshot.status === "idle" || terminalSnapshot.status === "grant_denied") && (
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    data-testid="workspace-terminal-open-btn"
+                    onClick={() => onOpenTerminal?.({ mode: "open" })}
+                  >
+                    {getCopy("workspace.terminal.openAction")}
+                  </button>
+                )}
+                {terminalSnapshot.status === "detached" && (
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    data-testid="workspace-terminal-reattach-btn"
+                    onClick={() => onOpenTerminal?.({ mode: "open" })}
+                  >
+                    {getCopy("workspace.terminal.reattachAction")}
+                  </button>
+                )}
+                {terminalSnapshot.status === "ended" && (
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    data-testid="workspace-terminal-new-btn"
+                    onClick={() => onOpenTerminal?.({ mode: "new" })}
+                  >
+                    {getCopy("workspace.terminal.newAction")}
+                  </button>
+                )}
+                {!terminalSnapshot.rootGranted && (
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    data-testid="workspace-terminal-grant-root-btn"
+                    onClick={() => onOpenTerminal?.({ mode: "grant_root", grantRoot: true })}
+                  >
+                    {getCopy("workspace.terminal.grantRootAction")}
+                  </button>
+                )}
+                {(terminalSnapshot.status === "running" ||
+                  terminalSnapshot.status === "detached" ||
+                  terminalSnapshot.status === "ended" ||
+                  terminalSnapshot.lines.length > 0) && (
+                  <button
+                    ref={effectiveCloseBtnRef}
+                    type="button"
+                    className="button button-secondary"
+                    data-testid="workspace-terminal-close-btn"
+                    onClick={() => onCloseTerminal?.("auto")}
+                  >
+                    {getCopy("workspace.terminal.closeAction")}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {terminalSnapshot.status === "grant_denied" && (
+              <div className="cap-notice is-warn" role="alert" data-testid="workspace-terminal-grant-denied-notice">
+                {getCopy("workspace.terminal.grantDeniedNotice")}
+              </div>
+            )}
+
+            {terminalSnapshot.status === "ended" && (
+              <div className="cap-notice is-warn" role="status" data-testid="workspace-terminal-ended-notice">
+                {getCopy("workspace.terminal.endedNotice")}
+              </div>
+            )}
+
+            {terminalSnapshot.trimmedOldest && (
+              <div className="cap-notice is-warn" role="status" data-testid="workspace-terminal-trimmed-notice">
+                {getCopy("workspace.terminal.trimmedNotice")}
+              </div>
+            )}
+
+            {terminalBusyConfirmOpen && terminalSnapshot.status === "running" && (
+              <div
+                className="cap-notice is-warn"
+                role="region"
+                aria-label={getCopy("workspace.terminal.busyConfirmTitle")}
+                data-testid="workspace-terminal-busy-confirm"
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onCancelTerminalBusyConfirm?.();
+                    effectiveCloseBtnRef.current?.focus();
+                  }
+                }}
+              >
+                <strong>{getCopy("workspace.terminal.busyConfirmTitle")}</strong>
+                <p style={{ margin: "4px 0 8px" }}>{getCopy("workspace.terminal.busyConfirmBody")}</p>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button
+                    ref={detachBtnRef}
+                    type="button"
+                    className="button button-primary"
+                    data-testid="workspace-terminal-detach-btn"
+                    onClick={() => onCloseTerminal?.("detach")}
+                  >
+                    {getCopy("workspace.terminal.detachKeepAction")}
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    data-testid="workspace-terminal-terminate-btn"
+                    onClick={() => onCloseTerminal?.("terminate")}
+                  >
+                    {getCopy("workspace.terminal.terminateAction")}
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    data-testid="workspace-terminal-cancel-close-btn"
+                    onClick={() => {
+                      onCancelTerminalBusyConfirm?.();
+                      effectiveCloseBtnRef.current?.focus();
+                    }}
+                  >
+                    {getCopy("workspace.terminal.cancelConfirmAction")}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {terminalSnapshot.lines.length === 0 ? (
+              <div className="workspace-empty" data-testid="workspace-terminal-empty">
+                {getCopy("workspace.terminal.empty")}
+              </div>
             ) : (
               <pre
-                className="workspace-preview-content"
+                className="workspace-preview-content workspace-terminal-screen"
                 data-testid="workspace-terminal-scrollback"
               >
-                {scopeView.terminalScrollback.join("\n")}
+                {terminalSnapshot.lines.join("\n")}
               </pre>
+            )}
+
+            {terminalSnapshot.status === "running" && (
+              <div className="workspace-preview-card terminal-controls-card">
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!terminalInput) return;
+                    const payload = terminalInput.endsWith("\n")
+                      ? terminalInput
+                      : `${terminalInput}\n`;
+                    onWriteTerminal?.(payload);
+                    setTerminalInput("");
+                  }}
+                >
+                  <div className="form-field">
+                    <label htmlFor={terminalInputId}>
+                      {getCopy("workspace.terminal.inputLabel")}
+                    </label>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        id={terminalInputId}
+                        type="text"
+                        className="form-input"
+                        data-testid="workspace-terminal-input"
+                        value={terminalInput}
+                        onChange={(e) => setTerminalInput(e.target.value)}
+                        placeholder={getCopy("workspace.terminal.inputPlaceholder")}
+                      />
+                      <button
+                        type="submit"
+                        className="button button-primary"
+                        data-testid="workspace-terminal-send-btn"
+                        disabled={!terminalInput}
+                      >
+                        {getCopy("workspace.terminal.sendAction")}
+                      </button>
+                    </div>
+                  </div>
+                </form>
+
+                <div className="terminal-resize-row">
+                  <label htmlFor={colsInputId} className="terminal-dim-label">
+                    {getCopy("workspace.terminal.colsLabel")}
+                    <input
+                      id={colsInputId}
+                      type="number"
+                      min={20}
+                      max={300}
+                      className="form-input terminal-dim-input"
+                      data-testid="workspace-terminal-cols-input"
+                      value={colsInput}
+                      onChange={(e) => setColsInput(e.target.value)}
+                    />
+                  </label>
+                  <label htmlFor={rowsInputId} className="terminal-dim-label">
+                    {getCopy("workspace.terminal.rowsLabel")}
+                    <input
+                      id={rowsInputId}
+                      type="number"
+                      min={5}
+                      max={120}
+                      className="form-input terminal-dim-input"
+                      data-testid="workspace-terminal-rows-input"
+                      value={rowsInput}
+                      onChange={(e) => setRowsInput(e.target.value)}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    data-testid="workspace-terminal-resize-btn"
+                    onClick={() => {
+                      const cols = Number(colsInput) || 80;
+                      const rows = Number(rowsInput) || 24;
+                      onResizeTerminal?.(cols, rows);
+                    }}
+                  >
+                    {getCopy("workspace.terminal.resizeAction")}
+                  </button>
+                </div>
+              </div>
             )}
           </div>
         )}

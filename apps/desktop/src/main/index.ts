@@ -41,6 +41,7 @@ import {
   createNodeSshTransportPorts,
   type SshTargetConfig,
 } from "./sshTransport";
+import { TerminalManager, createNodePtyFactory } from "./terminalManager";
 
 declare const __HERMES_BUILD_META__: EmbeddedBuildMeta | undefined;
 
@@ -328,6 +329,44 @@ function shouldAutoDialLocalOnStartup(): boolean {
   return localPorts.getControlSocketCandidates().some((sockPath) => fs.existsSync(sockPath));
 }
 
+  const terminalManager = new TerminalManager({
+    ptyFactory: createNodePtyFactory(),
+    getActiveScope: () => connectionSupervisor.getFleetSnapshot().activeScope,
+    defaultCwd: sandbox.hermesHomeDir,
+    confirmFirstTerminal: async (targetScope) => {
+      const targetWin = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+      const boxOptions: Electron.MessageBoxOptions = {
+        type: "question",
+        buttons: ["暂不打开", "授权打开 Terminal"],
+        defaultId: 0,
+        cancelId: 0,
+        title: "确认首次打开 Terminal",
+        message: `是否授权为当前 Scope (${targetScope.connectionId} / ${targetScope.profileId ?? "default"}) 启动本机 PTY Terminal？`,
+        detail: "PTY 进程完全由 Main 托管并绑定当前 Scope；拒绝则不会启动任何终端进程。",
+      };
+      const result = targetWin
+        ? await dialog.showMessageBox(targetWin, boxOptions)
+        : await dialog.showMessageBox(boxOptions);
+      return result.response === 1;
+    },
+    confirmGrantRoot: async (targetScope) => {
+      const targetWin = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+      const boxOptions: Electron.MessageBoxOptions = {
+        type: "warning",
+        buttons: ["拒绝授予", "授予文件根目录"],
+        defaultId: 0,
+        cancelId: 0,
+        title: "确认授予文件根目录访问",
+        message: `是否授予 Scope (${targetScope.connectionId} / ${targetScope.profileId ?? "default"}) 的 Terminal 文件根目录权限？`,
+        detail: "该授权仅在当前应用运行期间有效；拒绝则取消授权且不启动未开启的 PTY。",
+      };
+      const result = targetWin
+        ? await dialog.showMessageBox(targetWin, boxOptions)
+        : await dialog.showMessageBox(boxOptions);
+      return result.response === 1;
+    },
+  });
+
 const dispatcher = createBridgeDispatcher({
   "bridge.hello": async (): Promise<AppInfo> => {
     rendererReady = true;
@@ -390,6 +429,7 @@ const dispatcher = createBridgeDispatcher({
     return sshTransportManager.confirmHostKey(target, { passphrase });
   },
   ...connectionSupervisor.handlers,
+  ...terminalManager.handlers,
   "local.inspect": async () => localBackendManager.inspect(),
   "local.selectCli": async () => {
     const res = await localBackendManager.selectCli();
@@ -615,6 +655,16 @@ app.whenReady().then(async () => {
           }
         });
         activeSubscriptions.set(args.subscriptionId, unsub);
+      } else if (args.topic === "terminal") {
+        const scope = args.scope ?? connectionSupervisor.getFleetSnapshot().activeScope;
+        if (scope?.connectionId) {
+          const unsub = terminalManager.subscribe(scope, (terminalEvent) => {
+            if (!event.sender.isDestroyed()) {
+              event.sender.send("hermes:event", args.subscriptionId, terminalEvent);
+            }
+          });
+          activeSubscriptions.set(args.subscriptionId, unsub);
+        }
       } else if (
         args.topic === "fleet" ||
         args.topic === "connection.health" ||
@@ -673,6 +723,7 @@ app.whenReady().then(async () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  terminalManager.disposeAll();
   remoteAuthManager.dispose();
   for (const unsub of activeSubscriptions.values()) {
     unsub();

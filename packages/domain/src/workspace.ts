@@ -6,6 +6,7 @@ import type {
   ErrorCode,
   ProjectedArtifactAnnotation,
   SubagentTailSnapshot,
+  TerminalSnapshot,
   WorkspaceAgentItem,
   WorkspaceArtifactItem,
   WorkspaceCheckpointItem,
@@ -58,6 +59,7 @@ export interface ScopeWorkspaceView {
   selectedDiffPath: string | null;
   diffScope: "working" | "staged";
   terminalScrollback: string[];
+  terminalSnapshot: TerminalSnapshot | null;
 }
 
 export interface WorkspaceSessionState {
@@ -143,6 +145,7 @@ export function createEmptyScopeWorkspaceView(scopeKey: string): ScopeWorkspaceV
     selectedDiffPath: null,
     diffScope: "working",
     terminalScrollback: [],
+    terminalSnapshot: null,
   };
 }
 
@@ -1031,6 +1034,32 @@ export function setWorkspaceTerminalScrollback(
       [scopeKey]: {
         ...current,
         terminalScrollback: [...scrollback],
+      },
+    },
+  };
+}
+
+export function setWorkspaceTerminalSnapshot(
+  state: WorkspaceSessionState,
+  snapshot: TerminalSnapshot | null,
+  targetScope?: BridgeScope | null,
+): WorkspaceSessionState {
+  const scopeKey = targetScope ? resolveWorkspaceScopeKey(targetScope) : state.activeScopeKey;
+  const current = state.byScopeKey[scopeKey] ?? createEmptyScopeWorkspaceView(scopeKey);
+  return {
+    ...state,
+    byScopeKey: {
+      ...state.byScopeKey,
+      [scopeKey]: {
+        ...current,
+        terminalSnapshot: snapshot
+          ? {
+              ...snapshot,
+              scope: { ...snapshot.scope },
+              lines: [...snapshot.lines],
+            }
+          : null,
+        terminalScrollback: snapshot ? [...snapshot.lines] : [],
       },
     },
   };
