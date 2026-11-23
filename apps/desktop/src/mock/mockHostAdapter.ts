@@ -128,7 +128,28 @@ interface MockE2EFixture {
     servedMethods?: string[];
     olderMethods?: string[];
     refusedMethods?: string[];
+    capabilityTags?: string[];
     probedDomains?: Record<string, "ok" | "method_not_found" | "refused" | "timeout">;
+    plugins?: {
+      outcome?: "ok" | "method_not_found" | "refused" | "older" | "error";
+      items?: Array<Record<string, unknown>>;
+      errorCode?: string;
+    };
+    skills?: {
+      outcome?: "ok" | "method_not_found" | "refused" | "older" | "error";
+      items?: Array<Record<string, unknown>>;
+      errorCode?: string;
+    };
+    tools?: {
+      outcome?: "ok" | "method_not_found" | "refused" | "older" | "error";
+      items?: Array<Record<string, unknown>>;
+      errorCode?: string;
+    };
+    mcp?: {
+      outcome?: "ok" | "method_not_found" | "refused" | "older" | "error";
+      items?: Array<Record<string, unknown>>;
+      errorCode?: string;
+    };
   };
   config?: {
     supported?: boolean;
@@ -273,9 +294,68 @@ export function createMockHostBridge(): HermesHost {
     sessionsResumeCalls: 0,
     sessionsSelectCalls: 0,
     connectionsRetryCalls: 0,
+    pluginsListCalls: 0,
+    skillsListCalls: 0,
+    skillsReloadCalls: 0,
+    toolsShowCalls: 0,
+    mcpListCalls: 0,
+    mcpReloadCalls: 0,
   };
+  let mockOwnerGen = 1;
+  function applyMockCapabilitiesHandshake(connectionId: string, profileId: string) {
+    const liveFixture = readE2EFixture() ?? fixture;
+    const served = liveFixture?.capabilities?.servedMethods ?? [
+      "prompt.submit",
+      "prompt.cancel",
+      "session.steer",
+      "session.list",
+      "session.create",
+      "session.resume",
+      "profiles.list",
+      "config.get",
+      "config.update",
+    ];
+    capabilityRegistry.applyConnectHandshake({
+      connectionId,
+      profileId,
+      ownerGeneration: mockOwnerGen,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "mock-e2e-v1",
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: served,
+        older_methods: liveFixture?.capabilities?.olderMethods ?? [],
+        refused_methods: liveFixture?.capabilities?.refusedMethods ?? [],
+        ...(liveFixture?.capabilities?.capabilityTags
+          ? { capabilities: liveFixture.capabilities.capabilityTags }
+          : {}),
+        session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
+      },
+    });
+    if (liveFixture?.capabilities?.probedDomains) {
+      for (const [dom, outcome] of Object.entries(liveFixture.capabilities.probedDomains)) {
+        const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === dom);
+        if (meta?.probeMethod) {
+          capabilityRegistry.applyProbeOutcome({
+            domain: dom as CapabilityDomainId,
+            method: meta.probeMethod,
+            outcome,
+            expectedOwnerGeneration: mockOwnerGen,
+            expectedAuthorityEpoch: 1,
+          });
+        }
+      }
+    }
+  }
   if (fixture) {
     (globalThis as { __HERMES_E2E_COUNTS__?: typeof e2eCounts }).__HERMES_E2E_COUNTS__ = e2eCounts;
+    const readyConn = currentFleet.connections.find((c) => c.actual === "ready");
+    if (readyConn || fixture.capabilities) {
+      applyMockCapabilitiesHandshake(
+        currentFleet.activeScope?.connectionId ?? readyConn?.connectionId ?? "local",
+        currentFleet.activeScope?.profileId ?? "default",
+      );
+    }
   }
 
   const defaultConfigValues: Record<string, GatewayConfigValue> = {};
@@ -1497,6 +1577,12 @@ export function createMockHostBridge(): HermesHost {
           ? lookupTranscript(transcriptMap, cid, pid, nextSessionId) ??
             makeEmptyTranscript(cid, pid, nextSessionId)
           : null;
+        const capKey = capabilityRegistry.getSnapshot().key;
+        if (capKey.connectionId !== cid || capKey.profileId !== pid) {
+          mockOwnerGen += 1;
+          applyMockCapabilitiesHandshake(cid, pid);
+          emitCapabilitiesPatch();
+        }
         emitFleetSnapshot();
         emitChatStatePatch();
         return { ok: true, fleet: currentFleet, transcript };
@@ -2498,26 +2584,100 @@ export function createMockHostBridge(): HermesHost {
       syncFixtureGenerationIfNeeded(liveFixture);
       const domain =
         typeof payload.domain === "string" ? (payload.domain as CapabilityDomainId) : undefined;
+      const action = payload.action === "reload" ? "reload" : undefined;
       const snap = capabilityRegistry.getSnapshot();
       if (domain && snap.capabilitiesReady) {
         const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === domain);
         if (meta?.probeMethod) {
           const overrideOutcome = liveFixture?.capabilities?.probedDomains?.[domain];
           const tier = capabilityRegistry.getMethodTier(meta.probeMethod);
-          const outcome =
+          const baseOutcome =
             overrideOutcome ??
             (tier === "refused"
               ? "refused"
               : tier === "served" || tier === "older"
                 ? "ok"
                 : "method_not_found");
+
+          if (domain === "plugins") {
+            e2eCounts.pluginsListCalls += 1;
+            const plugCfg = liveFixture?.capabilities?.plugins;
+            const extOutcome =
+              plugCfg?.outcome ??
+              (tier === "refused"
+                ? "refused"
+                : tier === "older"
+                  ? "older"
+                  : baseOutcome === "ok"
+                    ? "ok"
+                    : "method_not_found");
+            capabilityRegistry.applyPluginsInventory({
+              expectedOwnerGeneration: snap.key.ownerGeneration,
+              expectedAuthorityEpoch: snap.key.authorityEpoch,
+              expectedGeneration: snap.generation,
+              outcome: extOutcome,
+              rawPlugins: plugCfg?.items ?? [],
+              errorCode: plugCfg?.errorCode,
+            });
+          } else if (domain === "skills") {
+            if (action === "reload") {
+              e2eCounts.skillsReloadCalls += 1;
+            }
+            e2eCounts.skillsListCalls += 1;
+            const skillCfg = liveFixture?.capabilities?.skills;
+            const extOutcome =
+              skillCfg?.outcome ??
+              (baseOutcome === "ok" ? "ok" : baseOutcome === "refused" ? "refused" : "method_not_found");
+            capabilityRegistry.applySkillsInventory({
+              expectedOwnerGeneration: snap.key.ownerGeneration,
+              expectedAuthorityEpoch: snap.key.authorityEpoch,
+              expectedGeneration: snap.generation,
+              outcome: extOutcome,
+              rawSkills: skillCfg?.items ?? [],
+              reloaded: action === "reload",
+              errorCode: skillCfg?.errorCode,
+            });
+          } else if (domain === "tools") {
+            e2eCounts.toolsShowCalls += 1;
+            const toolCfg = liveFixture?.capabilities?.tools;
+            const extOutcome =
+              toolCfg?.outcome ??
+              (baseOutcome === "ok" ? "ok" : baseOutcome === "refused" ? "refused" : "method_not_found");
+            capabilityRegistry.applyToolsInventory({
+              expectedOwnerGeneration: snap.key.ownerGeneration,
+              expectedAuthorityEpoch: snap.key.authorityEpoch,
+              expectedGeneration: snap.generation,
+              outcome: extOutcome,
+              rawTools: toolCfg?.items ?? [],
+              errorCode: toolCfg?.errorCode,
+            });
+          } else if (domain === "mcp") {
+            if (action === "reload") {
+              e2eCounts.mcpReloadCalls += 1;
+            }
+            e2eCounts.mcpListCalls += 1;
+            const mcpCfg = liveFixture?.capabilities?.mcp;
+            const extOutcome =
+              mcpCfg?.outcome ??
+              (baseOutcome === "ok" ? "ok" : baseOutcome === "refused" ? "refused" : "method_not_found");
+            capabilityRegistry.applyMcpInventory({
+              expectedOwnerGeneration: snap.key.ownerGeneration,
+              expectedAuthorityEpoch: snap.key.authorityEpoch,
+              expectedGeneration: snap.generation,
+              outcome: extOutcome,
+              rawServers: mcpCfg?.items ?? [],
+              reloaded: action === "reload",
+              errorCode: mcpCfg?.errorCode,
+            });
+          }
+
           capabilityRegistry.applyProbeOutcome({
             domain,
             method: meta.probeMethod,
-            outcome,
+            outcome: baseOutcome,
             expectedOwnerGeneration: snap.key.ownerGeneration,
             expectedAuthorityEpoch: snap.key.authorityEpoch,
-            expectedGeneration: snap.generation,
+            expectedGeneration: capabilityRegistry.getSnapshot().generation,
           });
           emitCapabilitiesPatch();
         }

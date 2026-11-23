@@ -1,5 +1,6 @@
 import type { RefObject } from "react";
 import type {
+  ApprovalView,
   ChatSessionProjection,
   ConnectionHealthSummary,
   LocalInspectResult,
@@ -9,6 +10,7 @@ import type {
   ToolExecutionRow,
 } from "@hermes/contracts";
 import { getCopy } from "@hermes/domain";
+import { AttributionBadge } from "./AttributionBadge";
 import { LocalRepairCard } from "./LocalRepairCard";
 import { MarkdownText } from "./MarkdownText";
 
@@ -59,6 +61,17 @@ function getRoleLabel(role: "user" | "assistant" | "system"): string {
       return getCopy("chat.roleAssistant");
     case "system":
       return getCopy("chat.roleSystem");
+  }
+}
+
+function getApprovalStatusLabel(status: ApprovalView["status"]): string {
+  switch (status) {
+    case "pending":
+      return getCopy("chat.approvalStatus.pending");
+    case "approved":
+      return getCopy("chat.approvalStatus.approved");
+    case "denied":
+      return getCopy("chat.approvalStatus.denied");
   }
 }
 
@@ -291,6 +304,10 @@ export function ChatThread({
                   {msg.toolRows.map((row) => (
                     <li key={row.toolCallId} className="tool-execution-row">
                       <span className="tool-execution-name">{row.name}</span>
+                      <AttributionBadge
+                        attribution={row.attribution}
+                        testId={`tool-attribution-${row.toolCallId}`}
+                      />
                       <span
                         className={[
                           "status-pill",
@@ -309,6 +326,37 @@ export function ChatThread({
             </li>
           ))}
         </ol>
+      )}
+
+      {transcript?.pendingApprovals && transcript.pendingApprovals.length > 0 && (
+        <section
+          className="approval-cards-section"
+          aria-label={getCopy("chat.approvalsTitle")}
+          data-testid="pending-approvals-section"
+        >
+          <h2 className="approval-cards-heading">{getCopy("chat.approvalsTitle")}</h2>
+          <ul className="approval-cards-list">
+            {transcript.pendingApprovals.map((approval) => (
+              <li
+                key={approval.approvalId}
+                className="approval-card"
+                data-testid={`approval-card-${approval.approvalId}`}
+              >
+                <div className="approval-card-header">
+                  <strong className="tool-execution-name">{approval.toolName}</strong>
+                  <AttributionBadge
+                    attribution={approval.attribution}
+                    testId={`approval-attribution-${approval.approvalId}`}
+                  />
+                  <span className="status-pill is-warn">
+                    {getApprovalStatusLabel(approval.status)}
+                  </span>
+                </div>
+                <p className="approval-card-summary">{approval.summary}</p>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
       {stopError && (

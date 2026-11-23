@@ -2198,3 +2198,491 @@ test.describe("Ticket #41 Subagents (list/steer/interrupt/tail) and Checkpoint (
     );
   });
 });
+
+test.describe("Ticket #42 Skills/Tools/MCP/Plugins read-only inventory, states, lazy fetch, and ExternalAttribution", () => {
+  test("lazy-fetches on open without polling, renders whitelisted fields & safe errors, native reloads, CLI/docs links, and invalidates on Scope switch", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+            {
+              connectionId: "local",
+              profileId: "work",
+              displayName: "Work",
+              handle: "work",
+              isDefault: false,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-ext-1",
+              title: "Extensions E2E Session",
+              preview: "Checking extensions",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-ext-1" },
+          activeSessionId: "sess-ext-1",
+        },
+        capabilities: {
+          servedMethods: [
+            "prompt.submit",
+            "prompt.cancel",
+            "session.list",
+            "session.create",
+            "session.resume",
+            "profiles.list",
+            "plugins.list",
+            "skills.list",
+            "reload.skills",
+            "tools.show",
+            "mcp.list",
+            "reload.mcp",
+          ],
+          capabilityTags: ["plugin-rpc-v1"],
+          plugins: {
+            outcome: "ok",
+            items: [
+              {
+                name: "git-helper",
+                key: "git-helper-v2",
+                version: "1.4.2",
+                enabled: true,
+                status: "loaded",
+                tool_count: 2,
+                hook_count: 1,
+                command_count: 3,
+                skills: ["git-review"],
+                install_dir: "/Users/secret/.hermes/plugins/git",
+                settings_schema: { secretKey: "top-secret" },
+                tools: ["raw_leaked_tool"],
+              },
+              {
+                name: "broken-plugin",
+                version: "0.2.0",
+                enabled: false,
+                status: "failed",
+                error: "Crash at /Users/secret/token=abc123",
+                error_code: "PLUGIN_INIT_ERR",
+              },
+            ],
+          },
+          skills: {
+            outcome: "ok",
+            items: [
+              {
+                id: "git-review",
+                name: "git-review",
+                description: "Review git diffs read-only",
+                category: "git",
+                source: "plugin",
+                plugin: "git-helper",
+                enabled: true,
+              },
+            ],
+          },
+          tools: {
+            outcome: "ok",
+            items: [
+              {
+                id: "fs-read",
+                name: "read_file",
+                description: "Read files cleanly",
+                toolset: "filesystem",
+                origin: "external",
+                mcp_server: "filesystem",
+                enabled: true,
+              },
+            ],
+          },
+          mcp: {
+            outcome: "ok",
+            items: [
+              {
+                id: "filesystem",
+                name: "filesystem",
+                status: "connected",
+                tool_count: 4,
+              },
+              {
+                id: "broken-mcp",
+                name: "broken-mcp",
+                status: "error",
+                error: "Dial /Users/secret failed token=xyz",
+                error_code: "MCP_CONN_ERR",
+              },
+            ],
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // Zero extension list fetches before opening Extensions drawer or Settings
+    const initialCounts = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: Record<string, number> }).__HERMES_E2E_COUNTS__,
+    );
+    expect(initialCounts.pluginsListCalls).toBe(0);
+    expect(initialCounts.skillsListCalls).toBe(0);
+    expect(initialCounts.toolsShowCalls).toBe(0);
+    expect(initialCounts.mcpListCalls).toBe(0);
+
+    // Open Capabilities -> click "打开扩展清单（只读）"
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const capDrawer = page.getByRole("dialog", { name: "能力目录" });
+    await expect(capDrawer).toBeVisible();
+    await capDrawer.getByTestId("capabilities-open-extensions-drawer").click();
+
+    const extDrawer = page.getByRole("dialog", { name: "扩展清单（只读）" });
+    await expect(extDrawer).toBeVisible();
+    await expect(extDrawer.getByTestId("ext-drawer-plugins-state")).toHaveAttribute(
+      "data-inventory-status",
+      "available",
+    );
+
+    // Only plugins was fetched once; no polling after waiting
+    await page.waitForTimeout(450);
+    const afterPluginsOpen = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: Record<string, number> }).__HERMES_E2E_COUNTS__,
+    );
+    expect(afterPluginsOpen.pluginsListCalls).toBe(1);
+    expect(afterPluginsOpen.skillsListCalls).toBe(0);
+    expect(afterPluginsOpen.toolsShowCalls).toBe(0);
+    expect(afterPluginsOpen.mcpListCalls).toBe(0);
+
+    // Top 3-line notice, Gateway reported badge, conditional plugin-rpc-v1 notice, docs & CLI note
+    await expect(extDrawer).toContainText("Hermes 的插件运行在 Gateway / CLI 侧。");
+    await expect(extDrawer).toContainText("本客户端不加载官方桌面插件代码，也不提供插件商店。");
+    await expect(extDrawer).toContainText("安装、启停、移除或更新请使用 Hermes CLI 或官方文档。");
+    await expect(extDrawer).toContainText("Gateway 报告");
+    await expect(extDrawer.getByTestId("ext-drawer-plugin-rpc-notice")).toBeVisible();
+    await expect(extDrawer).toContainText("不会在此客户端执行");
+    await expect(extDrawer.getByTestId("ext-drawer-docs-plugins")).toBeVisible();
+
+    // Whitelisted fields only + safe error code; zero raw path/secret/schema leakage
+    const healthyRow = extDrawer.getByTestId("ext-drawer-plugin-row-git-helper-v2");
+    await expect(healthyRow).toContainText("git-helper");
+    await expect(healthyRow).toContainText("1.4.2");
+    await expect(healthyRow).toContainText("git-helper-v2");
+    await expect(healthyRow).toContainText("Tools 数量: 2");
+    await expect(healthyRow).toContainText("Hooks 数量: 1");
+    await expect(healthyRow).toContainText("Commands 数量: 3");
+    await expect(healthyRow).toContainText("外部提供 · Plugin · git-helper");
+
+    const failedRow = extDrawer.getByTestId("ext-drawer-plugin-row-broken-plugin");
+    await expect(failedRow).toContainText("加载失败");
+    await expect(failedRow).toContainText("PLUGIN_INIT_ERR");
+
+    const drawerText = await extDrawer.innerText();
+    expect(drawerText).not.toContain("install_dir");
+    expect(drawerText).not.toContain("settings_schema");
+    expect(drawerText).not.toContain("top-secret");
+    expect(drawerText).not.toContain("raw_leaked_tool");
+    expect(drawerText).not.toContain("/Users/secret");
+    expect(drawerText).not.toContain("token=abc123");
+
+    // Clicking "查看 Skills 清单" switches to Skills tab & fetches Skills once
+    await extDrawer.getByTestId("ext-drawer-plugin-view-skills-git-helper-v2").click();
+    await expect(extDrawer.getByTestId("ext-drawer-skills-state")).toHaveAttribute(
+      "data-inventory-status",
+      "available",
+    );
+    await expect(extDrawer).toContainText("git-review");
+    await expect(extDrawer.getByTestId("ext-drawer-reload-skills")).toBeVisible();
+    await expect(extDrawer.getByRole("button", { name: /安装|卸载|启用|禁用/ })).toHaveCount(0);
+
+    await extDrawer.getByTestId("ext-drawer-reload-skills").click();
+    const afterSkillsReload = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: Record<string, number> }).__HERMES_E2E_COUNTS__,
+    );
+    expect(afterSkillsReload.skillsReloadCalls).toBe(1);
+    expect(afterSkillsReload.skillsListCalls).toBe(2);
+
+    // Switch to Tools tab: read-only, no configure button
+    await extDrawer.getByTestId("ext-drawer-tab-tools").click();
+    await expect(extDrawer.getByTestId("ext-drawer-tools-state")).toHaveAttribute(
+      "data-inventory-status",
+      "available",
+    );
+    await expect(extDrawer).toContainText("read_file");
+    await expect(extDrawer).toContainText("外部提供 · MCP · filesystem");
+    await expect(extDrawer.getByRole("button", { name: /配置|configure/i })).toHaveCount(0);
+
+    // Switch to MCP tab: status + toolCount + safe errorCode + native reload
+    await extDrawer.getByTestId("ext-drawer-tab-mcp").click();
+    await expect(extDrawer.getByTestId("ext-drawer-mcp-state")).toHaveAttribute(
+      "data-inventory-status",
+      "available",
+    );
+    await expect(extDrawer).toContainText("filesystem");
+    await expect(extDrawer).toContainText("Tools 数量: 4");
+    await expect(extDrawer).toContainText("MCP_CONN_ERR");
+    expect(await extDrawer.innerText()).not.toContain("token=xyz");
+    await expect(extDrawer.getByRole("button", { name: /新增|删除|OAuth/i })).toHaveCount(0);
+
+    await extDrawer.getByTestId("ext-drawer-reload-mcp").click();
+    const afterMcpReload = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: Record<string, number> }).__HERMES_E2E_COUNTS__,
+    );
+    expect(afterMcpReload.mcpReloadCalls).toBe(1);
+
+    // Manual Refresh on Plugins increments pluginsListCalls
+    await extDrawer.getByTestId("ext-drawer-tab-plugins").click();
+    await extDrawer.getByTestId("ext-drawer-refresh-plugins").click();
+    const afterManualRefresh = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: Record<string, number> }).__HERMES_E2E_COUNTS__,
+    );
+    expect(afterManualRefresh.pluginsListCalls).toBe(2);
+
+    // Close Extensions + Capabilities, switch Profile -> invalidates & refetches on next open
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    await page.locator(".route-strip").getByRole("button", { name: "已连接" }).click();
+    const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+    await scopeDialog.getByRole("button", { name: /Work/ }).click();
+
+    await page.keyboard.press("Control+,");
+    const settingsDialog = page.getByRole("dialog", { name: "Settings" });
+    await expect(settingsDialog).toBeVisible();
+    const settingsPlugins = settingsDialog.locator('section[data-settings-section="plugins"]');
+    await expect(settingsPlugins).toBeVisible();
+    await expect(settingsPlugins.getByTestId("ext-settings-plugins-state")).toHaveAttribute(
+      "data-inventory-status",
+      "available",
+    );
+    const afterScopeSwitchOpen = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: Record<string, number> }).__HERMES_E2E_COUNTS__,
+    );
+    expect(afterScopeSwitchOpen.pluginsListCalls).toBe(3);
+  });
+
+  test("renders empty/unsupported/unknown/error states, hides plugin-rpc-v1 when unadvertised, and enforces ExternalAttribution across all 5 surfaces", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-attr-1",
+              title: "Attribution Session",
+              preview: "Checking 5 surfaces",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-attr-1" },
+          activeSessionId: "sess-attr-1",
+        },
+        transcripts: {
+          "local::default::sess-attr-1": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-attr-1",
+            messages: [
+              {
+                messageId: "m-attr-1",
+                sessionId: "sess-attr-1",
+                role: "assistant",
+                text: "Running external tool and checking provenance.",
+                createdAt: "2026-11-23T08:00:00.000Z",
+                toolRows: [
+                  {
+                    toolCallId: "tc-ext",
+                    name: "mcp_read",
+                    status: "completed",
+                    summary: "Read file",
+                    attribution: {
+                      origin: "external",
+                      provider: { kind: "mcp", id: "filesystem", label: "MCP · filesystem" },
+                      sourceLabel: "外部提供 · MCP · filesystem",
+                      accessibleLabel: "外部提供 · MCP · filesystem",
+                    },
+                  },
+                  {
+                    toolCallId: "tc-missing-attr",
+                    name: "opaque_tool",
+                    status: "completed",
+                    summary: "Omitted attribution must never default to builtin",
+                  },
+                ],
+              },
+            ],
+            pendingApprovals: [
+              {
+                approvalId: "appr-1",
+                sessionId: "sess-attr-1",
+                toolName: "git_commit_external",
+                summary: "Confirm external plugin tool execution",
+                status: "pending",
+                requestedAt: "2026-11-23T08:00:01.000Z",
+                attribution: {
+                  origin: "external",
+                  provider: { kind: "plugin", id: "git-helper", label: "Plugin · git-helper" },
+                  sourceLabel: "外部提供 · Plugin · git-helper",
+                  accessibleLabel: "外部提供 · Plugin · git-helper",
+                },
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        capabilities: {
+          servedMethods: [
+            "prompt.submit",
+            "prompt.cancel",
+            "session.list",
+            "session.create",
+            "session.resume",
+            "plugins.list",
+            "skills.list",
+          ],
+          olderMethods: ["skills.reload", "skills.install", "tools.configure"],
+          plugins: {
+            outcome: "ok",
+            items: [],
+          },
+          skills: {
+            outcome: "error",
+            errorCode: "SKILL_SCAN_ERR",
+          },
+          tools: {
+            outcome: "method_not_found",
+          },
+          mcp: {
+            outcome: "older",
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // Surface 3 & 4: Transcript tool rows (external + missing -> 来源未知) & pending Approval cards
+    await expect(page.getByTestId("tool-attribution-tc-ext")).toHaveText("外部提供 · MCP · filesystem");
+    await expect(page.getByTestId("tool-attribution-tc-missing-attr")).toHaveText("来源未知");
+    await expect(page.getByTestId("pending-approvals-section")).toBeVisible();
+    await expect(page.getByTestId("approval-attribution-appr-1")).toHaveText(
+      "外部提供 · Plugin · git-helper",
+    );
+
+    // Surface 1: Command Palette (⌘K) shows Builtin attribution badges
+    await page.keyboard.press("Control+k");
+    const palette = page.getByRole("dialog", { name: "命令面板" });
+    await expect(palette).toBeVisible();
+    await expect(palette.locator('.attribution-badge[data-attribution-origin="builtin"]').first()).toHaveText("内置");
+    await page.keyboard.press("Escape");
+
+    // Surface 2: Capabilities Drawer shows Builtin attribution badges + opens Extensions drawer
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const capDrawer = page.getByRole("dialog", { name: "能力目录" });
+    await expect(capDrawer.locator('.attribution-badge[data-attribution-origin="builtin"]').first()).toHaveText("内置");
+    await capDrawer.getByTestId("capabilities-open-extensions-drawer").click();
+
+    const extDrawer = page.getByRole("dialog", { name: "扩展清单（只读）" });
+    await expect(extDrawer).toBeVisible();
+    // Unadvertised plugin-rpc-v1 notice is hidden
+    await expect(extDrawer.getByTestId("ext-drawer-plugin-rpc-notice")).toHaveCount(0);
+    // Empty state on Plugins
+    await expect(extDrawer.getByTestId("ext-drawer-plugins-state")).toHaveAttribute(
+      "data-inventory-status",
+      "empty",
+    );
+    await expect(extDrawer).toContainText("Gateway 报告 0 个已加载插件");
+
+    // Unprobed MCP shows unknown state before tab is clicked? Wait: clicking tab probes; check unprobed via Settings before switching or check error & unsupported tabs directly
+    // Error state on Skills + older skills.reload keeps reload button hidden
+    await extDrawer.getByTestId("ext-drawer-tab-skills").click();
+    await expect(extDrawer.getByTestId("ext-drawer-skills-state")).toHaveAttribute(
+      "data-inventory-status",
+      "error",
+    );
+    await expect(extDrawer).toContainText("Skills 清单加载失败。");
+    await expect(extDrawer).toContainText("SKILL_SCAN_ERR");
+    await expect(extDrawer.getByTestId("ext-drawer-reload-skills")).toHaveCount(0);
+
+    // Unsupported state on Tools: never fabricates local tools
+    await extDrawer.getByTestId("ext-drawer-tab-tools").click();
+    await expect(extDrawer.getByTestId("ext-drawer-tools-state")).toHaveAttribute(
+      "data-inventory-status",
+      "unsupported",
+    );
+    await expect(extDrawer).toContainText("此 Gateway 不提供 Tools 清单（不伪造本地清单）。");
+    await expect(extDrawer.locator(".ext-card")).toHaveCount(0);
+
+    // Unknown state on MCP when compatibility tier is older
+    await extDrawer.getByTestId("ext-drawer-tab-mcp").click();
+    await expect(extDrawer.getByTestId("ext-drawer-mcp-state")).toHaveAttribute(
+      "data-inventory-status",
+      "unknown",
+    );
+    await expect(extDrawer).toContainText("无法确认 MCP 状态清单，请点击刷新清单探测。");
+  });
+});

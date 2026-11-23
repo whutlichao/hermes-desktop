@@ -49,8 +49,14 @@ describe("Quiet Relay shell state & layout invariants", () => {
   it("closes only the topmost surface on Esc and supports command palette, settings, workspace, and shortcuts", () => {
     let state = createInitialShellState();
     state = shellReducer(state, { type: "OPEN_SURFACE", surface: "palette" });
+    state = shellReducer(state, { type: "OPEN_SURFACE", surface: "extensions" });
+    expect(getTopmostSurface(state)).toBe("extensions");
+
     state = shellReducer(state, { type: "OPEN_SURFACE", surface: "shortcuts" });
     expect(getTopmostSurface(state)).toBe("shortcuts");
+
+    state = shellReducer(state, { type: "CLOSE_TOPMOST_SURFACE" });
+    expect(getTopmostSurface(state)).toBe("extensions");
 
     state = shellReducer(state, { type: "CLOSE_TOPMOST_SURFACE" });
     expect(getTopmostSurface(state)).toBe("palette");

@@ -273,12 +273,40 @@ export interface SessionSummary {
   status?: "idle" | "running" | "error";
 }
 
+export type CapabilityOrigin = "builtin" | "external" | "unknown";
+
+export type CapabilityProviderKind = "mcp" | "skill" | "tool" | "plugin" | "gateway";
+
+export interface CapabilityProviderRef {
+  kind: CapabilityProviderKind;
+  id: string;
+  label: string;
+}
+
+export interface ExternalAttribution {
+  origin: CapabilityOrigin;
+  provider?: CapabilityProviderRef;
+  sourceLabel: string;
+  accessibleLabel: string;
+}
+
+export interface ApprovalView {
+  approvalId: string;
+  sessionId: string;
+  toolName: string;
+  summary: string;
+  status: "pending" | "approved" | "denied";
+  requestedAt: string;
+  attribution: ExternalAttribution;
+}
+
 export interface ToolExecutionRow {
   toolCallId: string;
   name: string;
   status: "running" | "completed" | "failed" | "cancelled";
   summary?: string;
   durationMs?: number;
+  attribution?: ExternalAttribution;
 }
 
 export interface TranscriptMessage {
@@ -311,6 +339,7 @@ export interface SessionTranscriptSnapshot {
   chatAvailable: boolean;
   chatUnavailableReason?: string;
   supportedActions: SupportedChatActions;
+  pendingApprovals?: ApprovalView[];
   snapshotSeq?: number;
   resynced?: boolean;
   lastKnownUnverified?: boolean;
@@ -476,6 +505,7 @@ export interface CapabilityEntry {
   aliasUsed?: string;
   deepLink?: CapabilityDeepLink;
   degradation?: CapabilityDegradation;
+  attribution?: ExternalAttribution;
 }
 
 export interface CapabilityDomainSummary {
@@ -488,6 +518,125 @@ export interface CapabilityDomainSummary {
   probeMethod?: string;
   degradation?: CapabilityDegradation;
   deepLink?: CapabilityDeepLink;
+  attribution?: ExternalAttribution;
+}
+
+export type ExtensionInventoryStatus =
+  | "available"
+  | "empty"
+  | "unsupported"
+  | "unknown"
+  | "error";
+
+export interface ExtensionCliAction {
+  id: string;
+  label: string;
+  command: string;
+  note: string;
+}
+
+export interface ExtensionPluginRow {
+  pluginKey: string;
+  name: string;
+  version: string;
+  enabled: boolean;
+  enabledLabel: string;
+  loadStatus: "ok" | "failed" | "unknown";
+  loadStatusLabel: string;
+  errorCode?: string;
+  key?: string;
+  toolCount?: number;
+  hookCount?: number;
+  commandCount?: number;
+  skillsLabel: string;
+  cliActions: ExtensionCliAction[];
+  attribution: ExternalAttribution;
+}
+
+export interface SkillInventoryRow {
+  skillId: string;
+  name: string;
+  description?: string;
+  category?: string;
+  enabled?: boolean;
+  attribution: ExternalAttribution;
+}
+
+export interface SkillsInventoryView {
+  status: ExtensionInventoryStatus;
+  items: SkillInventoryRow[];
+  reloadSupported: boolean;
+  lastReloadedAt?: string;
+  errorCode?: string;
+  cliActions: ExtensionCliAction[];
+  docsUrl: string;
+}
+
+export interface ToolInventoryRow {
+  toolId: string;
+  name: string;
+  description?: string;
+  toolset?: string;
+  enabled?: boolean;
+  attribution: ExternalAttribution;
+}
+
+export interface ToolsInventoryView {
+  status: ExtensionInventoryStatus;
+  items: ToolInventoryRow[];
+  errorCode?: string;
+  cliActions: ExtensionCliAction[];
+  docsUrl: string;
+}
+
+export interface McpInventoryRow {
+  serverId: string;
+  name: string;
+  status: "connected" | "disconnected" | "error" | "unknown";
+  statusLabel: string;
+  toolCount?: number;
+  errorCode?: string;
+  attribution: ExternalAttribution;
+}
+
+export interface McpInventoryView {
+  status: ExtensionInventoryStatus;
+  items: McpInventoryRow[];
+  reloadSupported: boolean;
+  lastReloadedAt?: string;
+  errorCode?: string;
+  cliActions: ExtensionCliAction[];
+  docsUrl: string;
+}
+
+export interface ExtensionInventoryView {
+  status: ExtensionInventoryStatus;
+  scope: {
+    connectionId: string;
+    profileId: string;
+    gatewayVersion?: string;
+    perPluginProfile: false;
+  };
+  sourceKind: "gateway_reported";
+  sourceLabel: "Gateway 报告";
+  plugins: ExtensionPluginRow[];
+  counts: {
+    reported: number;
+    enabled: number;
+    failed: number;
+  };
+  pluginRpcAdvertised: boolean;
+  gatewayToolsets?: string[];
+  portableMcpServers?: string[];
+  fetchedAt: string | null;
+  generation: number;
+  errorCode?: string;
+  degradation?: CapabilityDegradation;
+  cliActions: ExtensionCliAction[];
+  docsUrl: string;
+  skills: SkillsInventoryView;
+  tools: ToolsInventoryView;
+  mcp: McpInventoryView;
 }
 
 export interface CapabilitySnapshotKey {
@@ -519,6 +668,7 @@ export interface CapabilitySnapshot {
   domains: CapabilityDomainSummary[];
   entries: CapabilityEntry[];
   methodTiers: Record<string, CapabilityMethodTier>;
+  extensions: ExtensionInventoryView;
   invalidatedReason?: string;
   updatedAt: string;
 }
