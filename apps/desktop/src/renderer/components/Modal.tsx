@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useId, useRef } from "react";
+import { type ReactNode, useEffect, useId, useLayoutEffect, useRef } from "react";
 import { X } from "lucide-react";
 
 interface ModalProps {
@@ -25,10 +25,35 @@ export function FocusDialog({
   const titleId = useId();
   const descId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const windowClosingRef = useRef(false);
+
+  // Capture trigger element synchronously in useLayoutEffect BEFORE parent App sets `inert` on shellRef
+  useLayoutEffect(() => {
+    if (!open) return;
+    const active = document.activeElement as HTMLElement | null;
+    if (active && active !== document.body && active !== document.documentElement) {
+      previousFocusRef.current = active;
+    } else {
+      previousFocusRef.current = null;
+    }
+  }, [open]);
+
+  useEffect(() => {
+    const markClosing = () => {
+      windowClosingRef.current = true;
+    };
+    window.addEventListener("beforeunload", markClosing);
+    window.addEventListener("pagehide", markClosing);
+    return () => {
+      window.removeEventListener("beforeunload", markClosing);
+      window.removeEventListener("pagehide", markClosing);
+    };
+  }, []);
 
   useEffect(() => {
     if (!open || !dialogRef.current) return;
-    const previous = document.activeElement as HTMLElement | null;
+    const previous = previousFocusRef.current ?? (document.activeElement as HTMLElement | null);
     const root = dialogRef.current;
 
     const getFocusables = () =>
@@ -65,8 +90,24 @@ export function FocusDialog({
     root.addEventListener("keydown", onKeyDown);
     return () => {
       root.removeEventListener("keydown", onKeyDown);
-      if (previous && document.contains(previous)) {
+      if (windowClosingRef.current) return;
+      if (
+        previous &&
+        document.contains(previous) &&
+        !previous.hasAttribute("disabled") &&
+        previous.getClientRects().length > 0
+      ) {
         previous.focus();
+        return;
+      }
+      const fallbackComposer = document.getElementById("composer-input");
+      if (fallbackComposer && !fallbackComposer.hasAttribute("disabled")) {
+        fallbackComposer.focus();
+        return;
+      }
+      const fallbackNewSession = document.getElementById("rail-new-session");
+      if (fallbackNewSession && !fallbackNewSession.hasAttribute("disabled")) {
+        fallbackNewSession.focus();
       }
     };
   }, [open]);

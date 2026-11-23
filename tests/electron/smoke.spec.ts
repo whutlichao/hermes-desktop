@@ -861,4 +861,141 @@ test.describe("Electron hardened smoke", () => {
       sandbox.cleanup(passed);
     }
   });
+
+  test("Ticket #36: AppInfo 3-place parity, Settings modal 9 sections & focus return, Session CLI deep links, and Cmd+W close/reopen startup recovery", async () => {
+    const sandbox = createTestSandbox("hr-t36-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2", "tkt_elec_3", "tkt_elec_4"]);
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "work", display_name: "Work", handle: "work", is_default: false },
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "sess-t36-def",
+          title: "Default T36 Session",
+          preview: "default ready",
+        },
+        {
+          profile_id: "work",
+          session_id: "sess-t36-work",
+          title: "Work T36 Session",
+          preview: "work ready",
+        },
+      ],
+    });
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    const counterFile = path.join(sandbox.rootDir, "attach-count.txt");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile,
+      wsUrl: gw.wsUrl,
+      withHostScope: false,
+    });
+    fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      // 1. Session Details card in Electron: never renders refused methods, renders 6 CLI deep links
+      const detailsCard = page.locator(".session-details-card");
+      await expect(detailsCard).toBeVisible();
+      await expect(detailsCard).toContainText("安全与隔离");
+      await expect(detailsCard).toContainText("只读深链 · 不会在此客户端执行");
+      await expect(detailsCard).not.toContainText("session.delete");
+      await expect(detailsCard.locator('[data-cli-action="delete"]')).toHaveAttribute(
+        "data-cli-command",
+        "hermes session delete sess-t36-def",
+      );
+
+      // 2. Scope Popover: switch to Work profile
+      const scopeChip = page.locator(".route-strip").getByRole("button", { name: "已连接" });
+      await scopeChip.click();
+      const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+      await expect(scopeDialog).toBeVisible();
+      await scopeDialog.getByRole("button", { name: /Work/ }).click();
+      await expect(page.locator(".route-strip")).toContainText("Work");
+      await expect(detailsCard.locator('[data-cli-action="delete"]')).toHaveAttribute(
+        "data-cli-command",
+        "hermes session delete --profile work sess-t36-work",
+      );
+
+      // 3. Settings Modal via rail gear button -> verify 9 sections & 3-place AppInfo parity -> Esc returns focus
+      const railGearBtn = page.locator("#rail-settings-gear");
+      await railGearBtn.focus();
+      await railGearBtn.click();
+      const settingsDialog = page.getByRole("dialog", { name: "Settings" });
+      await expect(settingsDialog).toBeVisible();
+
+      const aboutHeadline = await settingsDialog
+        .locator('section.settings-section[aria-label="About"] .settings-about-headline')
+        .innerText();
+      const diagHeadline = await settingsDialog
+        .locator('section.settings-section[aria-label="Diagnostics"] .settings-about-headline')
+        .innerText();
+      const exportDiag = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: {
+            request: (cmd: string, p?: Record<string, unknown>) => Promise<{
+              ok: boolean;
+              value: { display: { headline: string } };
+            }>;
+          };
+        };
+        const res = await w.hermesHost.request("diagnostics.export", {});
+        return res.value.display.headline;
+      });
+      expect(aboutHeadline).toBe(diagHeadline);
+      expect(aboutHeadline).toBe(exportDiag);
+
+      await page.keyboard.press("Escape");
+      await expect(settingsDialog).toBeHidden();
+      await expect(railGearBtn).toBeFocused();
+
+      // 4. Open Settings again, then close window (Cmd+W / win.close()) and reopen via app.emit("activate")
+      await railGearBtn.click();
+      await expect(settingsDialog).toBeVisible();
+
+      const reopenedPromise = electronApp.waitForEvent("window");
+      await electronApp.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()[0]?.close();
+      });
+      await expect
+        .poll(async () => electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length))
+        .toBe(0);
+
+      await electronApp.evaluate(({ app }) => {
+        app.emit("activate");
+      });
+      const reopenedPage = await reopenedPromise;
+      await reopenedPage.waitForLoadState("domcontentloaded");
+      await expect(reopenedPage.locator(".route-strip")).toContainText("Work", { timeout: 15_000 });
+      await expect(reopenedPage.getByRole("dialog", { name: "Settings" })).toHaveCount(0);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

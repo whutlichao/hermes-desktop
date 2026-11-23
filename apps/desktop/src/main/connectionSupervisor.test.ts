@@ -1080,4 +1080,187 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   });
+
+  it("switches Profile/Scope via scopes.switch without tearing down connections or pausing turns, remembers lastSessionByScope, and supports feature-detected config.get/config.update (Ticket #36 S1)", async () => {
+    const sandbox = createTestSandbox("hermes-s1-t36-");
+    let passed = false;
+    const validTickets = new Set<string>();
+    const gatewayConfig: Record<string, string | number | boolean> = {
+      "model.default": "claude-3-7-sonnet",
+      "chat.send_on_enter": true,
+      "voice.enabled": true,
+      "cloud.tier": "enterprise",
+    };
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+        "session.create",
+        "session.resume",
+        "session.transcript",
+        "prompt.submit",
+        "prompt.cancel",
+        "session.steer",
+        "config.get",
+        "config.update",
+      ],
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "s-def-1", title: "Default Session 1" },
+        { profile_id: "default", session_id: "s-def-2", title: "Default Session 2" },
+        { profile_id: "ops", session_id: "s-ops-1", title: "Ops Session 1" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "prompt.submit") {
+          // Leave turn in-flight (do not immediately send turn_completed)
+          ctx.replyResult({
+            turn_id: "turn-inflight-def",
+            user_message_id: "u-1",
+            assistant_message_id: "a-1",
+          });
+          return true;
+        }
+        if (method === "config.get") {
+          ctx.replyResult({
+            supported_keys: Object.keys(gatewayConfig),
+            values: { ...gatewayConfig },
+          });
+          return true;
+        }
+        if (method === "config.update" || method === "config.set") {
+          const k = typeof params.key === "string" ? params.key : "";
+          const v = params.value as string | number | boolean;
+          if (k) {
+            gatewayConfig[k] = v;
+          }
+          ctx.replyResult({
+            ok: true,
+            supported_keys: Object.keys(gatewayConfig),
+            values: { ...gatewayConfig },
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      const chatStore = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const backend = new LocalBackendManager(ports);
+      const supervisor = new LocalConnectionSupervisor(backend, {
+        chatSessionStateStore: chatStore,
+      });
+      await supervisor.connectLocal("default");
+
+      // Select s-def-2 on default profile and start an in-flight turn
+      await supervisor.handlers["sessions.select"](
+        { profileId: "default", sessionId: "s-def-2" },
+        { connectionId: "local", profileId: "default", sessionId: "s-def-2" },
+      );
+      await supervisor.handlers["prompts.send"](
+        { sessionId: "s-def-2", text: "Long running analysis" },
+        { connectionId: "local", profileId: "default", sessionId: "s-def-2" },
+      );
+
+      // Switch to ops via scopes.switch
+      const switchOps = (await supervisor.handlers["scopes.switch"](
+        { connectionId: "local", profileId: "ops" },
+        { connectionId: "local", profileId: "ops" },
+      )) as {
+        ok: boolean;
+        fleet: {
+          activeScope: { connectionId: string; profileId: string; sessionId?: string } | null;
+          profiles: Array<{ profileId: string; actual: string; isDefault: boolean }>;
+          sessions: Array<{ sessionId: string; activeTurnId: string | null }>;
+        };
+      };
+      expect(switchOps.ok).toBe(true);
+      expect(switchOps.fleet.activeScope).toEqual({
+        connectionId: "local",
+        profileId: "ops",
+        sessionId: "s-ops-1",
+      });
+      // Both default and ops profiles are now ready (neither was torn down)
+      expect(switchOps.fleet.profiles.find((p) => p.profileId === "default")?.actual).toBe("ready");
+      expect(switchOps.fleet.profiles.find((p) => p.profileId === "ops")?.actual).toBe("ready");
+      // In-flight turn on s-def-2 was NOT paused or cancelled!
+      expect(
+        gw.rpcCalls.some((c) => c.method === "prompt.cancel"),
+      ).toBe(false);
+
+      // Switch back to default via scopes.switch without explicit sessionId -> restores s-def-2 from lastSessionByScope!
+      const switchBack = (await supervisor.handlers["scopes.switch"](
+        { connectionId: "local", profileId: "default" },
+        { connectionId: "local", profileId: "default" },
+      )) as {
+        ok: boolean;
+        fleet: {
+          activeScope: { connectionId: string; profileId: string; sessionId?: string } | null;
+        };
+        transcript: { sessionId: string; activeTurnId: string | null } | null;
+      };
+      expect(switchBack.ok).toBe(true);
+      expect(switchBack.fleet.activeScope?.sessionId).toBe("s-def-2");
+      expect(switchBack.transcript?.activeTurnId).toBe("turn-inflight-def");
+
+      // Feature-detected config.get and config.update strip voice/cloud keys and round-trip supported keys
+      const cfgSnap = (await supervisor.handlers["config.get"](
+        {},
+        { connectionId: "local", profileId: "default" },
+      )) as {
+        supported: boolean;
+        supportedKeys: string[];
+        values: Record<string, string | number | boolean>;
+      };
+      expect(cfgSnap.supported).toBe(true);
+      expect(cfgSnap.supportedKeys).toEqual(["model.default", "chat.send_on_enter"]);
+      expect(cfgSnap.values["voice.enabled"]).toBeUndefined();
+      expect(cfgSnap.values["cloud.tier"]).toBeUndefined();
+
+      const cfgUpdated = (await supervisor.handlers["config.update"](
+        { key: "model.default", value: "gpt-4.1" },
+        { connectionId: "local", profileId: "default" },
+      )) as {
+        ok: boolean;
+        snapshot: { values: Record<string, string | number | boolean> };
+      };
+      expect(cfgUpdated.ok).toBe(true);
+      expect(cfgUpdated.snapshot.values["model.default"]).toBe("gpt-4.1");
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

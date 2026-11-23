@@ -1,13 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { CAPABILITY_DOMAIN_IDS, type CapabilityEntry } from "@hermes/contracts";
+import {
+  CAPABILITY_DOMAIN_IDS,
+  REFUSED_GATEWAY_METHODS,
+  SESSION_CLI_ACTION_IDS,
+  SETTINGS_SECTION_IDS,
+  type CapabilityEntry,
+} from "@hermes/contracts";
 import {
   CAPABILITY_DOMAIN_CATALOG,
   CapabilityRegistry,
   EXPLICIT_METHOD_ALIASES,
+  SurfaceFocusReturnStack,
   auditCapabilityIntegrity,
+  buildSessionCliDeepLinks,
+  filterRenderableSessionCapabilities,
+  isRefusedGatewayMethod,
+  projectSettingsSectionFields,
   resolveExplicitMethodAlias,
   resolveMethodWithAlias,
-} from "./capabilityRegistry";
+  resolveProfileManagementAvailability,
+} from "./index";
 
 describe("CapabilityRegistry 21-domain matrix, explicit aliases & invariants (S0)", () => {
   it("models all 21 domains as 13 native / 3 read_only / 1 deep_link / 4 deferred (17 reachable / 4 deferred) and Core 5 / Admin 8 / Exec 4", () => {
@@ -233,5 +245,191 @@ describe("CapabilityRegistry 21-domain matrix, explicit aliases & invariants (S0
     expect(steerEntry?.runtimeStatus).toBe("unavailable");
     expect(steerEntry?.degradation?.reason).toBe("method_not_found");
     expect(submitEntry?.runtimeStatus).toBe("available");
+  });
+
+  it("never renders any of the 16 refused methods and builds exact non-executing CLI deep links for session rename/delete/branch/archive/compress/undo (CAP-SESSION-01, CAP-SESSION-N1, CAP-SESSION-N2)", () => {
+    expect(REFUSED_GATEWAY_METHODS).toHaveLength(16);
+    for (const method of REFUSED_GATEWAY_METHODS) {
+      expect(isRefusedGatewayMethod(method)).toBe(true);
+    }
+    expect(isRefusedGatewayMethod("prompt.submit")).toBe(false);
+    expect(isRefusedGatewayMethod("custom.secret", { "custom.secret": "refused" })).toBe(true);
+
+    const rendered = filterRenderableSessionCapabilities(
+      [
+        "prompt.submit",
+        "prompt.cancel",
+        "session.steer",
+        "session.delete",
+        "session.title",
+        "session.branch",
+        "session.archive",
+        "session.compress",
+        "session.undo",
+        "agents.list",
+        "session.workspace.move",
+      ],
+      { "prompt.submit": "served", "session.delete": "served" },
+    );
+    expect(rendered).toEqual(["prompt.submit", "prompt.cancel", "session.steer"]);
+
+    const defaultLinks = buildSessionCliDeepLinks({
+      sessionId: "sess_local_1",
+      profileId: "default",
+      title: "Refactor gateway client",
+    });
+    expect(defaultLinks.map((item) => item.actionId)).toEqual([...SESSION_CLI_ACTION_IDS]);
+    expect(defaultLinks.find((item) => item.actionId === "rename")?.command).toBe(
+      'hermes session rename sess_local_1 "Refactor gateway client"',
+    );
+    expect(defaultLinks.find((item) => item.actionId === "delete")?.command).toBe(
+      "hermes session delete sess_local_1",
+    );
+    expect(defaultLinks.find((item) => item.actionId === "branch")?.command).toBe(
+      "hermes session branch sess_local_1",
+    );
+    expect(defaultLinks.find((item) => item.actionId === "archive")?.command).toBe(
+      "hermes session archive sess_local_1",
+    );
+    expect(defaultLinks.find((item) => item.actionId === "compress")?.command).toBe(
+      "hermes session compress sess_local_1",
+    );
+    expect(defaultLinks.find((item) => item.actionId === "undo")?.command).toBe(
+      "hermes session undo sess_local_1",
+    );
+
+    const workLinks = buildSessionCliDeepLinks({
+      sessionId: "sess_work_2",
+      profileId: "work",
+    });
+    expect(workLinks.find((item) => item.actionId === "delete")?.command).toBe(
+      "hermes session delete --profile work sess_work_2",
+    );
+  });
+
+  it("gates Profile management actions on read-only probe success and falls back to exact CLI/docs deep links (CAP-PROFILE-01, CAP-PROFILE-N1)", () => {
+    const registry = new CapabilityRegistry();
+    // Before probe passes, native profile management is hidden
+    const initialAvail = resolveProfileManagementAvailability(registry.getSnapshot());
+    expect(initialAvail.canManageNatively).toBe(false);
+    expect(initialAvail.cliCommand).toBe("hermes profile list");
+    expect(initialAvail.docsUrl).toMatch(/^https:\/\//);
+
+    const connected = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 1,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "sha_1",
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: ["prompt.submit", "session.list", "profiles.list"],
+      },
+    });
+    // Still not probed yet -> must require read-only probe pass
+    expect(resolveProfileManagementAvailability(connected).canManageNatively).toBe(false);
+
+    const probedOk = registry.applyProbeOutcome({
+      domain: "profile",
+      method: "profiles.list",
+      outcome: "ok",
+      expectedOwnerGeneration: 1,
+      expectedAuthorityEpoch: 1,
+      expectedGeneration: connected.generation,
+    });
+    expect(resolveProfileManagementAvailability(probedOk).canManageNatively).toBe(true);
+
+    const probedMissing = registry.applyProbeOutcome({
+      domain: "profile",
+      method: "profiles.list",
+      outcome: "method_not_found",
+      expectedOwnerGeneration: 1,
+      expectedAuthorityEpoch: 1,
+      expectedGeneration: probedOk.generation,
+    });
+    const afterMissing = resolveProfileManagementAvailability(probedMissing);
+    expect(afterMissing.canManageNatively).toBe(false);
+    expect(afterMissing.cliCommand).toBe("hermes profile list");
+  });
+
+  it("enforces the 9 Settings sections without Voice/Cloud/Billing and feature-detects supported config keys (CAP-SETTINGS-01, CAP-SETTINGS-N1, CAP-VOICE-N1)", () => {
+    expect(SETTINGS_SECTION_IDS).toEqual([
+      "model",
+      "workspace",
+      "safety",
+      "memory",
+      "chat",
+      "gateways",
+      "updates",
+      "about",
+      "diagnostics",
+    ]);
+    expect(SETTINGS_SECTION_IDS).not.toContain("voice");
+    expect(SETTINGS_SECTION_IDS).not.toContain("cloud");
+    expect(SETTINGS_SECTION_IDS).not.toContain("account");
+    expect(SETTINGS_SECTION_IDS).not.toContain("billing");
+
+    // When only model.default is supported, model.reasoning_effort and any cloud/voice keys are hidden
+    const snapshot = {
+      scope: { connectionId: "local", profileId: "default" },
+      supported: true,
+      readOnly: false,
+      supportedKeys: [
+        "model.default",
+        "chat.send_on_enter",
+        "voice.enabled",
+        "cloud.account_tier",
+        "billing.plan",
+      ],
+      values: {
+        "model.default": "claude-3-7-sonnet",
+        "chat.send_on_enter": true,
+        "voice.enabled": true,
+        "cloud.account_tier": "pro",
+      },
+      updatedAt: "2026-11-23T08:00:00.000Z",
+    };
+
+    const modelFields = projectSettingsSectionFields("model", snapshot);
+    expect(modelFields.map((f) => f.key)).toEqual(["model.default"]);
+    expect(modelFields[0]?.value).toBe("claude-3-7-sonnet");
+
+    const workspaceFields = projectSettingsSectionFields("workspace", snapshot);
+    expect(workspaceFields).toEqual([]);
+
+    const chatFields = projectSettingsSectionFields("chat", snapshot);
+    expect(chatFields.map((f) => f.key)).toEqual(["chat.send_on_enter"]);
+  });
+
+  it("manages LIFO FocusReturnController stack with Esc closing topmost, deterministic fallback, and ⌘W window close clearing return stack", () => {
+    const controller = new SurfaceFocusReturnStack();
+    controller.register("settings", { triggerId: "rail-settings-gear" });
+    controller.register("scopePopover", { triggerId: "route-scope-trigger" });
+
+    // Esc closes only topmost (scopePopover) and returns focus to route-scope-trigger
+    const firstClose = controller.closeTopmost("escape");
+    expect(firstClose).toEqual({
+      closedSurface: "scopePopover",
+      returnTargetId: "route-scope-trigger",
+    });
+
+    // Next Esc closes settings and returns focus to rail-settings-gear
+    const secondClose = controller.closeTopmost("escape");
+    expect(secondClose).toEqual({
+      closedSurface: "settings",
+      returnTargetId: "rail-settings-gear",
+    });
+
+    // If original trigger is hidden/unfocusable, resolveReturn falls back to composer-input -> rail-new-session
+    controller.register("settings", { triggerId: "rail-settings-gear" });
+    const fallbackTarget = controller.resolveReturn("settings", (id) => id === "composer-input");
+    expect(fallbackTarget).toBe("composer-input");
+
+    // ⌘W window close clears stack without returning focus
+    controller.clearOnWindowClose();
+    expect(controller.closeTopmost("escape")).toEqual({
+      closedSurface: null,
+      returnTargetId: null,
+    });
   });
 });

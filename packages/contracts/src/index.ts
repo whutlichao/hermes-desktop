@@ -1001,3 +1001,94 @@ export interface RegistrySafeSummaryExport {
     sshTargetDisplay?: string;
   }>;
 }
+
+export const REFUSED_GATEWAY_METHODS = [
+  "agents.list",
+  "session.activate",
+  "session.archive",
+  "session.branch",
+  "session.branch_stored",
+  "session.branch_whole",
+  "session.close",
+  "session.compress",
+  "session.cwd.set",
+  "session.delete",
+  "session.set_hidden",
+  "session.status",
+  "session.title",
+  "session.undo",
+  "session.usage",
+  "session.workspace.move",
+] as const;
+
+export type RefusedGatewayMethod = (typeof REFUSED_GATEWAY_METHODS)[number];
+
+export const SESSION_CLI_ACTION_IDS = [
+  "rename",
+  "delete",
+  "branch",
+  "archive",
+  "compress",
+  "undo",
+] as const;
+
+export type SessionCliActionId = (typeof SESSION_CLI_ACTION_IDS)[number];
+
+export interface SessionCliDeepLink {
+  actionId: SessionCliActionId;
+  labelKey: string;
+  command: string;
+  executionNoteKey: string;
+}
+
+export const SETTINGS_SECTION_IDS = [
+  "model",
+  "workspace",
+  "safety",
+  "memory",
+  "chat",
+  "gateways",
+  "updates",
+  "about",
+  "diagnostics",
+] as const;
+
+export type SettingsSectionId = (typeof SETTINGS_SECTION_IDS)[number];
+
+export const SUPPORTED_GATEWAY_CONFIG_KEYS = [
+  "model.default",
+  "model.reasoning_effort",
+  "workspace.default_tab",
+  "workspace.auto_open_artifacts",
+  "safety.approval_policy",
+  "safety.redact_diagnostics",
+  "memory.context_window",
+  "memory.auto_summarize",
+  "chat.send_on_enter",
+  "chat.stream_tokens",
+] as const;
+
+export type SupportedGatewayConfigKey = (typeof SUPPORTED_GATEWAY_CONFIG_KEYS)[number];
+
+export type GatewayConfigValue = string | number | boolean;
+
+export interface GatewayConfigSnapshot {
+  scope: BridgeScope | null;
+  supported: boolean;
+  readOnly: boolean;
+  supportedKeys: string[];
+  values: Record<string, GatewayConfigValue>;
+  updatedAt: string;
+}
+
+export interface GatewayConfigUpdateInput {
+  key: string;
+  value: GatewayConfigValue;
+}
+
+export interface GatewayConfigUpdateResult {
+  ok: boolean;
+  snapshot: GatewayConfigSnapshot;
+  errorCode?: ErrorCode;
+}
+

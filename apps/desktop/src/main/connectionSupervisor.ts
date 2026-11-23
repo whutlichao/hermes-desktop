@@ -9,6 +9,9 @@ import type {
   ConnectionHealthSummary,
   ErrorCode,
   FleetSnapshot,
+  GatewayConfigSnapshot,
+  GatewayConfigUpdateResult,
+  GatewayConfigValue,
   LocalInspectResult,
   LocalTypedFailure,
   ProfileSummary,
@@ -30,6 +33,7 @@ import {
   classifyRuntimeCapabilities,
   getCopy,
   getLocalFailureCopy,
+  isAllowedGatewayConfigKey,
   isJsonRpcMethodNotFound,
   reduceTranscriptEvent,
   resolveExplicitMethodAlias,
@@ -2727,7 +2731,9 @@ export class ConnectionSupervisor {
     | "files.list"
     | "files.read"
     | "chatState.exportMissingSession"
-    | "chatState.dismissMissingSession",
+    | "chatState.dismissMissingSession"
+    | "config.get"
+    | "config.update",
     HostCommandHandler
   > = {
     "capabilities.describe": async (payload, scope) => {
@@ -2807,12 +2813,22 @@ export class ConnectionSupervisor {
       const entry = this.getTransport(connectionId, profileId);
       let transcript: SessionTranscriptSnapshot | null = null;
       if (entry) {
+        await this.refreshProfiles(entry, profileId);
         const sessions = await this.refreshSessionsForProfile(entry, profileId);
         const requestedSession =
           typeof payload.sessionId === "string" && payload.sessionId.trim()
             ? payload.sessionId.trim()
-            : scope?.sessionId ?? null;
-        const resolvedSessionId = requestedSession ?? sessions[0]?.sessionId ?? null;
+            : null;
+        const rememberedSession =
+          this.chatSessionStateStore?.getProjection().lastSessionByScope[
+            scopeKey(connectionId, profileId)
+          ] ?? null;
+        const validRemembered =
+          rememberedSession && sessions.some((s) => s.sessionId === rememberedSession)
+            ? rememberedSession
+            : null;
+        const resolvedSessionId =
+          requestedSession ?? validRemembered ?? sessions[0]?.sessionId ?? null;
         this.activeScope = {
           connectionId,
           profileId,
@@ -3304,7 +3320,132 @@ export class ConnectionSupervisor {
       this.emitFleet();
       return projection;
     },
+
+    "config.get": async (payload, scope): Promise<GatewayConfigSnapshot> => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const entry = this.getTransport(connectionId, profileId);
+      const nowIso = new Date().toISOString();
+      if (!entry || this.capabilityRegistry.isMethodRefused("config.get")) {
+        return {
+          scope: { connectionId, profileId },
+          supported: false,
+          readOnly: true,
+          supportedKeys: [],
+          values: {},
+          updatedAt: nowIso,
+        };
+      }
+      try {
+        const res = await entry.client.call<Record<string, unknown>>("config.get", {
+          profile_id: profileId,
+        });
+        return this.parseGatewayConfigSnapshot(connectionId, profileId, res);
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          this.capabilityRegistry.markMethodNotFound({
+            method: "config.get",
+            expectedOwnerGeneration: entry.ownerGeneration,
+            expectedAuthorityEpoch: entry.authorityEpoch,
+          });
+          this.emitCapabilities();
+        }
+        return {
+          scope: { connectionId, profileId },
+          supported: false,
+          readOnly: true,
+          supportedKeys: [],
+          values: {},
+          updatedAt: nowIso,
+        };
+      }
+    },
+
+    "config.update": async (payload, scope): Promise<GatewayConfigUpdateResult> => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const key = typeof payload.key === "string" ? payload.key.trim() : "";
+      const value = payload.value as GatewayConfigValue;
+      if (!key || !isAllowedGatewayConfigKey(key)) {
+        throw makeBridgeError("invalid_request", "不支持更新该配置项");
+      }
+      const entry = this.requireTransport(connectionId, profileId);
+      if (this.capabilityRegistry.isMethodRefused("config.update")) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 拒绝更新配置");
+      }
+      try {
+        const res = await entry.client.call<Record<string, unknown>>("config.update", {
+          profile_id: profileId,
+          key,
+          value,
+        });
+        return {
+          ok: true,
+          snapshot: this.parseGatewayConfigSnapshot(connectionId, profileId, res),
+        };
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          this.capabilityRegistry.markMethodNotFound({
+            method: "config.update",
+            expectedOwnerGeneration: entry.ownerGeneration,
+            expectedAuthorityEpoch: entry.authorityEpoch,
+          });
+          this.emitCapabilities();
+          throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 config.update 能力");
+        }
+        throw makeBridgeError("internal", "更新配置失败");
+      }
+    },
   };
+
+  private parseGatewayConfigSnapshot(
+    connectionId: string,
+    profileId: string,
+    raw: Record<string, unknown> | null | undefined,
+  ): GatewayConfigSnapshot {
+    const nowIso = new Date().toISOString();
+    if (!raw || typeof raw !== "object") {
+      return {
+        scope: { connectionId, profileId },
+        supported: false,
+        readOnly: true,
+        supportedKeys: [],
+        values: {},
+        updatedAt: nowIso,
+      };
+    }
+    const rawValuesObj =
+      raw.values && typeof raw.values === "object" && !Array.isArray(raw.values)
+        ? (raw.values as Record<string, unknown>)
+        : raw.config && typeof raw.config === "object" && !Array.isArray(raw.config)
+          ? (raw.config as Record<string, unknown>)
+          : raw;
+    const rawKeys = Array.isArray(raw.supported_keys)
+      ? raw.supported_keys
+      : Array.isArray(raw.supportedKeys)
+        ? raw.supportedKeys
+        : Object.keys(rawValuesObj);
+    const supportedKeys: string[] = [];
+    const values: Record<string, GatewayConfigValue> = {};
+    for (const k of rawKeys) {
+      if (typeof k !== "string" || !isAllowedGatewayConfigKey(k)) continue;
+      if (!supportedKeys.includes(k)) {
+        supportedKeys.push(k);
+      }
+      const val = rawValuesObj[k];
+      if (typeof val === "string" || typeof val === "number" || typeof val === "boolean") {
+        values[k] = val;
+      }
+    }
+    return {
+      scope: { connectionId, profileId },
+      supported: supportedKeys.length > 0,
+      readOnly: Boolean(raw.read_only ?? raw.readOnly ?? false),
+      supportedKeys,
+      values,
+      updatedAt: nowIso,
+    };
+  }
 
   async dispose(): Promise<void> {
     this.disposed = true;

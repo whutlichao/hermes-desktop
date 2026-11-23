@@ -11,3 +11,4 @@ export * from "./remoteGateway";
 export * from "./ssh";
 export * from "./workspace";
 export * from "./focusReturnController";
+export * from "./settingsAndScope";
