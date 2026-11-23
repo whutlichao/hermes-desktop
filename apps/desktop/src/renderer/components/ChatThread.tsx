@@ -11,6 +11,7 @@ import type {
   MissingSessionExport,
   SessionTranscriptSnapshot,
   ToolExecutionRow,
+  TranscriptPendingApprovalView,
 } from "@hermes/contracts";
 import { getCopy } from "@hermes/domain";
 import { AttributionBadge } from "./AttributionBadge";
@@ -75,7 +76,7 @@ function getRoleLabel(role: "user" | "assistant" | "system"): string {
   }
 }
 
-function getApprovalStatusLabel(status: ApprovalView["status"]): string {
+function getApprovalStatusLabel(status: TranscriptPendingApprovalView["status"]): string {
   switch (status) {
     case "pending":
       return getCopy("chat.approvalStatus.pending");

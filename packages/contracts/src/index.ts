@@ -326,7 +326,7 @@ export interface ExternalAttribution {
   accessibleLabel: string;
 }
 
-export interface ApprovalView {
+export interface TranscriptPendingApprovalView {
   approvalId: string;
   sessionId: string;
   toolName: string;
@@ -375,7 +375,7 @@ export interface SessionTranscriptSnapshot {
   chatAvailable: boolean;
   chatUnavailableReason?: string;
   supportedActions: SupportedChatActions;
-  pendingApprovals?: ApprovalView[];
+  pendingApprovals?: TranscriptPendingApprovalView[];
   snapshotSeq?: number;
   resynced?: boolean;
   lastKnownUnverified?: boolean;

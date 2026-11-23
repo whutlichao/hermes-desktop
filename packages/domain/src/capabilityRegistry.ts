@@ -1,5 +1,4 @@
 import type {
-  ApprovalView,
   CapabilityClassification,
   CapabilityDeepLink,
   CapabilityDegradation,
@@ -23,6 +22,7 @@ import type {
   SkillInventoryRow,
   SkillsInventoryView,
   ToolInventoryRow,
+  TranscriptPendingApprovalView,
   ToolsInventoryView,
 } from "@hermes/contracts";
 import { getCopy, type CopyKey } from "./copy";
@@ -891,7 +891,7 @@ export interface ProjectApprovalViewInput extends ExternalAttributionInput {
   requestedAt: string;
 }
 
-export function projectApprovalView(input: ProjectApprovalViewInput): ApprovalView {
+export function projectApprovalView(input: ProjectApprovalViewInput): TranscriptPendingApprovalView {
   return {
     approvalId: input.approvalId,
     sessionId: input.sessionId,
