@@ -467,6 +467,28 @@ test.describe("Electron hardened smoke", () => {
       await expect(thread).toContainText("已停止");
       await expect(stopBtn).toHaveCount(0);
 
+      // Verify capabilities.describe + ⌘K Command Palette + Capabilities Drawer in Electron
+      const capBtn = page.getByRole("button", { name: /能力 17 可达 4 延期/ });
+      await expect(capBtn).toBeVisible();
+      await capBtn.click();
+      const capDrawer = page.getByRole("dialog", { name: "能力目录" });
+      await expect(capDrawer).toBeVisible();
+      await expect(capDrawer.getByTestId("cap-group-core")).toContainText("核心 5");
+      await expect(capDrawer.getByTestId("cap-group-admin")).toContainText("管理 8");
+      await expect(capDrawer.getByTestId("cap-group-exec")).toContainText("执行 4");
+      await expect(capDrawer.getByTestId("capabilities-deferred-footnote")).toContainText("Voice");
+      await expect(capDrawer.getByTestId("capabilities-deferred-footnote").getByRole("button")).toHaveCount(0);
+      await page.keyboard.press("Escape");
+      await expect(capDrawer).toBeHidden();
+
+      await page.getByRole("button", { name: "命令面板 ⌘K" }).click();
+      const palette = page.getByRole("dialog", { name: "命令面板" });
+      await expect(palette).toBeVisible();
+      await expect(palette.getByRole("combobox")).toBeVisible();
+      await expect(palette.getByRole("listbox")).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(palette).toBeHidden();
+
       // Verify zero ticket / wsUrl leak in DOM or diagnostics.export
       const bodyText = await page.locator("body").innerText();
       expect(bodyText).not.toContain("tkt_elec_");

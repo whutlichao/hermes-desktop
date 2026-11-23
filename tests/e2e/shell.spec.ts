@@ -277,4 +277,99 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await expect(scopeDialog).toBeHidden();
     await expect(scopeBtn).toBeFocused();
   });
+
+  test("⌘K Command Palette uses WAI-ARIA combobox/listbox keyboard navigation sourced from CapabilityRegistry with zero deferred entries", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // Wait for initial capabilities hydration and React keydown listener mount
+    await expect(page.getByRole("button", { name: /能力 17 可达 4 延期/ })).toBeVisible();
+    await page.getByRole("button", { name: "命令面板 ⌘K" }).focus();
+
+    await page.keyboard.press("Control+k");
+    const palette = page.getByRole("dialog", { name: "命令面板" });
+    await expect(palette).toBeVisible();
+    await expect(palette).toContainText("能力 17 可达 4 延期");
+
+    const combobox = palette.getByRole("combobox");
+    await expect(combobox).toBeVisible();
+    await expect(combobox).toBeFocused();
+    const listbox = palette.getByRole("listbox");
+    await expect(listbox).toBeVisible();
+
+    const options = listbox.getByRole("option");
+    const count = await options.count();
+    expect(count).toBeGreaterThan(5);
+
+    // Every option must carry a data-testid and never represent a deferred domain
+    const optionDomains = await options.evaluateAll((els) =>
+      els.map((el) => ({
+        domain: el.getAttribute("data-domain"),
+        testId: el.getAttribute("data-testid"),
+      })),
+    );
+    for (const opt of optionDomains) {
+      expect(opt.testId).toBeTruthy();
+      expect(["voice", "bots", "memory_graph", "kanban"]).not.toContain(opt.domain);
+    }
+
+    // Keyboard ArrowDown / End / Home / ArrowUp updates aria-activedescendant cleanly
+    const firstId = await combobox.getAttribute("aria-activedescendant");
+    expect(firstId).toBeTruthy();
+    await page.keyboard.press("ArrowDown");
+    const secondId = await combobox.getAttribute("aria-activedescendant");
+    expect(secondId).not.toBe(firstId);
+    await page.keyboard.press("End");
+    const lastId = await combobox.getAttribute("aria-activedescendant");
+    expect(lastId).toBeTruthy();
+    await page.keyboard.press("Home");
+    expect(await combobox.getAttribute("aria-activedescendant")).toBe(firstId);
+
+    // Filter to capabilities.open and press Enter to open Capabilities drawer
+    await combobox.fill("查看能力目录");
+    await page.keyboard.press("Enter");
+    await expect(palette).toBeHidden();
+    await expect(page.getByRole("dialog", { name: "能力目录" })).toBeVisible();
+  });
+
+  test("E2E-FAKE-01: Capabilities drawer sizes to 448px@1440 / 408px@1280, groups Core 5 / Admin 8 / Exec 4, and exposes zero deferred buttons", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const drawer = page.getByRole("dialog", { name: "能力目录" });
+    await expect(drawer).toBeVisible();
+
+    const box1440 = await drawer.boundingBox();
+    expect(box1440?.width).toBe(448);
+
+    await expect(drawer.getByTestId("capabilities-counts-summary")).toContainText("能力 17 可达 4 延期");
+    await expect(drawer.getByTestId("cap-group-core")).toContainText("核心 5");
+    await expect(drawer.getByTestId("cap-group-admin")).toContainText("管理 8");
+    await expect(drawer.getByTestId("cap-group-exec")).toContainText("执行 4");
+
+    expect(await drawer.locator('[data-testid="cap-group-core"] .cap-domain-card').count()).toBe(5);
+    expect(await drawer.locator('[data-testid="cap-group-admin"] .cap-domain-card').count()).toBe(8);
+    expect(await drawer.locator('[data-testid="cap-group-exec"] .cap-domain-card').count()).toBe(4);
+
+    // Bottom disclosure footnote ONLY; zero buttons/tabs/switches for deferred domains
+    const footnote = drawer.getByTestId("capabilities-deferred-footnote");
+    await expect(footnote).toBeVisible();
+    await expect(footnote).toContainText("Voice");
+    await expect(footnote.getByRole("button")).toHaveCount(0);
+    await expect(drawer.locator('[data-domain="voice"], [data-domain="bots"], [data-domain="memory_graph"], [data-domain="kanban"]')).toHaveCount(0);
+
+    // Resize to 1280x800 -> drawer adapts to 408px without horizontal overflow
+    await page.setViewportSize({ width: 1280, height: 800 });
+    const box1280 = await drawer.boundingBox();
+    expect(box1280?.width).toBe(408);
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(overflow).toBe(false);
+  });
 });

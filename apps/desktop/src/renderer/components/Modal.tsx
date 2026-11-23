@@ -8,6 +8,7 @@ interface ModalProps {
   closeLabel: string;
   onClose: () => void;
   className?: string;
+  scrimClassName?: string;
   children: ReactNode;
 }
 
@@ -18,6 +19,7 @@ export function FocusDialog({
   closeLabel,
   onClose,
   className,
+  scrimClassName,
   children,
 }: ModalProps) {
   const titleId = useId();
@@ -37,7 +39,10 @@ export function FocusDialog({
       ).filter((el) => el.getClientRects().length > 0);
 
     const list = getFocusables();
-    if (list.length > 0) {
+    const autofocusTarget = root.querySelector<HTMLElement>("[data-autofocus]");
+    if (autofocusTarget && list.includes(autofocusTarget)) {
+      autofocusTarget.focus();
+    } else if (list.length > 0) {
       list[0].focus();
     } else {
       root.focus();
@@ -70,7 +75,7 @@ export function FocusDialog({
 
   return (
     <div
-      className="modal-scrim"
+      className={["modal-scrim", scrimClassName].filter(Boolean).join(" ")}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}

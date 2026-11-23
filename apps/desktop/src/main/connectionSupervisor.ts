@@ -2,6 +2,8 @@ import type {
   ActivityEventPayload,
   BridgeEvent,
   BridgeScope,
+  CapabilityDomainId,
+  CapabilitySnapshot,
   ConnectionHealthSummary,
   ErrorCode,
   FleetSnapshot,
@@ -17,10 +19,14 @@ import type {
   TranscriptPatchPayload,
 } from "@hermes/contracts";
 import {
+  CAPABILITY_DOMAIN_CATALOG,
+  CORE_CAPABILITY_DOMAINS,
+  CapabilityRegistry,
   classifyRuntimeCapabilities,
   getLocalFailureCopy,
   isJsonRpcMethodNotFound,
   reduceTranscriptEvent,
+  resolveExplicitMethodAlias,
   toSupportedChatActions,
   type ClassifiedRuntimeCapabilities,
   type HostCommandHandler,
@@ -43,9 +49,14 @@ interface GatewayTransportEntry {
   transportMode: "shared-host-scope" | "per-profile";
   client: GatewayClient;
   dial: LocalDialMaterial;
+  ownerGeneration: number;
+  authorityEpoch: number;
+  gatewayVersionOrSha: string;
+  describeResult?: Record<string, unknown>;
   capabilities: ClassifiedRuntimeCapabilities;
   supportedActions: SupportedChatActions;
   capabilitiesReported: boolean;
+  capabilitiesHandshakeSent: boolean;
   subscribedToGateway: boolean;
   disposed: boolean;
   unsubNotification: () => void;
@@ -178,9 +189,13 @@ function mapRawMessage(raw: Record<string, unknown>, sessionId: string): Transcr
 export class LocalConnectionSupervisor {
   private readonly localBackend: LocalBackendManager;
   private readonly getLocalLabel: () => string;
+  private readonly probeTimeoutMs: number;
+  private readonly capabilityRegistry = new CapabilityRegistry();
 
   private revision = 1;
   private subscriberSeq = 0;
+  private ownerGenerationSeq = 0;
+  private inflightCoreProbes: Promise<void> | null = null;
   private disposed = false;
 
   private localHealth: ConnectionHealthSummary;
@@ -198,10 +213,12 @@ export class LocalConnectionSupervisor {
     localBackend: LocalBackendManager,
     options?: {
       getLocalLabel?: () => string;
+      probeTimeoutMs?: number;
     },
   ) {
     this.localBackend = localBackend;
     this.getLocalLabel = options?.getLocalLabel ?? (() => "This device");
+    this.probeTimeoutMs = options?.probeTimeoutMs ?? 1200;
     this.localHealth = {
       connectionId: "local",
       label: this.getLocalLabel(),
@@ -212,6 +229,16 @@ export class LocalConnectionSupervisor {
       latencyMs: null,
       nextRetryAt: null,
     };
+  }
+
+  getCapabilitySnapshot(): CapabilitySnapshot {
+    return this.capabilityRegistry.getSnapshot();
+  }
+
+  invalidateCapabilities(reason: string): CapabilitySnapshot {
+    const snap = this.capabilityRegistry.invalidate({ reason });
+    this.emitCapabilities();
+    return snap;
   }
 
   getLocalHealth(): ConnectionHealthSummary {
@@ -291,6 +318,10 @@ export class LocalConnectionSupervisor {
       { profiles: [...this.profiles] },
       (sub) => !sub.scope || sub.scope.connectionId === "local",
     );
+  }
+
+  private emitCapabilities(): void {
+    this.emitTopic("capabilities", null, "snapshot", this.capabilityRegistry.getSnapshot());
   }
 
   private emitSessions(profileId: string): void {
@@ -500,9 +531,26 @@ export class LocalConnectionSupervisor {
 
     const capabilities = classifyRuntimeCapabilities(describeRes);
     const supportedActions = toSupportedChatActions(capabilities);
+    const ownerGeneration = ++this.ownerGenerationSeq;
+    const authorityEpoch =
+      describeRes && typeof describeRes.authority_epoch === "number"
+        ? describeRes.authority_epoch
+        : describeRes && typeof describeRes.authorityEpoch === "number"
+          ? describeRes.authorityEpoch
+          : 1;
+    const gatewayVersionOrSha =
+      describeRes && typeof describeRes.code_sha === "string"
+        ? describeRes.code_sha
+        : describeRes && typeof describeRes.gateway_version === "string"
+          ? describeRes.gateway_version
+          : describeRes && typeof describeRes.version === "string"
+            ? describeRes.version
+            : "unknown";
 
     let capabilitiesReported = false;
+    let capabilitiesHandshakeSent = false;
     try {
+      capabilitiesHandshakeSent = true;
       await client.call("client.capabilities", { server_requests: true });
       capabilitiesReported = true;
     } catch (err) {
@@ -526,9 +574,14 @@ export class LocalConnectionSupervisor {
       transportMode: dial.transportMode,
       client,
       dial,
+      ownerGeneration,
+      authorityEpoch,
+      gatewayVersionOrSha,
+      describeResult: describeRes,
       capabilities,
       supportedActions,
       capabilitiesReported,
+      capabilitiesHandshakeSent,
       subscribedToGateway,
       disposed: false,
       unsubNotification: () => {},
@@ -550,6 +603,8 @@ export class LocalConnectionSupervisor {
           latencyMs: null,
           errorCode: "unreachable",
         };
+        this.capabilityRegistry.invalidate({ reason: "transport_closed" });
+        this.emitCapabilities();
         this.emitFleet();
       }
     });
@@ -559,6 +614,18 @@ export class LocalConnectionSupervisor {
       this.disposeTransportEntry(transportKey, previous);
     }
     this.transports.set(transportKey, entry);
+
+    this.capabilityRegistry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: dial.profileId,
+      ownerGeneration,
+      authorityEpoch,
+      gatewayVersionOrSha,
+      describeResult: describeRes,
+      serverRequestsSupported: capabilitiesReported,
+    });
+    this.emitCapabilities();
+    this.scheduleCoreProbes(entry, dial.profileId);
 
     const latencyMs = Math.max(1, Date.now() - startedAt);
     this.localHealth = {
@@ -889,11 +956,175 @@ export class LocalConnectionSupervisor {
     }
   }
 
+  private scheduleCoreProbes(entry: GatewayTransportEntry, profileId: string): void {
+    const promise = Promise.all(
+      CORE_CAPABILITY_DOMAINS.map((domain) => this.probeDomain(entry, profileId, domain)),
+    ).then(() => {
+      if (!this.disposed && !entry.disposed) {
+        this.emitCapabilities();
+      }
+    });
+    this.inflightCoreProbes = promise.finally(() => {
+      if (this.inflightCoreProbes === promise) {
+        this.inflightCoreProbes = null;
+      }
+    });
+  }
+
+  private async probeDomain(
+    entry: GatewayTransportEntry,
+    profileId: string,
+    domain: CapabilityDomainId,
+    options?: { force?: boolean },
+  ): Promise<void> {
+    if (this.disposed || entry.disposed) return;
+    const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === domain);
+    if (!meta || !meta.probeMethod || meta.classification === "deferred" || meta.classification === "deep_link") {
+      return;
+    }
+
+    const currentSnap = this.capabilityRegistry.getSnapshot();
+    const existingDom = currentSnap.domains.find((d) => d.domain === domain);
+    if (existingDom?.probed && !options?.force) {
+      return;
+    }
+
+    const probeMethod = resolveExplicitMethodAlias(meta.probeMethod) ?? meta.probeMethod;
+    const methodToCheck = this.capabilityRegistry.getMethodTier(meta.probeMethod) !== "unknown"
+      ? meta.probeMethod
+      : probeMethod;
+
+    // Never invoke refused methods on wire
+    if (
+      this.capabilityRegistry.isMethodRefused(meta.probeMethod) ||
+      this.capabilityRegistry.isMethodRefused(methodToCheck) ||
+      meta.requiredMethods.some((req) => this.capabilityRegistry.isMethodRefused(req))
+    ) {
+      this.capabilityRegistry.applyProbeOutcome({
+        domain,
+        method: meta.probeMethod,
+        outcome: "refused",
+        expectedOwnerGeneration: entry.ownerGeneration,
+        expectedAuthorityEpoch: entry.authorityEpoch,
+      });
+      return;
+    }
+
+    // Legacy owner without server_requests: don't pretend approval is available
+    if (domain === "approval" && !entry.capabilitiesReported) {
+      this.capabilityRegistry.applyProbeOutcome({
+        domain,
+        method: meta.probeMethod,
+        outcome: "method_not_found",
+        expectedOwnerGeneration: entry.ownerGeneration,
+        expectedAuthorityEpoch: entry.authorityEpoch,
+      });
+      return;
+    }
+
+    const startGeneration = currentSnap.generation;
+    try {
+      await entry.client.call(
+        meta.probeMethod,
+        { profile_id: profileId },
+        { timeoutMs: this.probeTimeoutMs },
+      );
+      this.capabilityRegistry.applyProbeOutcome({
+        domain,
+        method: meta.probeMethod,
+        outcome: "ok",
+        expectedOwnerGeneration: entry.ownerGeneration,
+        expectedAuthorityEpoch: entry.authorityEpoch,
+        expectedGeneration: startGeneration,
+      });
+    } catch (err) {
+      if (isJsonRpcMethodNotFound(err)) {
+        this.capabilityRegistry.applyProbeOutcome({
+          domain,
+          method: meta.probeMethod,
+          outcome: "method_not_found",
+          expectedOwnerGeneration: entry.ownerGeneration,
+          expectedAuthorityEpoch: entry.authorityEpoch,
+          expectedGeneration: startGeneration,
+        });
+      } else if (err instanceof GatewayTransportError && err.code === "timeout") {
+        this.capabilityRegistry.applyProbeOutcome({
+          domain,
+          method: meta.probeMethod,
+          outcome: "timeout",
+          expectedOwnerGeneration: entry.ownerGeneration,
+          expectedAuthorityEpoch: entry.authorityEpoch,
+          expectedGeneration: startGeneration,
+        });
+      } else {
+        // Non-fatal probe error: do not disconnect or retry
+        this.capabilityRegistry.applyProbeOutcome({
+          domain,
+          method: meta.probeMethod,
+          outcome: "timeout",
+          expectedOwnerGeneration: entry.ownerGeneration,
+          expectedAuthorityEpoch: entry.authorityEpoch,
+          expectedGeneration: startGeneration,
+        });
+      }
+    }
+  }
+
   private handleGatewayNotification(
     entry: GatewayTransportEntry,
     method: string,
     params: Record<string, unknown>,
   ): void {
+    if (method === "resync_required" || method === "possible_event_loss") {
+      const nextEpoch =
+        typeof params.authority_epoch === "number"
+          ? params.authority_epoch
+          : typeof params.authorityEpoch === "number"
+            ? params.authorityEpoch
+            : entry.authorityEpoch;
+      entry.authorityEpoch = nextEpoch;
+      this.capabilityRegistry.invalidate({
+        reason: method,
+        authorityEpoch: nextEpoch,
+      });
+      this.capabilityRegistry.applyConnectHandshake({
+        connectionId: "local",
+        profileId: this.activeScope?.profileId ?? entry.dial.profileId,
+        ownerGeneration: entry.ownerGeneration,
+        authorityEpoch: nextEpoch,
+        gatewayVersionOrSha: entry.gatewayVersionOrSha,
+        describeResult: entry.describeResult,
+        serverRequestsSupported: entry.capabilitiesReported,
+      });
+      this.emitCapabilities();
+      this.scheduleCoreProbes(entry, this.activeScope?.profileId ?? entry.dial.profileId);
+      return;
+    }
+
+    const incomingEpoch =
+      typeof params.authority_epoch === "number"
+        ? params.authority_epoch
+        : typeof params.authorityEpoch === "number"
+          ? params.authorityEpoch
+          : undefined;
+    if (incomingEpoch !== undefined && incomingEpoch !== entry.authorityEpoch) {
+      entry.authorityEpoch = incomingEpoch;
+      this.capabilityRegistry.invalidate({
+        reason: "authority_epoch_changed",
+        authorityEpoch: incomingEpoch,
+      });
+      this.capabilityRegistry.applyConnectHandshake({
+        connectionId: "local",
+        profileId: this.activeScope?.profileId ?? entry.dial.profileId,
+        ownerGeneration: entry.ownerGeneration,
+        authorityEpoch: incomingEpoch,
+        gatewayVersionOrSha: entry.gatewayVersionOrSha,
+        describeResult: entry.describeResult,
+        serverRequestsSupported: entry.capabilitiesReported,
+      });
+      this.emitCapabilities();
+      this.scheduleCoreProbes(entry, this.activeScope?.profileId ?? entry.dial.profileId);
+    }
     const sessionId = asString(params.session_id ?? params.sessionId).trim();
     const profileId = asString(params.profile_id ?? params.profileId, entry.dial.profileId).trim() || entry.dial.profileId;
     const resolvedProfileId = this.findProfileIdForSession(sessionId) ?? profileId;
@@ -1038,10 +1269,19 @@ export class LocalConnectionSupervisor {
     entry: GatewayTransportEntry,
     err: unknown,
     singleAction?: keyof SupportedChatActions,
+    rpcMethod?: string,
   ): never {
     if (isJsonRpcMethodNotFound(err)) {
       if (singleAction) {
         this.downgradeSingleAction(entry, singleAction);
+      }
+      if (rpcMethod) {
+        this.capabilityRegistry.markMethodNotFound({
+          method: rpcMethod,
+          expectedOwnerGeneration: entry.ownerGeneration,
+          expectedAuthorityEpoch: entry.authorityEpoch,
+        });
+        this.emitCapabilities();
       }
       throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供此能力");
     }
@@ -1103,6 +1343,15 @@ export class LocalConnectionSupervisor {
                 supportedActions: defaultChatActions(),
               });
         listener({ topic, scope: { connectionId: "local", profileId: pid, ...(sid ? { sessionId: sid } : {}) }, kind: "snapshot", seq: 0, revision: rev, payload: snap });
+      } else if (topic === "capabilities") {
+        listener({
+          topic,
+          scope: null,
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: this.capabilityRegistry.getSnapshot(),
+        });
       }
     });
 
@@ -1112,6 +1361,7 @@ export class LocalConnectionSupervisor {
   }
 
   readonly handlers: Record<
+    | "capabilities.describe"
     | "connections.retry"
     | "profiles.list"
     | "sessions.list"
@@ -1123,6 +1373,25 @@ export class LocalConnectionSupervisor {
     | "prompts.steer",
     HostCommandHandler
   > = {
+    "capabilities.describe": async (payload, scope) => {
+      if (this.inflightCoreProbes) {
+        await this.inflightCoreProbes;
+      }
+      const domain =
+        typeof payload.domain === "string" ? (payload.domain as CapabilityDomainId) : undefined;
+      if (domain) {
+        const profileId = this.resolveTargetProfile(payload, scope);
+        const entry = this.getTransportForProfile(profileId);
+        if (entry) {
+          await this.probeDomain(entry, profileId, domain, {
+            force: payload.refresh === true,
+          });
+          this.emitCapabilities();
+        }
+      }
+      return this.capabilityRegistry.getSnapshot();
+    },
+
     "connections.retry": async (payload, scope) => {
       const profileId = this.resolveTargetProfile(payload, scope);
       const res = await this.connectLocal(profileId, { forceReconnect: true });
@@ -1178,6 +1447,19 @@ export class LocalConnectionSupervisor {
       if (resolvedSessionId) {
         transcript = await this.loadTranscriptSnapshot(entry, profileId, resolvedSessionId);
       }
+      if (this.capabilityRegistry.getSnapshot().key.profileId !== profileId) {
+        this.capabilityRegistry.applyConnectHandshake({
+          connectionId: "local",
+          profileId,
+          ownerGeneration: entry.ownerGeneration,
+          authorityEpoch: entry.authorityEpoch,
+          gatewayVersionOrSha: entry.gatewayVersionOrSha,
+          describeResult: entry.describeResult,
+          serverRequestsSupported: entry.capabilitiesReported,
+        });
+        this.emitCapabilities();
+        this.scheduleCoreProbes(entry, profileId);
+      }
       this.emitFleet();
       return {
         fleet: this.getFleetSnapshot(),
@@ -1203,7 +1485,7 @@ export class LocalConnectionSupervisor {
           title,
         });
       } catch (err) {
-        this.translateRpcFailure(entry, err, "sessionCreate");
+        this.translateRpcFailure(entry, err, "sessionCreate", "session.create");
       }
 
       const rawSession =
@@ -1291,7 +1573,7 @@ export class LocalConnectionSupervisor {
           text,
         });
       } catch (err) {
-        this.translateRpcFailure(entry, err, "promptSubmit");
+        this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit");
       }
 
       const turnId = asString(res.turn_id ?? res.turnId, `turn-${Date.now()}`);
@@ -1397,7 +1679,7 @@ export class LocalConnectionSupervisor {
           turnId,
           kind: "stop_failed",
         } satisfies PromptEventPayload);
-        this.translateRpcFailure(entry, err, "promptCancel");
+        this.translateRpcFailure(entry, err, "promptCancel", "prompt.cancel");
       }
 
       if (res?.stopped === false) {
@@ -1454,7 +1736,7 @@ export class LocalConnectionSupervisor {
           text,
         });
       } catch (err) {
-        this.translateRpcFailure(entry, err, "promptSteer");
+        this.translateRpcFailure(entry, err, "promptSteer", "session.steer");
       }
     },
   };

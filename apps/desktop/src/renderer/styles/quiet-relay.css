@@ -1303,3 +1303,260 @@ button {
 .palette-item.is-active-scope {
   border-color: var(--ink);
 }
+
+.modal-scrim.is-drawer {
+  justify-content: flex-end;
+  align-items: stretch;
+  padding: 0;
+}
+
+.dialog-panel.capabilities-drawer {
+  width: 448px;
+  max-width: 100%;
+  height: 100vh;
+  max-height: 100vh;
+  border-radius: 0;
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+@media (max-width: 1340px) {
+  .dialog-panel.capabilities-drawer {
+    width: 408px;
+  }
+}
+
+.palette-meta-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.palette-listbox {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.palette-option {
+  cursor: pointer;
+}
+
+.palette-option.is-active {
+  border-color: var(--ink);
+  background: var(--hover);
+}
+
+.palette-option.is-unavailable {
+  opacity: 0.72;
+}
+
+.palette-option-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.palette-option-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.palette-option-hint {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.palette-empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.cap-summary-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--paper-raised);
+}
+
+.cap-counts-line {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.cap-key-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.cap-notice {
+  padding: 8px 10px;
+  border: 1px solid var(--control-line);
+  border-radius: 5px;
+  background: var(--paper-deep);
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.cap-empty-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.cap-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cap-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cap-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.cap-group-header h3 {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.cap-group-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.cap-domain-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cap-domain-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--paper-raised);
+}
+
+.cap-domain-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.cap-domain-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cap-class-tag {
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.cap-status-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.cap-status-badge.is-available {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.cap-status-badge.is-read_only {
+  border-color: var(--control-line);
+  background: var(--paper-raised);
+  color: var(--ink);
+}
+
+.cap-status-badge.is-degraded,
+.cap-status-badge.is-unknown {
+  border-color: var(--control-line);
+  background: var(--paper-deep);
+  color: var(--ink);
+}
+
+.cap-status-badge.is-deep_link {
+  border-color: var(--ink-soft);
+  background: var(--surface);
+  color: var(--ink-soft);
+}
+
+.cap-status-badge.is-unavailable {
+  border-color: var(--accent-text);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.cap-domain-note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.cap-deeplink-meta {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.cap-entry-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cap-action-btn {
+  min-height: 28px;
+  padding: 2px 9px;
+  font-size: 11.5px;
+}

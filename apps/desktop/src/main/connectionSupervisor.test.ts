@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { BridgeEvent, SessionTranscriptSnapshot } from "@hermes/contracts";
+import type { BridgeEvent, CapabilitySnapshot, SessionTranscriptSnapshot } from "@hermes/contracts";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
 import { startFakeGatewayServer } from "../../../../tests/helpers/fakeGatewayServer";
 import { LocalBackendManager, createNodeLocalBackendPorts } from "./localBackendManager";
@@ -472,6 +472,150 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
       )) as { session: { profileId: string; title: string } };
       expect(created.session.profileId).toBe("ops");
       expect(created.session.title).toBe("New Ops Check");
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("enforces CapabilityRegistry handshake, legacy missing server_requests, served/older/refused tiers, core-5 eager vs lazy probe, timeout->unknown, and generation invalidation (S1)", async () => {
+    const sandbox = createTestSandbox("hermes-s1-cap-");
+    let passed = false;
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      onRpc: (method, _params, ctx) => {
+        if (method === "runtime.describe") {
+          ctx.replyResult({
+            runtime_protocol: 1,
+            code_sha: "sha_cap_1",
+            capabilities: ["session-authority-v1", "host-scope-interactive"],
+            served_methods: [
+              "runtime.describe",
+              "subscribe",
+              "profiles.list",
+              "session.list",
+              "session.create",
+              "session.resume",
+              "session.transcript",
+              "prompt.submit",
+              "prompt.cancel",
+              "session.steer",
+              "approval.list",
+            ],
+            older_methods: ["skills.list", "config.get"],
+            refused_methods: ["tools.show", "session.delete"],
+            session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
+          });
+          return true;
+        }
+        // Legacy owner: client.capabilities returns -32601!
+        if (method === "client.capabilities") {
+          ctx.replyError(-32601, "Method not found: client.capabilities");
+          return true;
+        }
+        if (method === "config.get") {
+          // Hang longer than probeTimeoutMs so settings probe times out -> unknown without blocking connect!
+          setTimeout(() => {
+            ctx.replyResult({ config: {} });
+          }, 250);
+          return true;
+        }
+        if (method === "skills.list") {
+          ctx.replyResult({ skills: [{ name: "git" }] });
+          return true;
+        }
+        if (method === "tools.show") {
+          ctx.replyResult({ tools: [] });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      const backend = new LocalBackendManager(ports);
+      const supervisor = new LocalConnectionSupervisor(backend, { probeTimeoutMs: 40 });
+      const capEvents: BridgeEvent<CapabilitySnapshot>[] = [];
+      supervisor.subscribe("capabilities", null, (ev) =>
+        capEvents.push(ev as BridgeEvent<CapabilitySnapshot>),
+      );
+
+      await supervisor.connectLocal("default");
+
+      // 1. client.capabilities({ server_requests: true }) sent exactly once per ready
+      const capCalls = gw.rpcCalls.filter((c) => c.method === "client.capabilities");
+      expect(capCalls).toHaveLength(1);
+      expect(capCalls[0].params).toEqual({ server_requests: true });
+
+      // 2. Non-core domains (skills, tools, mcp, cron...) must NOT be probed eagerly on connect
+      expect(gw.rpcCalls.some((c) => c.method === "skills.list")).toBe(false);
+      expect(gw.rpcCalls.some((c) => c.method === "tools.show")).toBe(false);
+
+      const initialSnap = (await supervisor.handlers["capabilities.describe"]({}, null)) as CapabilitySnapshot;
+      expect(initialSnap.key.connectionId).toBe("local");
+      expect(initialSnap.key.profileId).toBe("default");
+      expect(initialSnap.key.gatewayVersionOrSha).toBe("sha_cap_1");
+      expect(initialSnap.legacyOwner).toBe(true);
+      expect(initialSnap.serverRequestsSupported).toBe(false);
+      // Missing server_requests -> approval unavailable
+      expect(initialSnap.domains.find((d) => d.domain === "approval")?.runtimeStatus).toBe("unavailable");
+      // Settings timed out -> unknown without blocking connect
+      expect(initialSnap.domains.find((d) => d.domain === "settings")?.runtimeStatus).toBe("unknown");
+
+      // 3. Lazy probe on non-core "skills" (older) -> calls skills.list once and tags degraded
+      const afterSkills = (await supervisor.handlers["capabilities.describe"](
+        { domain: "skills" },
+        null,
+      )) as CapabilitySnapshot;
+      expect(gw.rpcCalls.filter((c) => c.method === "skills.list")).toHaveLength(1);
+      const skillsDom = afterSkills.domains.find((d) => d.domain === "skills");
+      expect(skillsDom?.probed).toBe(true);
+      expect(skillsDom?.runtimeStatus).toBe("degraded");
+      expect(skillsDom?.degradation?.reason).toBe("older");
+
+      // 4. Refused domain "tools" ("tools.show" in refused_methods) MUST NEVER be invoked on wire!
+      const afterTools = (await supervisor.handlers["capabilities.describe"](
+        { domain: "tools" },
+        null,
+      )) as CapabilitySnapshot;
+      expect(gw.rpcCalls.some((c) => c.method === "tools.show")).toBe(false);
+      expect(afterTools.domains.find((d) => d.domain === "tools")?.runtimeStatus).toBe("unavailable");
+      expect(afterTools.entries.some((e) => e.domain === "tools")).toBe(false);
+
+      // 5. Reconnect bumps ownerGeneration and invalidates previous generation
+      const prevGen = afterTools.generation;
+      const prevOwnerGen = afterTools.key.ownerGeneration;
+      await supervisor.handlers["connections.retry"]({ connectionId: "local" }, null);
+      const afterRetry = (await supervisor.handlers["capabilities.describe"]({}, null)) as CapabilitySnapshot;
+      expect(afterRetry.key.ownerGeneration).toBeGreaterThan(prevOwnerGen);
+      expect(afterRetry.generation).toBeGreaterThan(prevGen);
+      expect(capEvents.length).toBeGreaterThanOrEqual(2);
 
       await supervisor.dispose();
       passed = true;
