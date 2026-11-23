@@ -1037,4 +1037,312 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await expect(page.locator(".transcript-list")).toContainText("ping remote gateway");
     await expect(page.locator(".transcript-list")).toContainText("SSH Mock Gateway");
   });
+
+  test("Ticket #35: Workspace shell bindings, 448/408 overlay geometry, Artifacts/Files preview & stale, annotations version, Hide vs Close, and FocusReturnController", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              availability: "ready",
+            },
+            {
+              connectionId: "local",
+              profileId: "research",
+              displayName: "Research",
+              handle: "research",
+              isDefault: false,
+              availability: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a",
+              title: "Session Alpha",
+              preview: "Alpha preview",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-b",
+              title: "Session Beta",
+              preview: "Beta preview",
+              updatedAt: "2026-11-23T08:01:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-a" },
+          activeSessionId: "sess-a",
+        },
+        chatState: {
+          windowId: "primary",
+          paneId: "main",
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-a" },
+          lastSessionByScope: { "local::default": "sess-a" },
+          lastValidProfileByConnection: { local: "default" },
+          lastValidScopes: [
+            { connectionId: "local", profileId: "default" },
+            { connectionId: "local", profileId: "research" },
+          ],
+          sessionSummaries: {},
+          activeStatus: "ready",
+          lastKnownUnverified: false,
+          missingSession: null,
+          routeBanner: null,
+        },
+        artifacts: {
+          "sess-a": [
+            {
+              artifactId: "art-spec",
+              title: "Workspace Spec",
+              kind: "markdown",
+              content: "# Workspace Spec v1\nInitial content",
+              version: 1,
+              hash: "hash-spec-v1",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+            },
+          ],
+          "sess-b": [
+            {
+              artifactId: "art-beta",
+              title: "Beta Diagram",
+              kind: "svg",
+              content: "<svg><text>Beta SVG</text></svg>",
+              version: 1,
+              hash: "hash-beta-v1",
+              updatedAt: "2026-11-23T08:01:00.000Z",
+            },
+          ],
+        },
+        files: {
+          "local::default": [
+            {
+              relativePath: "src",
+              name: "src",
+              kind: "directory",
+              parentPath: null,
+            },
+            {
+              relativePath: "src/main.ts",
+              name: "main.ts",
+              kind: "file",
+              parentPath: "src",
+              hash: "file-hash-1",
+              content: "const alpha = 1;\nconst beta = 2;\nexport { alpha, beta };",
+              sizeBytes: 56,
+            },
+          ],
+          "local::research": [
+            {
+              relativePath: "notes.md",
+              name: "notes.md",
+              kind: "file",
+              parentPath: null,
+              hash: "notes-hash-1",
+              content: "# Research Scope Notes",
+              sizeBytes: 22,
+            },
+          ],
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // 1. Mouse click on Session row leaves focus on that row
+    const sessAlphaRow = page.locator("nav.sidebar").getByRole("button", { name: /Session Alpha/ });
+    await sessAlphaRow.click();
+    await expect(sessAlphaRow).toBeFocused();
+
+    // 2. Open Workspace via trigger button -> 448px at 1440x900, overlay does not compress 720px thread column
+    const workspaceBtn = page.locator(".route-strip").getByRole("button", { name: /Workspace/ });
+    await workspaceBtn.focus();
+    await workspaceBtn.click();
+
+    const drawer = page.getByRole("complementary", { name: "Workspace" });
+    await expect(drawer).toBeVisible();
+    const drawerBox1440 = await drawer.boundingBox();
+    expect(drawerBox1440?.width).toBe(448);
+
+    const threadBox1440 = await page.locator(".thread-column").boundingBox();
+    expect(threadBox1440?.width).toBe(720);
+
+    // 1280x800 -> Workspace drawer is 408px
+    await page.setViewportSize({ width: 1280, height: 800 });
+    const drawerBox1280 = await drawer.boundingBox();
+    expect(drawerBox1280?.width).toBe(408);
+    await page.setViewportSize({ width: 1440, height: 900 });
+
+    // 3. Artifacts preview, zoom, and Draft annotation anchored to artifactId + version/hash + xPct/yPct + comment
+    await expect(drawer).toContainText("绑定 ActiveChat");
+    await expect(drawer).toContainText("Workspace Spec");
+    await expect(drawer.getByTestId("workspace-artifact-preview")).toContainText(
+      "# Workspace Spec v1",
+    );
+
+    await drawer.getByRole("button", { name: "放大预览" }).click();
+    await expect(drawer.getByTestId("workspace-artifact-zoom")).toHaveText("125%");
+
+    await drawer.getByLabel("标注 X 坐标 (%)").fill("30");
+    await drawer.getByLabel("标注 Y 坐标 (%)").fill("70");
+    await drawer.getByLabel("标注内容").fill("Check section header");
+    await drawer.getByRole("button", { name: "添加标注到 Draft" }).click();
+
+    const annCard = drawer.getByTestId("workspace-annotation-item").first();
+    await expect(annCard).toContainText("Check section header");
+    await expect(annCard).toContainText("(30%, 70%)");
+    await expect(annCard).not.toContainText("基于旧版本");
+
+    // 4. Artifact update marks existing annotation as "基于旧版本" without recalculating xPct/yPct
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      (fix.artifacts as Record<string, unknown>)["sess-a"] = [
+        {
+          artifactId: "art-spec",
+          title: "Workspace Spec",
+          kind: "markdown",
+          content: "# Workspace Spec v2\nUpdated specification",
+          version: 2,
+          hash: "hash-spec-v2",
+          updatedAt: "2026-11-23T08:05:00.000Z",
+        },
+      ];
+    });
+    await drawer.getByRole("button", { name: "刷新 Workspace" }).click();
+    await expect(drawer.getByTestId("workspace-artifact-preview")).toContainText(
+      "# Workspace Spec v2",
+    );
+    await expect(annCard).toContainText("(30%, 70%)");
+    await expect(annCard).toContainText("基于旧版本");
+
+    // 5. Switching Session swaps ActiveChat-bound Artifacts without closing drawer or switching tab
+    await page.locator("nav.sidebar").getByRole("button", { name: /Session Beta/ }).click();
+    await expect(drawer).toBeVisible();
+    await expect(drawer).toContainText("Beta Diagram");
+    await expect(drawer.getByTestId("workspace-artifact-preview")).toContainText("Beta SVG");
+    await page.locator("nav.sidebar").getByRole("button", { name: /Session Alpha/ }).click();
+    await expect(drawer).toContainText("Workspace Spec");
+
+    // 6. Files tab: expand directory, select file, select line, hash change invalidates line selection, external stale badge
+    await drawer.getByRole("tab", { name: "Files" }).click();
+    await expect(drawer).toContainText("绑定 Scope");
+    await drawer.getByTestId("workspace-dir-src").click();
+    await drawer.getByTestId("workspace-file-src/main.ts").click();
+    await expect(drawer.getByTestId("workspace-file-preview")).toContainText("const alpha = 1;");
+
+    await drawer.getByTestId("workspace-file-line-2").click();
+    await expect(drawer.getByTestId("workspace-line-selection-badge")).toContainText("L2");
+
+    // File hash change invalidates line selection
+    await page.evaluate(() => {
+      const fix = (window as unknown as { __HERMES_E2E_FIXTURE__: Record<string, unknown> })
+        .__HERMES_E2E_FIXTURE__;
+      (fix.files as Record<string, unknown>)["local::default"] = [
+        {
+          relativePath: "src",
+          name: "src",
+          kind: "directory",
+          parentPath: null,
+        },
+        {
+          relativePath: "src/main.ts",
+          name: "main.ts",
+          kind: "file",
+          parentPath: "src",
+          hash: "file-hash-2",
+          content: "const alpha = 10;\nconst beta = 20;\nexport { alpha, beta };",
+          sizeBytes: 58,
+        },
+      ];
+      (fix.filesStale as Record<string, boolean>) = { "local::default": true };
+    });
+    await drawer.getByRole("button", { name: "刷新 Workspace" }).click();
+    await expect(drawer.getByTestId("workspace-line-invalidated-notice")).toContainText(
+      "原行选择已失效",
+    );
+    await expect(drawer.getByTestId("workspace-stale-badge")).toContainText("上次已知 · 外部已变更");
+
+    // 7. Switching Scope keeps Workspace open and activeTab ("Files") while swapping Scope-keyed files
+    await page.locator(".route-strip").getByRole("button", { name: /已连接/ }).click();
+    const scopePopover = page.getByRole("dialog", { name: "选择 Scope" });
+    await scopePopover.getByRole("button", { name: /Research/ }).click();
+    await expect(drawer).toBeVisible();
+    await expect(drawer.getByRole("tab", { name: "Files" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await expect(drawer.getByTestId("workspace-file-notes.md")).toBeVisible();
+
+    // Switch back to Default profile
+    await page.locator(".route-strip").getByRole("button", { name: /已连接/ }).click();
+    await page.getByRole("dialog", { name: "选择 Scope" }).getByRole("button", { name: /Default/ }).click();
+
+    // 8. Agents steer text & Hide vs Close semantics + FocusReturnController
+    await drawer.getByRole("tab", { name: "Agents" }).click();
+    await drawer.getByLabel("向选中 Subagent 发送补充指令").fill("Focus on unit tests");
+
+    // Hide preserves tab, zoom, file selection, annotations, and steer text; returns focus to workspace trigger
+    await drawer.getByRole("button", { name: "隐藏 Workspace" }).click();
+    await expect(drawer).toHaveCount(0);
+    await expect(workspaceBtn).toBeFocused();
+
+    // Reopen via ⌘B -> preserved state intact
+    await page.keyboard.press("Control+b");
+    await expect(drawer).toBeVisible();
+    await expect(drawer.getByRole("tab", { name: "Agents" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await expect(drawer.getByLabel("向选中 Subagent 发送补充指令")).toHaveValue(
+      "Focus on unit tests",
+    );
+
+    // Close resets preview/zoom/file selection/steer text, but keeps annotations in Draft!
+    await page.locator("#composer-input").fill("Keep composer draft across workspace close");
+    await drawer.getByRole("button", { name: "关闭 Workspace" }).click();
+    await expect(drawer).toHaveCount(0);
+    await expect(page.locator("#composer-input")).toHaveValue(
+      "Keep composer draft across workspace close",
+    );
+
+    // Reopen and verify steer & zoom were reset, while Draft annotation was preserved
+    await workspaceBtn.click();
+    await expect(drawer.getByLabel("向选中 Subagent 发送补充指令")).toHaveValue("");
+    await drawer.getByRole("tab", { name: "Artifacts" }).click();
+    await expect(drawer.getByTestId("workspace-artifact-zoom")).toHaveText("100%");
+    await expect(drawer.getByTestId("workspace-annotation-item").first()).toContainText(
+      "Check section header",
+    );
+  });
 });

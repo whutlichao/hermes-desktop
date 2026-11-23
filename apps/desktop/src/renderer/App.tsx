@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import type {
   AppCommand,
+  ArtifactAnnotation,
   BridgeScope,
   CapabilityDomainId,
   CapabilityEntry,
@@ -21,21 +22,51 @@ import type {
   SanitizedDiagnosticsPayload,
   SessionSummary,
   SessionTranscriptSnapshot,
+  WorkspaceAgentItem,
+  WorkspaceArtifactItem,
+  WorkspaceFileEntry,
+  WorkspaceGitDiffItem,
   WorkspaceTab,
 } from "@hermes/contracts";
 import {
+  FocusReturnController,
   HERMES_INSTALL_DOCS_URL,
   HERMES_UPDATE_DOCS_URL,
+  addWorkspaceAnnotation,
+  closeWorkspace,
   createInitialShellState,
+  createInitialWorkspaceSessionState,
   createSequenceTracker,
   createTranscriptSyncController,
   deriveViewportMode,
   filterProfilesForConnection,
   filterSessionsForScope,
   formatAppInfoDisplay,
+  getActiveChatWorkspaceView,
   getCopy,
   getTopmostSurface,
+  hideWorkspace,
+  markWorkspaceArtifactsExternalStale,
+  markWorkspaceFilesExternalStale,
+  openWorkspace,
+  reconcileWorkspaceAgents,
+  reconcileWorkspaceArtifacts,
+  reconcileWorkspaceFiles,
+  reconcileWorkspaceGitDiffs,
+  resolveWorkspaceChatKey,
+  selectWorkspaceAgent,
+  selectWorkspaceArtifact,
+  selectWorkspaceFile,
+  selectWorkspaceFileLines,
+  selectWorkspaceGitDiff,
+  setWorkspaceActiveTab,
+  setWorkspaceAgentSteerText,
+  setWorkspaceAnnotations,
+  setWorkspaceArtifactScroll,
+  setWorkspaceArtifactZoom,
   shellReducer,
+  switchWorkspaceContext,
+  toggleWorkspaceDirectory,
 } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
 import { CapabilitiesDrawer } from "./components/CapabilitiesDrawer";
@@ -46,18 +77,14 @@ import { GatewaysSettings } from "./components/GatewaysSettings";
 import { HermesMark } from "./components/HermesMark";
 import { FocusDialog } from "./components/Modal";
 import { SessionRailList } from "./components/SessionRail";
+import { WorkspaceDrawer } from "./components/WorkspaceDrawer";
 import { createCapabilityHandlers } from "./components/capabilityHandlers";
-
-const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string }> = [
-  { id: "artifacts", label: "Artifacts" },
-  { id: "files", label: "Files" },
-  { id: "git", label: "Git" },
-  { id: "agents", label: "Agents" },
-  { id: "terminal", label: "Terminal" },
-];
 
 export default function App() {
   const [state, dispatch] = useReducer(shellReducer, undefined, createInitialShellState);
+  const [workspaceState, setWorkspaceState] = useState(() =>
+    createInitialWorkspaceSessionState(null),
+  );
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
@@ -67,6 +94,13 @@ export default function App() {
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
+  const paletteTriggerRef = useRef<HTMLButtonElement>(null);
+  const railNewSessionRef = useRef<HTMLButtonElement>(null);
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const capabilitiesTriggerRef = useRef<HTMLButtonElement>(null);
+  const workspaceTriggerRef = useRef<HTMLButtonElement>(null);
+  const sessionsPopoverTriggerRef = useRef<HTMLButtonElement>(null);
+  const scopePopoverTriggerRef = useRef<HTMLButtonElement>(null);
   const trackerRef = useRef(createSequenceTracker());
   const registryTrackerRef = useRef(createSequenceTracker());
   const capabilitiesTrackerRef = useRef(createSequenceTracker());
@@ -155,6 +189,245 @@ export default function App() {
       el.removeAttribute("inert");
     }
   }, [hasModal]);
+
+  const activeChatScope: BridgeScope | null = useMemo(() => {
+    if (!effectiveScope) return null;
+    return {
+      connectionId: effectiveScope.connectionId,
+      profileId: effectiveScope.profileId ?? "default",
+      ...(state.activeSessionId ? { sessionId: state.activeSessionId } : {}),
+    };
+  }, [effectiveScope, state.activeSessionId]);
+
+  const activeChatScopeRef = useRef<BridgeScope | null>(null);
+  activeChatScopeRef.current = activeChatScope;
+
+  const focusControllerRef = useRef<FocusReturnController<HTMLElement> | null>(null);
+  if (!focusControllerRef.current) {
+    focusControllerRef.current = new FocusReturnController<HTMLElement>({
+      inspectNode: (node) => {
+        if (!node) return null;
+        const connected = document.contains(node);
+        const isBody = node === document.body || node.tagName === "BODY";
+        const disabled = (node as HTMLButtonElement | HTMLInputElement).disabled === true;
+        const hidden =
+          node.hidden ||
+          node.getAttribute("aria-hidden") === "true" ||
+          (connected && node.getClientRects().length === 0);
+        const inert = Boolean(node.closest("[inert]"));
+        return {
+          connected,
+          visible: !hidden,
+          focusable: !disabled,
+          inert,
+          isBody,
+        };
+      },
+      focusNode: (node) => {
+        node.focus();
+      },
+      getActiveNode: () => (document.activeElement as HTMLElement | null) ?? null,
+      getAnchorNode: (anchor) => {
+        switch (anchor) {
+          case "composer":
+            return composerRef.current;
+          case "railNewSession":
+            return railNewSessionRef.current;
+          case "paletteTrigger":
+            return paletteTriggerRef.current;
+          case "workspaceTrigger":
+            return workspaceTriggerRef.current;
+          case "settingsTrigger":
+            return settingsTriggerRef.current;
+          case "capabilitiesTrigger":
+            return capabilitiesTriggerRef.current;
+          case "sessionsPopoverTrigger":
+            return sessionsPopoverTriggerRef.current;
+          case "scopePopoverTrigger":
+            return scopePopoverTriggerRef.current;
+          default:
+            return null;
+        }
+      },
+      hasActiveChat: () => Boolean(activeChatScopeRef.current?.sessionId),
+    });
+  }
+
+  const refreshWorkspaceData = useCallback(
+    async (targetChatScope: BridgeScope | null) => {
+      if (!targetChatScope?.connectionId) return;
+      const scopeOnly: BridgeScope = {
+        connectionId: targetChatScope.connectionId,
+        profileId: targetChatScope.profileId ?? "default",
+      };
+
+      const filesPromise = host.request<{
+        files?: WorkspaceFileEntry[];
+        stale?: boolean;
+        gitDiffs?: WorkspaceGitDiffItem[];
+      }>("files.list", { profileId: scopeOnly.profileId }, scopeOnly);
+
+      const artifactsPromise = targetChatScope.sessionId
+        ? host.request<{
+            artifacts?: WorkspaceArtifactItem[];
+            stale?: boolean;
+            agents?: WorkspaceAgentItem[];
+          }>(
+            "artifacts.list",
+            {
+              sessionId: targetChatScope.sessionId,
+              profileId: targetChatScope.profileId ?? "default",
+            },
+            targetChatScope,
+          )
+        : Promise.resolve(null);
+
+      const [filesRes, artifactsRes] = await Promise.all([filesPromise, artifactsPromise]);
+
+      setWorkspaceState((prev) => {
+        let next = switchWorkspaceContext(prev, targetChatScope);
+        if (filesRes.ok) {
+          next = reconcileWorkspaceFiles(next, scopeOnly, filesRes.value.files ?? []);
+          if (filesRes.value.gitDiffs) {
+            next = reconcileWorkspaceGitDiffs(next, scopeOnly, filesRes.value.gitDiffs);
+          }
+          if (filesRes.value.stale) {
+            next = markWorkspaceFilesExternalStale(next, scopeOnly);
+          }
+        }
+        if (artifactsRes && artifactsRes.ok) {
+          next = reconcileWorkspaceArtifacts(
+            next,
+            targetChatScope,
+            artifactsRes.value.artifacts ?? [],
+          );
+          if (artifactsRes.value.agents) {
+            next = reconcileWorkspaceAgents(next, targetChatScope, artifactsRes.value.agents);
+          }
+          if (artifactsRes.value.stale) {
+            next = markWorkspaceArtifactsExternalStale(next, targetChatScope);
+          }
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    setWorkspaceState((prev) => switchWorkspaceContext(prev, activeChatScope));
+    if (hasReadyConnection && activeChatScope) {
+      void refreshWorkspaceData(activeChatScope);
+    }
+  }, [
+    activeChatScope?.connectionId,
+    activeChatScope?.profileId,
+    activeChatScope?.sessionId,
+    hasReadyConnection,
+    refreshWorkspaceData,
+  ]);
+
+  // Hydrate persisted Draft annotations from chatState sessionSummaries
+  useEffect(() => {
+    if (!activeChatScope?.sessionId || !state.chatState) return;
+    const chatKey = resolveWorkspaceChatKey(activeChatScope);
+    const summary = state.chatState.sessionSummaries[chatKey];
+    if (summary?.annotations) {
+      setWorkspaceState((prev) =>
+        setWorkspaceAnnotations(prev, summary.annotations ?? [], activeChatScope),
+      );
+    }
+  }, [
+    activeChatScope?.connectionId,
+    activeChatScope?.profileId,
+    activeChatScope?.sessionId,
+    state.chatState,
+  ]);
+
+  const handleOpenWorkspace = useCallback(
+    (tab?: WorkspaceTab) => {
+      focusControllerRef.current?.register("workspace", {
+        layer: "drawer",
+        returnFocus:
+          (document.activeElement as HTMLElement | null) ?? workspaceTriggerRef.current,
+      });
+      setWorkspaceState((prev) => openWorkspace(prev, tab));
+      dispatch({ type: "SET_WORKSPACE_MODE", mode: "open" });
+      if (tab) {
+        dispatch({ type: "SET_WORKSPACE_TAB", tab });
+      }
+      if (activeChatScope) {
+        void refreshWorkspaceData(activeChatScope);
+      }
+    },
+    [activeChatScope, refreshWorkspaceData],
+  );
+
+  const handleHideWorkspace = useCallback(() => {
+    setWorkspaceState((prev) => hideWorkspace(prev));
+    dispatch({ type: "SET_WORKSPACE_MODE", mode: "hidden" });
+    focusControllerRef.current?.closeSurface("workspace", "shortcut");
+  }, []);
+
+  const handleCloseWorkspace = useCallback(() => {
+    setWorkspaceState((prev) => closeWorkspace(prev));
+    dispatch({ type: "SET_WORKSPACE_MODE", mode: "closed" });
+    focusControllerRef.current?.closeSurface("workspace", "explicit");
+  }, []);
+
+  const handleToggleWorkspace = useCallback(() => {
+    if (state.workspace.mode === "open") {
+      handleHideWorkspace();
+    } else {
+      handleOpenWorkspace();
+    }
+  }, [handleHideWorkspace, handleOpenWorkspace, state.workspace.mode]);
+
+  const handleSelectWorkspaceTab = useCallback((tab: WorkspaceTab) => {
+    setWorkspaceState((prev) => setWorkspaceActiveTab(prev, tab));
+    dispatch({ type: "SET_WORKSPACE_TAB", tab });
+  }, []);
+
+  const handleAddWorkspaceAnnotation = useCallback(
+    (input: { xPct: number; yPct: number; comment: string }) => {
+      let nextAnnotationsToSave: ArtifactAnnotation[] | null = null;
+      setWorkspaceState((prev) => {
+        const chatView = getActiveChatWorkspaceView(prev);
+        const selected =
+          chatView.artifacts.find((a) => a.artifactId === chatView.selectedArtifactId) ??
+          chatView.artifacts[0] ??
+          null;
+        if (!selected) return prev;
+        const annotation: ArtifactAnnotation = {
+          annotationId: `ann-${Date.now()}-${chatView.annotations.length + 1}`,
+          artifactId: selected.artifactId,
+          artifactVersion: selected.version,
+          artifactHash: selected.hash,
+          xPct: input.xPct,
+          yPct: input.yPct,
+          comment: input.comment,
+          createdAt: new Date().toISOString(),
+        };
+        const updated = addWorkspaceAnnotation(prev, annotation, activeChatScope);
+        nextAnnotationsToSave = getActiveChatWorkspaceView(updated).annotations;
+        return updated;
+      });
+
+      if (activeChatScope?.sessionId && nextAnnotationsToSave) {
+        void host.request(
+          "chatState.saveDraft",
+          {
+            sessionId: activeChatScope.sessionId,
+            profileId: activeChatScope.profileId ?? "default",
+            text: composerDraft,
+            annotations: nextAnnotationsToSave,
+          },
+          activeChatScope,
+        );
+      }
+    },
+    [activeChatScope, composerDraft],
+  );
 
   const handleCreateSession = useCallback(async () => {
     if (!hasReadyConnection || !effectiveScope || !canCreateSession) {
@@ -363,7 +636,7 @@ export default function App() {
           dispatch({ type: "ANNOUNCE", message: getCopy("settings.title") });
           break;
         case "toggle_workspace":
-          dispatch({ type: "TOGGLE_WORKSPACE" });
+          handleToggleWorkspace();
           break;
         case "new_session":
           void handleCreateSession();
@@ -378,7 +651,7 @@ export default function App() {
           break;
       }
     },
-    [handleCreateSession],
+    [handleCreateSession, handleToggleWorkspace],
   );
 
   const handleAppCommandRef = useRef(handleAppCommand);
@@ -564,7 +837,7 @@ export default function App() {
         }
         if (state.workspace.mode === "open") {
           event.preventDefault();
-          dispatch({ type: "SET_WORKSPACE_MODE", mode: "hidden" });
+          handleHideWorkspace();
         }
         return;
       }
@@ -655,11 +928,10 @@ export default function App() {
           });
         },
         openWorkspaceTab: (tab) => {
-          dispatch({ type: "SET_WORKSPACE_MODE", mode: "open" });
-          dispatch({ type: "SET_WORKSPACE_TAB", tab });
+          handleOpenWorkspace(tab);
         },
         toggleWorkspace: () => {
-          handleAppCommand({ type: "toggle_workspace" });
+          handleToggleWorkspace();
         },
         openSettings: () => {
           handleAppCommand({ type: "open_settings" });
@@ -787,6 +1059,7 @@ export default function App() {
           </div>
           <div className="window-meta">
             <button
+              ref={paletteTriggerRef}
               type="button"
               className="route-chip"
               onClick={() => dispatch({ type: "OPEN_SURFACE", surface: "palette" })}
@@ -807,6 +1080,7 @@ export default function App() {
               </div>
 
               <button
+                ref={railNewSessionRef}
                 type="button"
                 className="sidebar-new-btn"
                 disabled={hasReadyConnection ? !canCreateSession : false}
@@ -830,6 +1104,7 @@ export default function App() {
 
               <div className="sidebar-footer">
                 <button
+                  ref={settingsTriggerRef}
                   type="button"
                   className="button button-secondary"
                   style={{ width: "100%", justifyContent: "space-between" }}
@@ -846,6 +1121,7 @@ export default function App() {
             <div className="route-strip">
               {viewportMode === "popover" && (
                 <button
+                  ref={sessionsPopoverTriggerRef}
                   type="button"
                   className="route-chip"
                   onClick={() =>
@@ -891,6 +1167,7 @@ export default function App() {
               </div>
 
               <button
+                ref={scopePopoverTriggerRef}
                 type="button"
                 className="route-chip"
                 onClick={() => dispatch({ type: "OPEN_SURFACE", surface: "scopePopover" })}
@@ -925,6 +1202,7 @@ export default function App() {
 
               <div className="route-actions">
                 <button
+                  ref={capabilitiesTriggerRef}
                   type="button"
                   className="route-chip"
                   onClick={() =>
@@ -934,10 +1212,11 @@ export default function App() {
                   {getCopy("route.openCapabilities")}
                 </button>
                 <button
+                  ref={workspaceTriggerRef}
                   type="button"
                   className="route-chip"
                   aria-expanded={state.workspace.mode === "open"}
-                  onClick={() => dispatch({ type: "TOGGLE_WORKSPACE" })}
+                  onClick={() => handleToggleWorkspace()}
                 >
                   <PanelRight size={13} aria-hidden="true" />
                   <span>Workspace</span>
@@ -1009,55 +1288,43 @@ export default function App() {
             </div>
           </main>
 
-          {state.workspace.mode === "open" && (
-            <aside className="workspace-drawer" aria-label={getCopy("workspace.title")}>
-              <div className="workspace-header">
-                <strong>{getCopy("workspace.title")}</strong>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() =>
-                      dispatch({ type: "SET_WORKSPACE_MODE", mode: "hidden" })
-                    }
-                  >
-                    {getCopy("workspace.hide")}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() =>
-                      dispatch({ type: "SET_WORKSPACE_MODE", mode: "closed" })
-                    }
-                  >
-                    {getCopy("workspace.close")}
-                  </button>
-                </div>
-              </div>
-
-              <div className="workspace-tabs" role="tablist" aria-label="Workspace 面板标签">
-                {WORKSPACE_TABS.map((tab) => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={state.workspace.activeTab === tab.id}
-                    className={[
-                      "workspace-tab",
-                      state.workspace.activeTab === tab.id && "is-active",
-                    ]
-                      .filter(Boolean)
-                      .join(" ")}
-                    onClick={() => dispatch({ type: "SET_WORKSPACE_TAB", tab: tab.id })}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-
-              <div className="workspace-empty">{getCopy("workspace.emptyBody")}</div>
-            </aside>
-          )}
+          <WorkspaceDrawer
+            workspaceState={workspaceState}
+            onSelectTab={handleSelectWorkspaceTab}
+            onHide={handleHideWorkspace}
+            onClose={handleCloseWorkspace}
+            onRefresh={() => void refreshWorkspaceData(activeChatScope)}
+            onSelectArtifact={(artifactId) =>
+              setWorkspaceState((prev) => selectWorkspaceArtifact(prev, artifactId))
+            }
+            onArtifactScroll={(scrollTop) =>
+              setWorkspaceState((prev) => setWorkspaceArtifactScroll(prev, scrollTop))
+            }
+            onArtifactZoom={(zoom) =>
+              setWorkspaceState((prev) => setWorkspaceArtifactZoom(prev, zoom))
+            }
+            onAddAnnotation={handleAddWorkspaceAnnotation}
+            onToggleDir={(dirPath) =>
+              setWorkspaceState((prev) => toggleWorkspaceDirectory(prev, dirPath))
+            }
+            onSelectFile={(filePath) =>
+              setWorkspaceState((prev) => selectWorkspaceFile(prev, filePath))
+            }
+            onSelectFileLine={(line) =>
+              setWorkspaceState((prev) =>
+                selectWorkspaceFileLines(prev, { startLine: line, endLine: line }),
+              )
+            }
+            onSelectGitDiff={(diffPath) =>
+              setWorkspaceState((prev) => selectWorkspaceGitDiff(prev, diffPath))
+            }
+            onSelectAgent={(agentId) =>
+              setWorkspaceState((prev) => selectWorkspaceAgent(prev, agentId))
+            }
+            onChangeSteerText={(text) =>
+              setWorkspaceState((prev) => setWorkspaceAgentSteerText(prev, text))
+            }
+          />
         </div>
 
         <footer className="status-footer">

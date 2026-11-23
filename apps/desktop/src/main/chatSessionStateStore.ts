@@ -3,6 +3,7 @@ import path from "node:path";
 import type {
   ActiveChatRef,
   ActiveChatStatus,
+  ArtifactAnnotation,
   ChatSessionProjection,
   MissingSessionExport,
   ProfileSummary,
@@ -64,12 +65,57 @@ function normalizeActiveChat(raw: unknown): ActiveChatRef | null {
   };
 }
 
+function normalizeAnnotation(raw: unknown): ArtifactAnnotation | null {
+  if (!isPlainObject(raw)) return null;
+  const annotationId = typeof raw.annotationId === "string" ? raw.annotationId.trim() : "";
+  const artifactId = typeof raw.artifactId === "string" ? raw.artifactId.trim() : "";
+  const artifactHash = typeof raw.artifactHash === "string" ? raw.artifactHash.trim() : "";
+  const artifactVersion =
+    typeof raw.artifactVersion === "number" && Number.isFinite(raw.artifactVersion)
+      ? raw.artifactVersion
+      : 1;
+  const xPct = typeof raw.xPct === "number" && Number.isFinite(raw.xPct) ? raw.xPct : 0;
+  const yPct = typeof raw.yPct === "number" && Number.isFinite(raw.yPct) ? raw.yPct : 0;
+  const comment = typeof raw.comment === "string" ? raw.comment : "";
+  const createdAt =
+    typeof raw.createdAt === "string" && raw.createdAt.trim()
+      ? raw.createdAt.trim()
+      : "2026-11-23T00:00:00.000Z";
+  if (!annotationId || !artifactId) return null;
+  return {
+    annotationId,
+    artifactId,
+    artifactVersion,
+    artifactHash,
+    xPct,
+    yPct,
+    comment,
+    createdAt,
+  };
+}
+
+function normalizeAnnotations(raw: unknown): ArtifactAnnotation[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const list: ArtifactAnnotation[] = [];
+  for (const item of raw) {
+    const norm = normalizeAnnotation(item);
+    if (norm) list.push(norm);
+  }
+  return list.length > 0 ? list : undefined;
+}
+
 function normalizeSummary(raw: unknown): SessionRecoverySummary | null {
   if (!isPlainObject(raw)) return null;
   const connectionId = typeof raw.connectionId === "string" ? raw.connectionId.trim() : "";
   const profileId = typeof raw.profileId === "string" ? raw.profileId.trim() : "";
   const sessionId = typeof raw.sessionId === "string" ? raw.sessionId.trim() : "";
   if (!connectionId || !profileId || !sessionId) return null;
+  const annotations = normalizeAnnotations(raw.annotations);
+  const draftText = typeof raw.draftText === "string" ? raw.draftText : undefined;
+  const hasDraft =
+    Boolean(raw.hasDraft) ||
+    Boolean(draftText && draftText.trim().length > 0) ||
+    Boolean(annotations && annotations.length > 0);
   return {
     connectionId,
     profileId,
@@ -77,8 +123,9 @@ function normalizeSummary(raw: unknown): SessionRecoverySummary | null {
     title: typeof raw.title === "string" && raw.title.trim() ? raw.title : "新对话",
     ...(typeof raw.preview === "string" ? { preview: raw.preview } : {}),
     ...(typeof raw.updatedAt === "string" ? { updatedAt: raw.updatedAt } : {}),
-    hasDraft: Boolean(raw.hasDraft),
-    ...(typeof raw.draftText === "string" ? { draftText: raw.draftText } : {}),
+    hasDraft,
+    ...(draftText !== undefined ? { draftText } : {}),
+    ...(annotations ? { annotations } : {}),
     ...(Array.isArray(raw.lastKnownMessages)
       ? { lastKnownMessages: raw.lastKnownMessages.slice(-MAX_RETAINED_MESSAGES) }
       : {}),
@@ -285,6 +332,7 @@ export class ChatSessionStateStore {
           updatedAt: s.updatedAt,
           hasDraft: prev?.hasDraft ?? false,
           ...(prev?.draftText !== undefined ? { draftText: prev.draftText } : {}),
+          ...(prev?.annotations ? { annotations: prev.annotations } : {}),
           ...(prev?.lastKnownMessages ? { lastKnownMessages: prev.lastKnownMessages } : {}),
         };
         if (
@@ -318,12 +366,17 @@ export class ChatSessionStateStore {
       ...(prev?.updatedAt !== undefined ? { updatedAt: prev.updatedAt } : {}),
       hasDraft: prev?.hasDraft ?? false,
       ...(prev?.draftText !== undefined ? { draftText: prev.draftText } : {}),
+      ...(prev?.annotations ? { annotations: prev.annotations } : {}),
       lastKnownMessages: snapshot.messages.slice(-MAX_RETAINED_MESSAGES),
     };
     this.persist();
   }
 
-  saveDraft(ref: ActiveChatRef, text: string): ChatSessionProjection {
+  saveDraft(
+    ref: ActiveChatRef,
+    text: string,
+    options?: { annotations?: ArtifactAnnotation[] },
+  ): ChatSessionProjection {
     this.ensureLoaded();
     const sessionId = ref.sessionId?.trim();
     if (!sessionId) {
@@ -331,7 +384,13 @@ export class ChatSessionStateStore {
     }
     const key = makeSessionKey(ref.connectionId, ref.profileId, sessionId);
     const prev = this.state.sessionSummaries[key];
-    const hasDraft = text.trim().length > 0;
+    const nextAnnotations =
+      options?.annotations !== undefined
+        ? normalizeAnnotations(options.annotations)
+        : prev?.annotations;
+    const hasText = text.trim().length > 0;
+    const hasAnnotations = Boolean(nextAnnotations && nextAnnotations.length > 0);
+    const hasDraft = hasText || hasAnnotations;
     this.state.sessionSummaries[key] = {
       connectionId: ref.connectionId,
       profileId: ref.profileId,
@@ -340,7 +399,8 @@ export class ChatSessionStateStore {
       ...(prev?.preview !== undefined ? { preview: prev.preview } : {}),
       ...(prev?.updatedAt !== undefined ? { updatedAt: prev.updatedAt } : {}),
       hasDraft,
-      ...(hasDraft ? { draftText: text } : {}),
+      ...(hasText ? { draftText: text } : {}),
+      ...(hasAnnotations && nextAnnotations ? { annotations: nextAnnotations } : {}),
       ...(prev?.lastKnownMessages ? { lastKnownMessages: prev.lastKnownMessages } : {}),
     };
     if (
@@ -444,6 +504,7 @@ export class ChatSessionStateStore {
       },
       sessionTitle: summary?.title ?? "已移除的 Session",
       draftText: summary?.draftText ?? "",
+      ...(summary?.annotations ? { annotations: summary.annotations } : {}),
       messages: summary?.lastKnownMessages ?? [],
     };
   }

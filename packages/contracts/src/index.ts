@@ -497,14 +497,80 @@ export type WorkspaceMode = "closed" | "hidden" | "open";
 
 export type WorkspaceTab = "artifacts" | "files" | "git" | "agents" | "terminal";
 
+export type WorkspaceTabBinding = "active_chat" | "scope";
+
+export interface WorkspaceFrame {
+  mode: WorkspaceMode;
+  activeTab: WorkspaceTab;
+}
+
+export type ArtifactKind = "markdown" | "code" | "html" | "svg" | "json" | "text";
+
+export interface WorkspaceArtifactItem {
+  artifactId: string;
+  title: string;
+  kind: ArtifactKind;
+  content: string;
+  version: number;
+  hash: string;
+  updatedAt: string;
+  language?: string;
+  stale?: boolean;
+}
+
+export interface ArtifactAnnotation {
+  annotationId: string;
+  artifactId: string;
+  artifactVersion: number;
+  artifactHash: string;
+  xPct: number;
+  yPct: number;
+  comment: string;
+  createdAt: string;
+}
+
+export interface ProjectedArtifactAnnotation extends ArtifactAnnotation {
+  outdatedVersion: boolean;
+}
+
+export interface WorkspaceFileEntry {
+  relativePath: string;
+  name: string;
+  kind: "file" | "directory";
+  parentPath?: string | null;
+  hash?: string;
+  content?: string;
+  sizeBytes?: number;
+  updatedAt?: string;
+  stale?: boolean;
+}
+
+export interface WorkspaceLineSelection {
+  startLine: number;
+  endLine: number;
+  fileHash: string;
+}
+
+export interface WorkspaceGitDiffItem {
+  relativePath: string;
+  status: "modified" | "added" | "deleted" | "untracked" | "renamed";
+  summary: string;
+  patch?: string;
+}
+
+export interface WorkspaceAgentItem {
+  agentId: string;
+  name: string;
+  role: string;
+  status: "running" | "idle" | "completed" | "failed";
+  summary?: string;
+}
+
 export interface PaneState {
   paneId: string;
   activeScope: BridgeScope | null;
   activeChat: ActiveChatRef | null;
-  workspace: {
-    mode: WorkspaceMode;
-    activeTab: WorkspaceTab;
-  };
+  workspace: WorkspaceFrame;
 }
 
 export interface WindowState {
@@ -534,6 +600,7 @@ export interface SessionRecoverySummary {
   updatedAt?: string;
   hasDraft: boolean;
   draftText?: string;
+  annotations?: ArtifactAnnotation[];
   lastKnownMessages?: TranscriptMessage[];
 }
 
@@ -558,6 +625,7 @@ export interface MissingSessionExport {
   scope: BridgeScope;
   sessionTitle: string;
   draftText: string;
+  annotations?: ArtifactAnnotation[];
   messages: TranscriptMessage[];
 }
 

@@ -9,3 +9,5 @@ export * from "./capabilityRegistry";
 export * from "./activeChatResolver";
 export * from "./remoteGateway";
 export * from "./ssh";
+export * from "./workspace";
+export * from "./focusReturnController";
