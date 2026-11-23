@@ -225,6 +225,33 @@ connectionSupervisor = new ConnectionSupervisor(localBackendManager, {
     const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
     return Boolean(win && !win.isDestroyed() && win.isFocused());
   },
+  confirmHighRiskApproval: async (req) => {
+    const targetWin = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+    const scopeSummary = `${req.connectionLabel}（${req.connectionKind} · ${req.hostDisplay}） / Profile: ${req.profileDisplayName} / Session: ${req.sessionTitle}`;
+    const bgLine = req.isOwningSessionBackground
+      ? "⚠ 该 Approval 来自后台 Session（非当前前台窗口会话）。"
+      : "来源：当前前台 Session。";
+    const riskLine =
+      req.riskCategories.length > 0 ? req.riskCategories.join(", ") : req.choice;
+    const grantLine = req.persistentGrant
+      ? `\n持久规则：${req.persistentGrant.pattern}（作用域：${req.persistentGrant.scope}）\n撤销方式：${req.persistentGrant.revokeHint}`
+      : "";
+    const confirmButtonLabel =
+      req.choice === "always" ? "确认持久批准" : req.choice === "session" ? "确认本会话批准" : "确认批准一次";
+    const boxOptions: Electron.MessageBoxOptions = {
+      type: "warning",
+      buttons: ["取消（保持待处理）", confirmButtonLabel],
+      defaultId: 0,
+      cancelId: 0,
+      title: "高风险 Approval 二次确认",
+      message: `确认执行高风险操作（${riskLine}）？`,
+      detail: `${scopeSummary}\n${bgLine}\n工作目录：${req.cwd}\n命令：${req.command}${grantLine}`,
+    };
+    const result = targetWin
+      ? await dialog.showMessageBox(targetWin, boxOptions)
+      : await dialog.showMessageBox(boxOptions);
+    return result.response === 1;
+  },
   onBackgroundNotification: (notif) => {
     if (!Notification.isSupported()) return;
     const osNotif = new Notification({
@@ -597,7 +624,8 @@ app.whenReady().then(async () => {
         args.topic === "prompt" ||
         args.topic === "activity" ||
         args.topic === "capabilities" ||
-        args.topic === "chat.state"
+        args.topic === "chat.state" ||
+        args.topic === "approval"
       ) {
         const unsub = connectionSupervisor.subscribe(args.topic, args.scope ?? null, (bridgeEvent) => {
           if (!event.sender.isDestroyed()) {

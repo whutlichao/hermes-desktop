@@ -1,5 +1,6 @@
 import type {
   AppInfo,
+  ApprovalTopicSnapshot,
   BridgeEvent,
   BridgeScope,
   CapabilitySnapshot,
@@ -27,7 +28,8 @@ export type OverlaySurface =
   | "sessionsPopover"
   | "scopePopover"
   | "diagnostics"
-  | "remoteEscape";
+  | "remoteEscape"
+  | "approvalInspect";
 
 export interface ShellState {
   appInfo: AppInfo | null;
@@ -43,6 +45,8 @@ export interface ShellState {
   localInspection: LocalInspectResult | null;
   diagnosticsReport: SanitizedDiagnosticsPayload | null;
   capabilities: CapabilitySnapshot;
+  approvals: ApprovalTopicSnapshot;
+  inspectedApprovalKey: string | null;
   workspace: {
     mode: WorkspaceMode;
     activeTab: WorkspaceTab;
@@ -70,6 +74,9 @@ export type ShellAction =
   | { type: "APPLY_LOCAL_INSPECTION"; inspection: LocalInspectResult }
   | { type: "APPLY_DIAGNOSTICS_REPORT"; report: SanitizedDiagnosticsPayload }
   | { type: "APPLY_CAPABILITIES_SNAPSHOT"; snapshot: CapabilitySnapshot }
+  | { type: "APPLY_APPROVAL_SNAPSHOT"; snapshot: ApprovalTopicSnapshot }
+  | { type: "OPEN_APPROVAL_INSPECT"; approvalKey: string }
+  | { type: "CLOSE_APPROVAL_INSPECT" }
   | { type: "OPEN_SURFACE"; surface: OverlaySurface }
   | { type: "CLOSE_TOPMOST_SURFACE" }
   | { type: "CLOSE_SURFACE"; surface: OverlaySurface }
@@ -97,6 +104,12 @@ export function createInitialShellState(): ShellState {
     localInspection: null,
     diagnosticsReport: null,
     capabilities: new CapabilityRegistry().getSnapshot(),
+    approvals: {
+      approvals: [],
+      pendingCount: 0,
+      orphanedCount: 0,
+    },
+    inspectedApprovalKey: null,
     workspace: {
       mode: "closed",
       activeTab: "artifacts",
@@ -179,6 +192,25 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         ...state,
         capabilities: action.snapshot,
       };
+    case "APPLY_APPROVAL_SNAPSHOT":
+      return {
+        ...state,
+        approvals: action.snapshot,
+      };
+    case "OPEN_APPROVAL_INSPECT": {
+      const filtered = state.surfaceStack.filter((item) => item !== "approvalInspect");
+      return {
+        ...state,
+        surfaceStack: [...filtered, "approvalInspect"],
+        inspectedApprovalKey: action.approvalKey,
+      };
+    }
+    case "CLOSE_APPROVAL_INSPECT":
+      return {
+        ...state,
+        surfaceStack: state.surfaceStack.filter((item) => item !== "approvalInspect"),
+        inspectedApprovalKey: null,
+      };
     case "OPEN_SURFACE": {
       const filtered = state.surfaceStack.filter((item) => item !== action.surface);
       return {
@@ -188,15 +220,18 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
     }
     case "CLOSE_TOPMOST_SURFACE": {
       if (state.surfaceStack.length === 0) return state;
+      const closed = state.surfaceStack[state.surfaceStack.length - 1];
       return {
         ...state,
         surfaceStack: state.surfaceStack.slice(0, -1),
+        ...(closed === "approvalInspect" ? { inspectedApprovalKey: null } : {}),
       };
     }
     case "CLOSE_SURFACE":
       return {
         ...state,
         surfaceStack: state.surfaceStack.filter((item) => item !== action.surface),
+        ...(action.surface === "approvalInspect" ? { inspectedApprovalKey: null } : {}),
       };
     case "TOGGLE_WORKSPACE":
       return {

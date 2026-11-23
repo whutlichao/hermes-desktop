@@ -3,9 +3,13 @@ import net from "node:net";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
+  ApprovalHighRiskSheetRequest,
+  ApprovalRespondResult,
+  ApprovalTopicSnapshot,
   BridgeEvent,
   CapabilitySnapshot,
   ChatSessionProjection,
+  SafeBackgroundNotification,
   SessionTranscriptSnapshot,
 } from "@hermes/contracts";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
@@ -2819,4 +2823,384 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   });
+
+  it("reconciles live request & approval.pending, enforces cwd completeness, high-risk sheet, ownerGeneration stale_owner, same-gen resync, ACK-loss check, expired, and orphaned (S1 #39)", async () => {
+    const sandbox = createTestSandbox("hermes-s1-approvals-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_apr_1", "tkt_apr_2", "tkt_apr_3"]);
+    let pendingFromServer: Array<Record<string, unknown>> = [
+      {
+        approval_id: "apr-startup-1",
+        profile_id: "default",
+        session_id: "sess-with-cwd",
+        turn_id: "turn-startup",
+        execution_generation: 3,
+        command: "ls -la",
+        description: "List workspace files",
+        choices: ["once", "session", "deny"],
+      },
+      {
+        approval_id: "apr-missing-cwd",
+        profile_id: "default",
+        session_id: "sess-no-cwd",
+        turn_id: "turn-nocwd",
+        execution_generation: 1,
+        command: "cat README.md",
+        choices: ["once", "deny"],
+      },
+    ];
+    let respondMode: "settled" | "settled_elsewhere" | "timeout_once" = "settled";
+    let respondAttempts = 0;
+    let profilesFromServer = [
+      { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+      { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+    ];
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+        "approval.pending",
+        "approval.respond",
+      ],
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "sess-with-cwd",
+          title: "Primary Dev Session",
+          cwd: "/srv/workspace/project-a",
+        },
+        {
+          profile_id: "default",
+          session_id: "sess-no-cwd",
+          title: "No CWD Session",
+        },
+        {
+          profile_id: "ops",
+          session_id: "sess-ops-bg",
+          title: "Background Ops Session",
+          cwd: "/srv/ops",
+        },
+      ],
+      onRpc: async (method, _params, { replyResult, replyError }) => {
+        if (method === "profiles.list") {
+          replyResult({ profiles: profilesFromServer });
+          return true;
+        }
+        if (method === "approval.pending") {
+          replyResult({ approvals: pendingFromServer });
+          return true;
+        }
+        if (method === "approval.respond") {
+          respondAttempts += 1;
+          if (respondMode === "timeout_once" && respondAttempts === 1) {
+            replyError(-32000, "simulated ack loss / server busy");
+            return true;
+          }
+          if (respondMode === "settled_elsewhere") {
+            replyResult({
+              status: "settled_elsewhere_by_server",
+              message: "该 Approval 已在另一客户端处理",
+            });
+            return true;
+          }
+          replyResult({ status: "settled" });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+      const localBackend = new LocalBackendManager(ports);
+      const store = new RegistryStore({ rootDir: sandbox.hermesHomeDir });
+      const sheetRequests: ApprovalHighRiskSheetRequest[] = [];
+      let sheetDecision = false;
+      let appIsForeground = true;
+      const notifications: SafeBackgroundNotification[] = [];
+
+      const supervisor = new LocalConnectionSupervisor(localBackend, {
+        registryStore: store,
+        isAppForeground: () => appIsForeground,
+        onBackgroundNotification: (n) => notifications.push(n),
+        confirmHighRiskApproval: async (req) => {
+          sheetRequests.push(req);
+          return sheetDecision;
+        },
+      });
+
+      const approvalEvents: BridgeEvent<ApprovalTopicSnapshot>[] = [];
+      supervisor.subscribe("approval", null, (ev) => {
+        approvalEvents.push(ev as BridgeEvent<ApprovalTopicSnapshot>);
+      });
+
+      // 1. Connect -> rehydrates startup pending approvals with Main-provided session snapshot cwd
+      await supervisor.connectLocal("default");
+      const snap1 = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      const startupApr = snap1.approvals.find((a) => a.description === "List workspace files")!;
+      const noCwdApr = snap1.approvals.find((a) => a.command === "cat README.md")!;
+      expect(startupApr.state).toBe("actionable");
+      expect(startupApr.cwd).toBe("/srv/workspace/project-a");
+      expect(startupApr.allowedChoices).toEqual(["once", "session", "deny"]);
+      // Never guess cwd from previous session or local repo -> context_incomplete
+      expect(noCwdApr.state).toBe("context_incomplete");
+      expect(noCwdApr.missingContextFields).toContain("cwd");
+      expect(noCwdApr.allowedChoices).toEqual(["deny"]);
+      await expect(
+        supervisor.handlers["approvals.respond"](
+          { approvalKey: noCwdApr.approvalKey, choice: "once" },
+          null,
+        ),
+      ).rejects.toThrow();
+      // Deny still works even when context_incomplete
+      const denyNoCwdRes = (await supervisor.handlers["approvals.respond"](
+        { approvalKey: noCwdApr.approvalKey, choice: "deny" },
+        null,
+      )) as ApprovalRespondResult;
+      expect(denyNoCwdRes.status).toBe("settled");
+
+      // 2. Activate 'ops' profile so Main has its session snapshot (title + cwd), then switch back to 'default' so 'ops' is background
+      await supervisor.handlers["scopes.switch"]({ connectionId: "local", profileId: "ops" }, null);
+      await supervisor.handlers["scopes.switch"]({ connectionId: "local", profileId: "default" }, null);
+
+      // Live server-initiated request carries separate serverRequestId != approvalId, and high-risk sheet cancel stays pending
+      appIsForeground = false;
+      gw.sendServerRequest(9001, "approval.requested", {
+        approval_id: "apr-sudo-live",
+        profile_id: "ops",
+        session_id: "sess-ops-bg",
+        turn_id: "turn-sudo-1",
+        execution_generation: 7,
+        command: "sudo systemctl restart nginx",
+        description: "Restart nginx service",
+        choices: ["once", "deny"],
+      });
+      await new Promise((r) => setTimeout(r, 40));
+
+      const snap2 = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      const sudoApr = snap2.approvals.find((a) => a.command === "sudo systemctl restart nginx")!;
+      expect(sudoApr.state).toBe("actionable");
+      expect(sudoApr.requiresHighRiskSheet).toBe(true);
+      expect(sudoApr.riskCategories).toContain("sudo");
+      expect(sudoApr.isOwningSessionActive).toBe(false);
+      // Background approval sets needsInput & emits minimal safe notification without command/cwd/path
+      const opsSessions = supervisor
+        .getFleetSnapshot()
+        .sessions.filter((s) => s.profileId === "ops" && s.sessionId === "sess-ops-bg");
+      expect(opsSessions[0]?.needsInput).toBe(true);
+      expect(notifications.some((n) => n.kind === "approval_pending")).toBe(true);
+      expect(JSON.stringify(notifications)).not.toMatch(/sudo|systemctl|nginx|\/srv\/ops/);
+
+      // Cancel Main native sheet -> remains actionable
+      sheetDecision = false;
+      const cancelledSheetRes = (await supervisor.handlers["approvals.respond"](
+        { approvalKey: sudoApr.approvalKey, choice: "once" },
+        null,
+      )) as ApprovalRespondResult;
+      expect(cancelledSheetRes.status).toBe("cancelled_pending");
+      expect(cancelledSheetRes.approval?.state).toBe("actionable");
+      expect(sheetRequests[0]?.isOwningSessionBackground).toBe(true);
+
+      // Confirm Main native sheet -> sends both approval_id and server_request_id
+      sheetDecision = true;
+      const confirmedSheetRes = (await supervisor.handlers["approvals.respond"](
+        { approvalKey: sudoApr.approvalKey, choice: "once" },
+        null,
+      )) as ApprovalRespondResult;
+      expect(confirmedSheetRes.status).toBe("settled");
+      const respondCall = gw.rpcCalls.find(
+        (c) => c.method === "approval.respond" && c.params.approval_id === "apr-sudo-live",
+      );
+      expect(respondCall?.params.server_request_id).toBe(9001);
+
+      // 3. Same-generation resync via possible_event_loss: marks unverified first, reconciles exact 4-tuple, missing is NOT auto-denied
+      const prevOwnerGen = startupApr.ownerGeneration;
+      // Inject a second live approval that will be missing during resync
+      appIsForeground = true;
+      gw.sendNotification("approval.requested", {
+        approval_id: "apr-missing-in-resync",
+        profile_id: "default",
+        session_id: "sess-with-cwd",
+        turn_id: "turn-resync-miss",
+        execution_generation: 2,
+        command: "git status",
+        choices: ["once", "deny"],
+      });
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Keep startup-1 in pendingFromServer with exact matching tuple, omit apr-missing-in-resync
+      pendingFromServer = [
+        {
+          approval_id: "apr-startup-1",
+          profile_id: "default",
+          session_id: "sess-with-cwd",
+          turn_id: "turn-startup",
+          execution_generation: 3,
+          command: "ls -la",
+          description: "List workspace files",
+          choices: ["once", "session", "deny"],
+        },
+      ];
+      gw.sendNotification("possible_event_loss", { authority_epoch: 2 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const snapAfterResync = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      const resyncMatched = snapAfterResync.approvals.find((a) => a.approvalKey === startupApr.approvalKey)!;
+      const resyncMissing = snapAfterResync.approvals.find((a) => a.command === "git status")!;
+      expect(resyncMatched.state).toBe("actionable");
+      expect(resyncMatched.ownerGeneration).toBe(prevOwnerGen);
+      expect(resyncMissing.state).toBe("unverified"); // Missing is NOT auto-denied!
+
+      // 4. Lost ACK on approval.respond checks authoritative pending list
+      respondAttempts = 0;
+      respondMode = "timeout_once";
+      const ackLossPendingRes = (await supervisor.handlers["approvals.respond"](
+        { approvalKey: startupApr.approvalKey, choice: "once" },
+        null,
+      )) as ApprovalRespondResult;
+      expect(ackLossPendingRes.status).toBe("pending_reconciled");
+      expect(ackLossPendingRes.approval?.state).toBe("actionable");
+
+      // Multi-client: server reports settled_elsewhere_by_server
+      respondMode = "settled_elsewhere";
+      const elsewhereRes = (await supervisor.handlers["approvals.respond"](
+        { approvalKey: startupApr.approvalKey, choice: "once" },
+        null,
+      )) as ApprovalRespondResult;
+      expect(elsewhereRes.status).toBe("settled_elsewhere_by_server");
+      expect(elsewhereRes.approval?.state).toBe("settled_elsewhere_by_server");
+
+      // 5. Reconnect changes ownerGeneration -> old approvals immediately stale_owner and never revived in-place
+      gw.sendNotification("approval.requested", {
+        approval_id: "apr-will-stale",
+        profile_id: "default",
+        session_id: "sess-with-cwd",
+        turn_id: "turn-stale-1",
+        execution_generation: 5,
+        command: "pwd",
+        choices: ["once", "deny"],
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      const snapPreReconnect = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      const staleCandidate = snapPreReconnect.approvals.find((a) => a.command === "pwd")!;
+      expect(staleCandidate.state).toBe("actionable");
+
+      // Gateway still returns apr-will-stale on reconnect, but new ownerGeneration means old key is stale_owner forever
+      pendingFromServer = [
+        {
+          approval_id: "apr-will-stale",
+          profile_id: "default",
+          session_id: "sess-with-cwd",
+          turn_id: "turn-stale-1",
+          execution_generation: 5,
+          command: "pwd",
+          choices: ["once", "deny"],
+        },
+      ];
+      await supervisor.connectLocal("default", { forceReconnect: true });
+      const snapPostReconnect = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      const oldKeyView = snapPostReconnect.approvals.find(
+        (a) => a.approvalKey === staleCandidate.approvalKey,
+      )!;
+      expect(oldKeyView.state).toBe("stale_owner");
+      const newKeyView = snapPostReconnect.approvals.find(
+        (a) => a.approvalKey !== staleCandidate.approvalKey && a.command === "pwd",
+      )!;
+      expect(newKeyView.state).toBe("actionable");
+      expect(newKeyView.ownerGeneration).toBeGreaterThan(oldKeyView.ownerGeneration);
+
+      // 6. Expired & Removed Connection -> orphaned (read-only + dismissOrphaned)
+      gw.sendNotification("approval.expired", {
+        approval_id: "apr-will-stale",
+        profile_id: "default",
+        session_id: "sess-with-cwd",
+        turn_id: "turn-stale-1",
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      const snapAfterExpire = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      expect(
+        snapAfterExpire.approvals.find((a) => a.approvalKey === newKeyView.approvalKey)?.state,
+      ).toBe("expired");
+
+      // Remote/orphaned test via non-local scope removal
+      gw.sendNotification("approval.requested", {
+        approval_id: "apr-remote-orphan",
+        profile_id: "ops",
+        session_id: "sess-ops-bg",
+        turn_id: "turn-orphan-1",
+        execution_generation: 1,
+        command: "whoami",
+        choices: ["once", "deny"],
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      const preOrphan = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      const opsOrphanTarget = preOrphan.approvals.find((a) => a.command === "whoami")!;
+      expect(opsOrphanTarget.state).toBe("actionable");
+
+      // Remove 'ops' profile -> approval becomes orphaned (read-only, non-forwardable, dismissible)
+      profilesFromServer = [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+      ];
+      await supervisor.refreshProfilesForConnection("local");
+      const snapOrphaned = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
+      const orphanedView = snapOrphaned.approvals.find(
+        (a) => a.approvalKey === opsOrphanTarget.approvalKey,
+      )!;
+      expect(orphanedView.state).toBe("orphaned");
+      expect(orphanedView.canApprove).toBe(false);
+      expect(orphanedView.canDeny).toBe(false);
+      expect(orphanedView.canDismiss).toBe(true);
+      await expect(
+        supervisor.handlers["approvals.respond"](
+          { approvalKey: orphanedView.approvalKey, choice: "deny" },
+          null,
+        ),
+      ).rejects.toThrow();
+      const afterDismiss = (await supervisor.handlers["approvals.dismissOrphaned"](
+        { approvalKey: orphanedView.approvalKey },
+        null,
+      )) as ApprovalTopicSnapshot;
+      expect(
+        afterDismiss.approvals.find((a) => a.approvalKey === orphanedView.approvalKey),
+      ).toBeUndefined();
+
+      await supervisor.shutdown({ timeoutMs: 2000 });
+      store.close();
+      expect(approvalEvents.length).toBeGreaterThan(0);
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  }, 15_000);
 });

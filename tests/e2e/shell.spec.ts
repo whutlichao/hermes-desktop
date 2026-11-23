@@ -1912,6 +1912,342 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
       "Work scope transcript after notification focus",
     );
   });
+
+  test("Ticket #39: Approval session confinement, context completeness, high-risk sheet cancel/confirm, inspect modal focus return, and orphaned read-only recovery", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local-control-socket",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+            {
+              connectionId: "vps",
+              kind: "remote",
+              label: "Prod VPS",
+              originDisplay: "https://vps.example.com",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+            {
+              connectionId: "local",
+              profileId: "work",
+              displayName: "Work",
+              handle: "work",
+              isDefault: false,
+              actual: "ready",
+            },
+            {
+              connectionId: "vps",
+              profileId: "prod",
+              displayName: "Prod",
+              handle: "prod",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-fg",
+              title: "Foreground Approval Session",
+              preview: "awaiting decision",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-fg-1",
+              status: "running",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-bg",
+              title: "Background Waiting Session",
+              preview: "background prompt",
+              updatedAt: "2026-11-23T08:50:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-bg-1",
+              status: "running",
+            },
+            {
+              connectionId: "local",
+              profileId: "work",
+              sessionId: "sess-work",
+              title: "Work Distraction Session",
+              preview: "clean profile",
+              updatedAt: "2026-11-23T08:40:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "vps",
+              profileId: "prod",
+              sessionId: "sess-vps",
+              title: "VPS Prod Session",
+              preview: "remote task",
+              updatedAt: "2026-11-23T08:30:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-vps-1",
+              status: "running",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-fg" },
+          activeSessionId: "sess-fg",
+        },
+        approvals: [
+          {
+            gateway: {
+              approvalId: "apr-fg-sudo",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-fg",
+              turnId: "turn-fg-1",
+              executionGeneration: 1,
+              command: "sudo systemctl reload nginx",
+              description: "Reload reverse proxy",
+              choices: ["once", "session", "always", "deny"],
+              persistentGrant: {
+                pattern: "sudo systemctl reload *",
+                scope: "local/default",
+                revokeHint: "hermes approvals revoke apr-fg-sudo",
+              },
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Foreground Approval Session",
+              cwd: "/srv/app/current",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+          {
+            gateway: {
+              approvalId: "apr-fg-incomplete",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-fg",
+              turnId: "turn-fg-2",
+              executionGeneration: 2,
+              command: "git status",
+              description: "Check repo without verified cwd",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Foreground Approval Session",
+              cwd: null,
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+          {
+            gateway: {
+              approvalId: "apr-bg-smart",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-bg",
+              turnId: "turn-bg-1",
+              executionGeneration: 1,
+              command: "cat ~/.ssh/config",
+              description: "Inspect ssh config",
+              choices: ["once", "session", "always", "deny"],
+              smartDenied: true,
+              smartDeniedReason: "Blocked automatic broad grant",
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Background Waiting Session",
+              cwd: "/Users/dev/project",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+          {
+            gateway: {
+              approvalId: "apr-vps-orphan",
+              connectionId: "vps",
+              profileId: "prod",
+              sessionId: "sess-vps",
+              turnId: "turn-vps-1",
+              executionGeneration: 1,
+              command: "docker ps",
+              description: "List running containers",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "Prod VPS",
+              connectionKind: "remote",
+              hostDisplay: "vps.example.com",
+              profileDisplayName: "Prod",
+              sessionTitle: "VPS Prod Session",
+              cwd: "/opt/deploy",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+        ],
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // 1. Owning-session confinement & zero writable fields inside ApprovalCard
+    const cards = page.locator('[data-testid="approval-card"]');
+    await expect(cards).toHaveCount(2);
+
+    const sudoCard = cards.filter({ hasText: "sudo systemctl reload nginx" });
+    const incompleteCard = cards.filter({ hasText: "git status" });
+    await expect(sudoCard).toBeVisible();
+    await expect(incompleteCard).toBeVisible();
+    await expect(cards.filter({ hasText: "cat ~/.ssh/config" })).toHaveCount(0);
+    await expect(cards.filter({ hasText: "docker ps" })).toHaveCount(0);
+
+    // Verify no writable target/command/scope controls exist inside ApprovalCards
+    await expect(sudoCard.locator("input, select, textarea")).toHaveCount(0);
+    await expect(sudoCard).toContainText("/srv/app/current");
+    await expect(sudoCard).toContainText("sudo systemctl reload *");
+    await expect(sudoCard.getByTestId("approval-choice-always")).toBeVisible();
+
+    // Background session gets needs-input badge in Session Rail
+    const sidebar = page.locator("nav.sidebar");
+    const bgRow = sidebar.getByRole("button", { name: /Background Waiting Session/ });
+    await expect(bgRow.getByTestId("session-needs-input-badge")).toHaveText("待处理 Approval");
+
+    // 2. context_incomplete blocks Approve choices, allows Inspect & Deny, and Esc closes Inspect modal cleanly
+    await expect(incompleteCard).toHaveAttribute("data-approval-state", "context_incomplete");
+    await expect(incompleteCard.getByTestId("approval-choice-once")).toHaveCount(0);
+    await expect(incompleteCard.getByTestId("approval-choice-deny")).toBeVisible();
+
+    const inspectBtn = incompleteCard.getByTestId("approval-inspect-btn");
+    await inspectBtn.click();
+    const inspectDialog = page.getByRole("dialog", { name: "Approval 只读详情" });
+    await expect(inspectDialog).toBeVisible();
+    await expect(inspectDialog.locator("input, select, textarea")).toHaveCount(0);
+    await expect(inspectDialog).toContainText("owner=1 · execution=2");
+    await page.keyboard.press("Escape");
+    await expect(inspectDialog).toBeHidden();
+    await expect(inspectBtn).toBeFocused();
+    await expect(incompleteCard).toHaveAttribute("data-approval-state", "context_incomplete");
+
+    // 3. Switching Profile / Session or hiding Workspace never migrates or resolves owning session's Approval
+    await page.keyboard.press("Control+b");
+    await expect(page.getByRole("complementary", { name: "Workspace" })).toBeVisible();
+    await page.keyboard.press("Control+b");
+    await expect(sudoCard).toHaveAttribute("data-approval-state", "actionable");
+
+    // Switch to Background Waiting Session -> check smartDenied + missing persistentGrant gating
+    await bgRow.click();
+    const smartCard = page.locator('[data-testid="approval-card"]').filter({ hasText: "cat ~/.ssh/config" });
+    await expect(smartCard).toBeVisible();
+    await expect(smartCard.getByTestId("approval-smart-denied-badge")).toBeVisible();
+    await expect(smartCard.getByTestId("approval-choice-session")).toHaveCount(0);
+    await expect(smartCard.getByTestId("approval-choice-always")).toHaveCount(0);
+    await expect(smartCard.getByTestId("approval-choice-once")).toBeVisible();
+
+    // Switch to Work profile -> zero Approvals shown, never leaked across profiles
+    await page.locator(".route-strip").getByRole("button", { name: /已连接/ }).click();
+    await page.getByRole("dialog", { name: "选择 Scope" }).getByRole("button", { name: /Work/ }).click();
+    await expect(page.locator('[data-testid="approval-card"]')).toHaveCount(0);
+
+    // Return to Default -> Foreground Approval Session -> sudoCard & incompleteCard still pending!
+    await page.locator(".route-strip").getByRole("button", { name: /已连接/ }).click();
+    await page.getByRole("dialog", { name: "选择 Scope" }).getByRole("button", { name: /Default/ }).click();
+    await sidebar.getByRole("button", { name: /Foreground Approval Session/ }).click();
+    await expect(sudoCard).toHaveAttribute("data-approval-state", "actionable");
+
+    // 4. High-risk Main native sheet: cancelling keeps actionable + cancelled notice; confirming sends sheet request & settles
+    await page.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_HIGH_RISK_CONFIRM__ = () => false;
+    });
+    await sudoCard.getByTestId("approval-choice-always").click();
+    await expect(sudoCard).toHaveAttribute("data-approval-state", "actionable");
+    await expect(sudoCard.getByTestId("approval-cancelled-notice")).toContainText(
+      "已取消高风险确认，Approval 仍保持待处理。",
+    );
+
+    await page.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_HIGH_RISK_CONFIRM__ = () => true;
+    });
+    await sudoCard.getByTestId("approval-choice-always").click();
+    await expect(sudoCard).toHaveAttribute("data-approval-state", "settled");
+    await expect(sudoCard.getByTestId("approval-state-badge")).toHaveText("已处理");
+    const sheetLog = await page.evaluate(() => {
+      return (window as unknown as { __HERMES_E2E_HIGH_RISK_SHEETS__?: Array<Record<string, unknown>> })
+        .__HERMES_E2E_HIGH_RISK_SHEETS__;
+    });
+    expect(sheetLog?.length).toBeGreaterThanOrEqual(2);
+    expect(sheetLog?.[0]).toMatchObject({
+      choice: "always",
+      connectionLabel: "This device",
+      profileDisplayName: "Default",
+      sessionTitle: "Foreground Approval Session",
+      cwd: "/srv/app/current",
+      command: "sudo systemctl reload nginx",
+    });
+
+    // Deny still works on context_incomplete card
+    await incompleteCard.getByTestId("approval-choice-deny").click();
+    await expect(incompleteCard).toHaveAttribute("data-approval-state", "settled");
+
+    // 5. Removing owning non-local connection marks its approval orphaned (read-only) & dismisses cleanly
+    await page.locator("#rail-settings-gear").click();
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    await settings.locator('[data-connection-id="vps"]').getByRole("button", { name: "移除连接" }).click();
+    await page.keyboard.press("Escape");
+
+    const orphanedSection = page.getByRole("region", { name: "已孤立的只读 Approval 记录" });
+    await expect(orphanedSection).toBeVisible();
+    const orphanCard = orphanedSection.locator('[data-testid="approval-card"]');
+    await expect(orphanCard).toHaveAttribute("data-approval-state", "orphaned");
+    await expect(orphanCard).toContainText("docker ps");
+    await expect(orphanCard.getByTestId("approval-choice-once")).toHaveCount(0);
+    await expect(orphanCard.getByTestId("approval-choice-deny")).toHaveCount(0);
+
+    await orphanCard.getByTestId("approval-dismiss-orphaned-btn").click();
+    await expect(orphanedSection).toHaveCount(0);
+  });
 });
 
 test.describe("Ticket #41 Subagents (list/steer/interrupt/tail) and Checkpoint (list/diff/restore) & degradations", () => {

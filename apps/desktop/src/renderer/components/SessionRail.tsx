@@ -191,7 +191,17 @@ export function SessionRailList({
                     onSelectSession(session);
                   }}
                 >
-                  <span className="session-item-title">{session.title}</span>
+                  <span className="session-item-title-row">
+                    <span className="session-item-title">{session.title}</span>
+                    {session.needsInput && (
+                      <span
+                        className="session-needs-input-badge"
+                        data-testid="session-needs-input-badge"
+                      >
+                        {getCopy("approval.needsInputBadge")}
+                      </span>
+                    )}
+                  </span>
                   {session.preview && <span className="session-item-preview">{session.preview}</span>}
                   {hasBadges && (
                     <span className="session-item-badges">

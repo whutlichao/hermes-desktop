@@ -477,4 +477,19 @@ describe("HostBridge v1 contracts & invariants", () => {
       scope: { connectionId: "vps", profileId: "ops", sessionId: "s-2" },
     });
   });
+
+  it("preserves command and cwd filesystem paths in ApprovalView while redacting secrets and URLs", () => {
+    const redacted = redactSensitiveData({
+      approvalKey: "apr-1",
+      command: "cat /Users/alice/repo/config.json token=super-secret",
+      cwd: "/Users/alice/repo",
+      stderrLine: "stderr: /Users/alice/repo leaked",
+      nestedToken: "Bearer my-secret-jwt",
+    });
+
+    expect(redacted.command).toBe("cat /Users/alice/repo/config.json token=[REDACTED]");
+    expect(redacted.cwd).toBe("/Users/alice/repo");
+    expect(redacted.stderrLine).toBe("[REDACTED_STDERR]");
+    expect(redacted.nestedToken).toBe("Bearer [REDACTED]");
+  });
 });

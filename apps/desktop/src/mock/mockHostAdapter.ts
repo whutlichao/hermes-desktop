@@ -3,6 +3,8 @@ import {
   HOST_TOPICS,
   type AppCommand,
   type AppInfo,
+  type ApprovalHighRiskSheetRequest,
+  type ApprovalTopicSnapshot,
   type AuthStartResult,
   type AuthStateSnapshot,
   type BridgeEvent,
@@ -48,11 +50,14 @@ import {
   SUPPORTED_GATEWAY_CONFIG_KEYS,
 } from "@hermes/contracts";
 import {
+  ApprovalAndRecoveryCoordinator,
   CAPABILITY_DOMAIN_CATALOG,
   CapabilityRegistry,
   SETTINGS_FIELD_CATALOG,
   boundSubagentTailLines,
   computeSessionPinned,
+  assertApprovalDismissPayloadSafe,
+  assertApprovalRespondPayloadSafe,
   createBridgeDispatcher,
   createEmptyRegistryDocument,
   diffRegistries,
@@ -74,6 +79,7 @@ import {
   validateClientUpdateConnection,
   validateRemoteEndpointUrl,
   validateSshTargetInput,
+  type ApprovalIngestInput,
   type NormalizedRegistryResult,
 } from "@hermes/domain";
 
@@ -179,6 +185,9 @@ interface MockE2EFixture {
   servedMethods?: string[];
   refusedMethods?: string[];
   bumpGenerationCount?: number;
+  approvals?: ApprovalIngestInput[];
+  highRiskConfirmResult?: boolean;
+  approvalRespondOutcome?: "settled" | "settled_elsewhere_by_server";
 }
 
 function readE2EFixture(): MockE2EFixture | undefined {
@@ -257,7 +266,9 @@ export function createMockHostBridge(): HermesHost {
   const sessionsListeners = new Set<(event: BridgeEvent<{ sessions: SessionSummary[] }>) => void>();
   const chatStateListeners = new Set<(event: BridgeEvent<ChatSessionProjection>) => void>();
   const capabilitiesListeners = new Set<(event: BridgeEvent<CapabilitySnapshot>) => void>();
+  const approvalListeners = new Set<(event: BridgeEvent<ApprovalTopicSnapshot>) => void>();
   let capabilitiesSeq = 0;
+  let approvalSeq = 0;
   const registryListeners = new Set<
     (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void
   >();
@@ -369,10 +380,6 @@ export function createMockHostBridge(): HermesHost {
   let mockActiveScope: BridgeScope | null = null;
   let mockActiveSessionId: string | null = null;
   let fleetRev = 1;
-
-  let currentNorm: NormalizedRegistryResult = normalizeRegistryDocument(
-    createEmptyRegistryDocument(),
-  );
   let registrySeq = 0;
   let fleetSeq = 0;
   let sessionsSeq = 0;
@@ -476,6 +483,128 @@ export function createMockHostBridge(): HermesHost {
       emitCapabilitiesPatch();
     }
   }
+
+  function syncSessionNeedsInput(snap: ApprovalTopicSnapshot): void {
+    const needsSet = new Set<string>();
+    for (const item of snap.approvals) {
+      if (
+        item.state === "actionable" ||
+        item.state === "context_incomplete" ||
+        item.state === "submitting" ||
+        item.state === "unverified" ||
+        item.state === "delivery_unknown"
+      ) {
+        needsSet.add(`${item.connectionId}::${item.profileId}::${item.sessionId}`);
+      }
+    }
+    let changed = false;
+    if (fixture) {
+      currentFleet = {
+        ...currentFleet,
+        sessions: currentFleet.sessions.map((s) => {
+          const next = needsSet.has(`${s.connectionId}::${s.profileId}::${s.sessionId}`);
+          if (s.needsInput !== next) changed = true;
+          return s.needsInput === next ? s : { ...s, needsInput: next };
+        }),
+      };
+    } else {
+      for (let i = 0; i < mockSessions.length; i += 1) {
+        const s = mockSessions[i];
+        const next = needsSet.has(`${s.connectionId}::${s.profileId}::${s.sessionId}`);
+        if (s.needsInput !== next) {
+          mockSessions[i] = { ...s, needsInput: next };
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      if (fixture) {
+        emitSessionsSnapshot();
+        emitFleetSnapshot();
+      } else {
+        emitMockFleet();
+      }
+    }
+  }
+
+  let approvalEmitSuppressed = false;
+  const approvalCoordinator = new ApprovalAndRecoveryCoordinator({
+    confirmHighRiskApproval: async (req) => {
+      const sheetLog = ((
+        globalThis as { __HERMES_E2E_HIGH_RISK_SHEETS__?: ApprovalHighRiskSheetRequest[] }
+      ).__HERMES_E2E_HIGH_RISK_SHEETS__ ??= []);
+      sheetLog.push(req);
+      const customConfirm = (
+        globalThis as {
+          __HERMES_E2E_HIGH_RISK_CONFIRM__?: (
+            r: ApprovalHighRiskSheetRequest,
+          ) => Promise<boolean> | boolean;
+        }
+      ).__HERMES_E2E_HIGH_RISK_CONFIRM__;
+      if (customConfirm) {
+        return await customConfirm(req);
+      }
+      const liveFixture = readE2EFixture() ?? fixture;
+      return liveFixture?.highRiskConfirmResult ?? true;
+    },
+    sendApprovalRespond: async (payload) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      return {
+        status: liveFixture?.approvalRespondOutcome ?? "settled",
+        choice: payload.choice,
+      };
+    },
+    fetchPendingApprovals: async () => [],
+    onChange: (snap) => {
+      if (approvalEmitSuppressed) return;
+      syncSessionNeedsInput(snap);
+      approvalSeq += 1;
+      for (const listener of approvalListeners) {
+        listener({
+          topic: "approval",
+          scope: null,
+          kind: "patch",
+          seq: approvalSeq,
+          revision: approvalSeq + 1,
+          payload: snap,
+        });
+      }
+    },
+  });
+
+  if (fixture?.approvals && fixture.approvals.length > 0) {
+    approvalEmitSuppressed = true;
+    if (currentFleet.activeScope) {
+      approvalCoordinator.setActiveScope({
+        connectionId: currentFleet.activeScope.connectionId,
+        ...(currentFleet.activeScope.profileId ? { profileId: currentFleet.activeScope.profileId } : {}),
+        ...(currentFleet.activeSessionId
+          ? { sessionId: currentFleet.activeSessionId }
+          : currentFleet.activeScope.sessionId
+            ? { sessionId: currentFleet.activeScope.sessionId }
+            : {}),
+      });
+    }
+    for (const item of fixture.approvals) {
+      approvalCoordinator.receive(item);
+    }
+    approvalEmitSuppressed = false;
+    syncSessionNeedsInput(approvalCoordinator.snapshot());
+  }
+
+  const fixtureRegistryConnections = (fixture?.fleet?.connections ?? [])
+    .filter((c) => c.connectionId !== "local" && c.kind === "remote" && Boolean(c.originDisplay))
+    .map((c) => ({
+      id: c.connectionId,
+      kind: "remote" as const,
+      label: c.label,
+      url: c.originDisplay,
+    }));
+
+  let currentNorm: NormalizedRegistryResult = normalizeRegistryDocument({
+    ...createEmptyRegistryDocument(),
+    connections: [...createEmptyRegistryDocument().connections, ...fixtureRegistryConnections],
+  });
 
   function emitFleetSnapshot() {
     fleetSeq += 1;
@@ -1319,19 +1448,63 @@ export function createMockHostBridge(): HermesHost {
         connections: currentNorm.doc.connections.filter((c) => c.id !== connectionId),
       });
       const snapshot = emitRegistryPatch(prev, prevIssues);
-      const idx = mockConnections.findIndex((c) => c.connectionId === connectionId);
-      if (idx >= 0) mockConnections.splice(idx, 1);
-      for (let i = mockProfiles.length - 1; i >= 0; i -= 1) {
-        if (mockProfiles[i].connectionId === connectionId) mockProfiles.splice(i, 1);
+      if (fixture) {
+        const nextConns = currentFleet.connections.filter((c) => c.connectionId !== connectionId);
+        const nextProfs = currentFleet.profiles.filter((p) => p.connectionId !== connectionId);
+        const nextSessions = currentFleet.sessions.filter((s) => s.connectionId !== connectionId);
+        let nextScope = currentFleet.activeScope;
+        let nextSessionId = currentFleet.activeSessionId;
+        if (nextScope?.connectionId === connectionId) {
+          const fallbackConn = nextConns[0];
+          const fallbackProf = fallbackConn
+            ? nextProfs.find((p) => p.connectionId === fallbackConn.connectionId)
+            : undefined;
+          const fallbackSess =
+            fallbackConn && fallbackProf
+              ? nextSessions.find(
+                  (s) =>
+                    s.connectionId === fallbackConn.connectionId &&
+                    s.profileId === fallbackProf.profileId,
+                )
+              : undefined;
+          nextScope = fallbackConn
+            ? {
+                connectionId: fallbackConn.connectionId,
+                profileId: fallbackProf?.profileId ?? "default",
+                ...(fallbackSess ? { sessionId: fallbackSess.sessionId } : {}),
+              }
+            : null;
+          nextSessionId = fallbackSess?.sessionId ?? null;
+        }
+        currentFleet = {
+          ...currentFleet,
+          connections: nextConns,
+          profiles: nextProfs,
+          sessions: nextSessions,
+          activeScope: nextScope,
+          activeSessionId: nextSessionId,
+        };
+        approvalCoordinator.onScopeRemoved({ connectionId });
+        approvalCoordinator.setActiveScope(currentFleet.activeScope);
+        emitFleetSnapshot();
+        emitSessionsSnapshot();
+      } else {
+        const idx = mockConnections.findIndex((c) => c.connectionId === connectionId);
+        if (idx >= 0) mockConnections.splice(idx, 1);
+        for (let i = mockProfiles.length - 1; i >= 0; i -= 1) {
+          if (mockProfiles[i].connectionId === connectionId) mockProfiles.splice(i, 1);
+        }
+        for (let i = mockSessions.length - 1; i >= 0; i -= 1) {
+          if (mockSessions[i].connectionId === connectionId) mockSessions.splice(i, 1);
+        }
+        if (mockActiveScope?.connectionId === connectionId) {
+          mockActiveScope = null;
+          mockActiveSessionId = null;
+        }
+        approvalCoordinator.onScopeRemoved({ connectionId });
+        approvalCoordinator.setActiveScope(mockActiveScope);
+        emitMockFleet();
       }
-      for (let i = mockSessions.length - 1; i >= 0; i -= 1) {
-        if (mockSessions[i].connectionId === connectionId) mockSessions.splice(i, 1);
-      }
-      if (mockActiveScope?.connectionId === connectionId) {
-        mockActiveScope = null;
-        mockActiveSessionId = null;
-      }
-      emitMockFleet();
       return {
         committed: true,
         snapshot,
@@ -1564,6 +1737,7 @@ export function createMockHostBridge(): HermesHost {
         }
         emitFleetSnapshot();
         emitChatStatePatch();
+        approvalCoordinator.setActiveScope(currentFleet.activeScope);
         return {
           ok: true,
           fleet: currentFleet,
@@ -1596,6 +1770,7 @@ export function createMockHostBridge(): HermesHost {
           : candidates[0]?.sessionId ?? null;
       mockActiveScope = { connectionId: cid, profileId: pid, ...(sid ? { sessionId: sid } : {}) };
       mockActiveSessionId = sid;
+      approvalCoordinator.setActiveScope(mockActiveScope);
       const transcript = sid ? mockTranscripts.get(transcriptKey(cid, pid, sid)) ?? null : null;
       emitMockFleet();
       return { ok: true, fleet: getMockFleet(), transcript };
@@ -1733,6 +1908,7 @@ export function createMockHostBridge(): HermesHost {
         emitSessionsSnapshot();
         emitFleetSnapshot();
         emitChatStatePatch();
+        approvalCoordinator.setActiveScope(currentFleet.activeScope);
         return { session: created, transcript, fleet: currentFleet };
       }
 
@@ -1785,6 +1961,7 @@ export function createMockHostBridge(): HermesHost {
       mockTranscripts.set(transcriptKey(cid, pid, sessionId), snapshot);
       mockActiveScope = { connectionId: cid, profileId: pid, sessionId };
       mockActiveSessionId = sessionId;
+      approvalCoordinator.setActiveScope(mockActiveScope);
       emitMockFleet();
       return { session, transcript: snapshot, fleet: getMockFleet() };
     },
@@ -1836,6 +2013,7 @@ export function createMockHostBridge(): HermesHost {
         };
         emitFleetSnapshot();
         emitChatStatePatch();
+        approvalCoordinator.setActiveScope(currentFleet.activeScope);
         return {
           transcript,
           fleet: currentFleet,
@@ -1864,6 +2042,7 @@ export function createMockHostBridge(): HermesHost {
           : scope?.sessionId ?? candidates[0]?.sessionId ?? null;
       mockActiveScope = { connectionId: cid, profileId: pid, ...(sid ? { sessionId: sid } : {}) };
       mockActiveSessionId = sid;
+      approvalCoordinator.setActiveScope(mockActiveScope);
       const transcript = sid ? mockTranscripts.get(transcriptKey(cid, pid, sid)) ?? null : null;
       emitMockFleet();
       return { fleet: getMockFleet(), transcript };
@@ -2820,6 +2999,18 @@ export function createMockHostBridge(): HermesHost {
       }
       return { opened: true };
     },
+    "approvals.list": async (): Promise<ApprovalTopicSnapshot> => {
+      approvalCoordinator.onExpiryTick();
+      return approvalCoordinator.snapshot();
+    },
+    "approvals.respond": async (payload) => {
+      const { approvalKey, choice } = assertApprovalRespondPayloadSafe(payload);
+      return await approvalCoordinator.respond(approvalKey, choice);
+    },
+    "approvals.dismissOrphaned": async (payload) => {
+      const { approvalKey } = assertApprovalDismissPayloadSafe(payload);
+      return approvalCoordinator.dismissOrphaned(approvalKey);
+    },
   });
 
   const bridge: HermesHost = {
@@ -3073,6 +3264,24 @@ export function createMockHostBridge(): HermesHost {
         }
         return () => {
           authListeners.delete(typed);
+        };
+      } else if (topic === "approval") {
+        const typed = listener as (event: BridgeEvent<ApprovalTopicSnapshot>) => void;
+        approvalListeners.add(typed);
+        queueMicrotask(() => {
+          if (!approvalListeners.has(typed)) return;
+          approvalCoordinator.onExpiryTick();
+          typed({
+            topic: "approval",
+            scope: null,
+            kind: "snapshot",
+            seq: 0,
+            revision: approvalSeq + 1,
+            payload: approvalCoordinator.snapshot(),
+          });
+        });
+        return () => {
+          approvalListeners.delete(typed);
         };
       }
       return () => {

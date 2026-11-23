@@ -191,7 +191,7 @@ export function isScopeMatch(expected: BridgeScope | null | undefined, actual: B
   return true;
 }
 
-export function redactString(input: string): string {
+function redactSecretsOnly(input: string): string {
   let out = input;
   // Remove PEM private keys
   out = out.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, "[REDACTED_KEY]");
@@ -208,6 +208,11 @@ export function redactString(input: string): string {
   );
   // Redact raw stderr prefixes/lines
   out = out.replace(/\b(?:raw_?stderr|stderr)\s*:\s*[^\n]+/gi, "[REDACTED_STDERR]");
+  return out;
+}
+
+export function redactString(input: string): string {
+  let out = redactSecretsOnly(input);
   // Redact Unix/macOS home, tilde, or absolute paths
   out = out.replace(/\/(?:Users|home|var|tmp|private|etc|opt|usr|Library|Applications)\/[^\s"'`:)]+/g, "[REDACTED_PATH]");
   out = out.replace(/~\/[^\s"'`:)]+/g, "[REDACTED_PATH]");
@@ -247,6 +252,8 @@ export function redactSensitiveData<T>(value: T): T {
       out[key] = "[REDACTED]";
     } else if ((key === "originDisplay" || key === "hostDisplay") && typeof entry === "string") {
       out[key] = sanitizeDisplayOriginValue(entry);
+    } else if ((key === "command" || key === "cwd") && typeof entry === "string") {
+      out[key] = redactSecretsOnly(entry);
     } else {
       out[key] = redactSensitiveData(entry);
     }

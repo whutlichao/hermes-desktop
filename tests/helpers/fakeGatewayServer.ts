@@ -25,6 +25,7 @@ export interface FakeGatewayServerOptions {
     title: string;
     preview?: string;
     updated_at?: string;
+    cwd?: string;
   }>;
   onRpc?: (
     method: string,
@@ -72,6 +73,7 @@ export interface FakeGatewayServerHandle {
     sessionId: string,
     messages: Array<{ message_id: string; role: "user" | "assistant" | "system"; text: string; created_at: string }>,
   ) => void;
+  sendServerRequest: (id: string | number, method: string, params: Record<string, unknown>) => void;
   closeAllClients: () => void;
   close: () => Promise<void>;
 }
@@ -374,6 +376,12 @@ export async function startFakeGatewayServer(
     setTranscriptMessages(sessionId, messages) {
       transcripts.set(sessionId, [...messages]);
     },
+    sendServerRequest(id, method, params) {
+      const frame = encodeServerTextFrame(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      for (const sock of activeSockets) {
+        if (!sock.destroyed) sock.write(frame);
+      }
+    },
     closeAllClients() {
       for (const sock of activeSockets) {
         sock.destroy();
@@ -406,6 +414,7 @@ export interface FakeRemoteGatewayServerOptions {
     title: string;
     preview?: string;
     updated_at?: string;
+    cwd?: string;
   }>;
   onRpc?: FakeGatewayServerOptions["onRpc"];
 }

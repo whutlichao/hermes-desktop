@@ -78,7 +78,11 @@ export interface GatewayClientConnectOptions {
   connectTimeoutMs?: number;
 }
 
-export type GatewayNotificationListener = (method: string, params: Record<string, unknown>) => void;
+export type GatewayNotificationListener = (
+  method: string,
+  params: Record<string, unknown>,
+  serverRequestId?: string | number,
+) => void;
 export type GatewayCloseListener = (reason: string) => void;
 export type GatewayInboundFrameListener = (opcode: number, payload: Buffer) => void;
 
@@ -365,14 +369,16 @@ export class GatewayClient {
         msg.params && typeof msg.params === "object"
           ? (msg.params as Record<string, unknown>)
           : {};
-      if (msg.id !== undefined && msg.id !== null) {
-        // Server-to-client request: acknowledge ping/heartbeat or return method not found cleanly
+      const serverRequestId =
+        typeof msg.id === "string" || typeof msg.id === "number" ? msg.id : undefined;
+      if (serverRequestId !== undefined) {
+        // Server-to-client request: acknowledge ping/heartbeat cleanly
         if (msg.method === "ping" || msg.method === "heartbeat") {
           this.sendRaw({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         }
       }
       for (const listener of this.notificationListeners) {
-        listener(msg.method, params);
+        listener(msg.method, params, serverRequestId);
       }
     }
   }

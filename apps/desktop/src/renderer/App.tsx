@@ -8,6 +8,10 @@ import {
 import {
   SETTINGS_SECTION_IDS,
   type AppCommand,
+  type ApprovalChoice,
+  type ApprovalRespondResult,
+  type ApprovalTopicSnapshot,
+  type ApprovalView,
   type ArtifactAnnotation,
   type AttentionTarget,
   type BridgeScope,
@@ -91,6 +95,7 @@ import {
   type CopyKey,
 } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
+import { ApprovalInspectModal } from "./components/ApprovalInspectModal";
 import { CapabilitiesDrawer } from "./components/CapabilitiesDrawer";
 import { ChatThread } from "./components/ChatThread";
 import { CommandPalette } from "./components/CommandPalette";
@@ -128,6 +133,7 @@ export default function App() {
     useState<ExtensionDomainTab>("plugins");
   const [extBusyDomain, setExtBusyDomain] = useState<ExtensionDomainTab | null>(null);
   const attemptedExtFetchRef = useRef<Map<ExtensionDomainTab, string>>(new Map());
+  const [cancelledApprovalKey, setCancelledApprovalKey] = useState<string | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const paletteTriggerRef = useRef<HTMLButtonElement>(null);
@@ -141,6 +147,7 @@ export default function App() {
   const registryTrackerRef = useRef(createSequenceTracker());
   const capabilitiesTrackerRef = useRef(createSequenceTracker());
   const chatStateTrackerRef = useRef(createSequenceTracker());
+  const approvalTrackerRef = useRef(createSequenceTracker());
   const transcriptSyncRef = useRef(createTranscriptSyncController());
   const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -1242,6 +1249,57 @@ export default function App() {
     }
   }, [effectiveScope, state.activeSessionId, state.transcript?.activeTurnId]);
 
+  const handleRespondApproval = useCallback(
+    async (approval: ApprovalView, choice: ApprovalChoice) => {
+      setCancelledApprovalKey((prev) => (prev === approval.approvalKey ? null : prev));
+      const res = await host.request<ApprovalRespondResult>("approvals.respond", {
+        approvalKey: approval.approvalKey,
+        choice,
+      });
+      if (!res.ok) {
+        dispatch({ type: "ANNOUNCE", message: res.error.message });
+        return;
+      }
+      if (res.value.status === "cancelled_pending") {
+        setCancelledApprovalKey(approval.approvalKey);
+        dispatch({ type: "ANNOUNCE", message: getCopy("approval.cancelledPendingNotice") });
+      } else if (res.value.approval) {
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy(`approval.state.${res.value.approval.state}` as CopyKey),
+        });
+      }
+    },
+    [],
+  );
+
+  const handleDismissOrphanedApproval = useCallback(async (approval: ApprovalView) => {
+    const res = await host.request<ApprovalTopicSnapshot>("approvals.dismissOrphaned", {
+      approvalKey: approval.approvalKey,
+    });
+    if (res.ok) {
+      dispatch({ type: "APPLY_APPROVAL_SNAPSHOT", snapshot: res.value });
+    }
+  }, []);
+
+  const handleInspectApproval = useCallback((approval: ApprovalView) => {
+    dispatch({ type: "OPEN_APPROVAL_INSPECT", approvalKey: approval.approvalKey });
+  }, []);
+
+  const inspectedApproval = useMemo(
+    () =>
+      state.surfaceStack.includes("approvalInspect") && state.inspectedApprovalKey
+        ? state.approvals.approvals.find((a) => a.approvalKey === state.inspectedApprovalKey) ?? null
+        : null,
+    [state.approvals.approvals, state.inspectedApprovalKey, state.surfaceStack],
+  );
+
+  useEffect(() => {
+    if (state.surfaceStack.includes("approvalInspect") && !inspectedApproval) {
+      dispatch({ type: "CLOSE_APPROVAL_INSPECT" });
+    }
+  }, [inspectedApproval, state.surfaceStack]);
+
   const handleAppCommand = useCallback(
     (command: AppCommand) => {
       switch (command.type) {
@@ -1393,6 +1451,30 @@ export default function App() {
       dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
     });
 
+    void host.request<ApprovalTopicSnapshot>("approvals.list", {}).then((res) => {
+      if (!active || !res.ok) return;
+      dispatch({ type: "APPLY_APPROVAL_SNAPSHOT", snapshot: res.value });
+    });
+
+    const unsubApproval = host.subscribe("approval", null, (event) => {
+      const accepted = approvalTrackerRef.current.accept(event);
+      if (accepted.status === "resync_required") {
+        approvalTrackerRef.current.reset();
+        void host.request<ApprovalTopicSnapshot>("approvals.list", {}).then((res) => {
+          if (active && res.ok) {
+            dispatch({ type: "APPLY_APPROVAL_SNAPSHOT", snapshot: res.value });
+          }
+        });
+        return;
+      }
+      if (accepted.status === "applied") {
+        dispatch({
+          type: "APPLY_APPROVAL_SNAPSHOT",
+          snapshot: event.payload as ApprovalTopicSnapshot,
+        });
+      }
+    });
+
     const unsubChatState = host.subscribe("chat.state", null, (event) => {
       const accepted = chatStateTrackerRef.current.accept(event);
       if (accepted.status === "resync_required") {
@@ -1441,6 +1523,7 @@ export default function App() {
       unsubChatState();
       unsubRegistry();
       unsubCapabilities();
+      unsubApproval();
       unsubCmd();
     };
   }, []);
@@ -2170,6 +2253,10 @@ export default function App() {
               <ChatThread
                 hasReadyConnection={hasReadyConnection}
                 activeConnection={activeConnection}
+                activeScope={state.activeScope}
+                activeSessionId={state.activeSessionId}
+                approvals={state.approvals}
+                cancelledApprovalKey={cancelledApprovalKey}
                 transcript={state.transcript}
                 chatState={state.chatState}
                 exportedMissing={exportedMissing}
@@ -2187,6 +2274,9 @@ export default function App() {
                 onExportMissingSession={() => void handleExportMissingSession()}
                 onDismissMissingSession={() => void handleDismissMissingSession()}
                 onLocalAction={(action) => void handleLocalAction(action)}
+                onRespondApproval={(approval, choice) => void handleRespondApproval(approval, choice)}
+                onInspectApproval={handleInspectApproval}
+                onDismissOrphanedApproval={(approval) => void handleDismissOrphanedApproval(approval)}
                 onOpenSettings={() =>
                   dispatch({ type: "OPEN_SURFACE", surface: "settings" })
                 }
@@ -2747,6 +2837,11 @@ export default function App() {
         onCopied={() =>
           dispatch({ type: "ANNOUNCE", message: getCopy("diagnostics.copiedNotice") })
         }
+      />
+
+      <ApprovalInspectModal
+        approval={inspectedApproval}
+        onClose={() => dispatch({ type: "CLOSE_APPROVAL_INSPECT" })}
       />
 
       <FocusDialog

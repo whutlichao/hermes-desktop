@@ -602,6 +602,215 @@ describe("MockHostBridge Ticket #35 Workspace artifacts, files, and Draft annota
 
     unsubHealth();
   });
+
+  it("supports Ticket #39 S0 approval topic snapshot/patch and approvals.respond envelope validation", async () => {
+    const prevFixture = (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__;
+    try {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              label: "This device",
+              kind: "local",
+              originDisplay: "127.0.0.1",
+              actual: "ready",
+              degraded: false,
+              latencyMs: 5,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              title: "Approval S0",
+              preview: "",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-1",
+              status: "running",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+          activeSessionId: "sess-1",
+        },
+        approvals: [
+          {
+            gateway: {
+              approvalId: "gw-s0-1",
+              serverRequestId: "srv-999",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              turnId: "turn-1",
+              executionGeneration: 1,
+              command: "git status",
+              description: "Check repo status",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "127.0.0.1",
+              profileDisplayName: "Default",
+              sessionTitle: "Approval S0",
+              cwd: "/Users/alice/repo",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+          {
+            gateway: {
+              approvalId: "gw-s0-2",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              turnId: "turn-2",
+              executionGeneration: 1,
+              command: "sudo rm -rf /tmp/build",
+              description: "High risk command",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "127.0.0.1",
+              profileDisplayName: "Default",
+              sessionTitle: "Approval S0",
+              cwd: "/Users/alice/repo",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+          {
+            gateway: {
+              approvalId: "gw-s0-incomplete",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              turnId: "turn-3",
+              executionGeneration: 1,
+              command: "ls -la",
+              description: "Missing cwd",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "127.0.0.1",
+              profileDisplayName: "Default",
+              sessionTitle: "Approval S0",
+              cwd: "",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+        ],
+        highRiskConfirmResult: false,
+      };
+
+      const mock = createMockHostBridge();
+      const events: BridgeEvent[] = [];
+      const unsub = mock.subscribe("approval", null, (ev) => events.push(ev));
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(events).toHaveLength(1);
+      expect(events[0].topic).toBe("approval");
+      expect(events[0].kind).toBe("snapshot");
+
+      const listRes = await mock.request<{ approvals: Array<Record<string, unknown>> }>(
+        "approvals.list",
+        {},
+      );
+      expect(listRes.ok).toBe(true);
+      if (!listRes.ok) return;
+      expect(listRes.value.approvals).toHaveLength(3);
+      const serialized = JSON.stringify(listRes.value);
+      expect(serialized).not.toContain("srv-999");
+      expect(serialized).not.toContain("gw-s0-1");
+
+      const regular = listRes.value.approvals[0];
+      const highRisk = listRes.value.approvals[1];
+      const incomplete = listRes.value.approvals[2];
+
+      expect(regular.cwd).toBe("/Users/alice/repo");
+      expect(incomplete.state).toBe("context_incomplete");
+      expect(incomplete.canApprove).toBe(false);
+      expect(incomplete.canDeny).toBe(true);
+
+      // Writable override fields must be rejected at HostBridge envelope check
+      const hijack = await mock.request("approvals.respond", {
+        approvalKey: regular.approvalKey,
+        choice: "once",
+        target: "other",
+        command: "evil",
+      });
+      expect(hijack.ok).toBe(false);
+      if (!hijack.ok) {
+        expect(hijack.error.code).toBe("invalid_request");
+      }
+
+      // Incomplete context cannot approve
+      const approveIncomplete = await mock.request("approvals.respond", {
+        approvalKey: incomplete.approvalKey,
+        choice: "once",
+      });
+      expect(approveIncomplete.ok).toBe(false);
+      if (!approveIncomplete.ok) {
+        expect(approveIncomplete.error.code).toBe("invalid_request");
+      }
+
+      // High-risk sheet cancel keeps state pending (actionable)
+      const cancelledHighRisk = await mock.request<{ status: string; approval?: { state: string } }>(
+        "approvals.respond",
+        {
+          approvalKey: highRisk.approvalKey,
+          choice: "once",
+        },
+      );
+      expect(cancelledHighRisk.ok).toBe(true);
+      if (cancelledHighRisk.ok) {
+        expect(cancelledHighRisk.value.status).toBe("cancelled_pending");
+        expect(cancelledHighRisk.value.approval?.state).toBe("actionable");
+      }
+
+      // Approve regular item -> emits approval patch event and settles
+      const settled = await mock.request<{ status: string; approval?: { state: string } }>(
+        "approvals.respond",
+        {
+          approvalKey: regular.approvalKey,
+          choice: "once",
+        },
+      );
+      expect(settled.ok).toBe(true);
+      if (settled.ok) {
+        expect(settled.value.status).toBe("settled");
+        expect(settled.value.approval?.state).toBe("settled");
+      }
+      expect(events.length).toBeGreaterThanOrEqual(2);
+
+      unsub();
+    } finally {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
+    }
+  });
 });
 
 describe("MockHostBridge Ticket #41 Subagents and Checkpoints contract (S0)", () => {

@@ -677,4 +677,164 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
     await checkAxe("1280 popover with attention badges");
   });
+
+
+  test("Ticket #39: passes axe-core serious/critical = 0 on actionable, context_incomplete, orphaned Approval cards, rail badge, and inspect modal", async ({
+    page,
+  }) => {
+    const checkAxe = async (label: string) => {
+      const results = await new AxeBuilder({ page }).analyze();
+      const severe = results.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(severe, `axe serious/critical violations on ${label}`).toEqual([]);
+    };
+
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local-control-socket",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y-apr",
+              title: "Approval A11y Session",
+              preview: "Waiting for decision",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-a11y-1",
+              status: "running",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y-bg",
+              title: "Background Badge Session",
+              preview: "Background pending",
+              updatedAt: "2026-11-23T08:55:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-a11y-bg",
+              status: "running",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-a11y-apr" },
+          activeSessionId: "sess-a11y-apr",
+        },
+        approvals: [
+          {
+            gateway: {
+              approvalId: "apr-a11y-sudo",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y-apr",
+              turnId: "turn-a11y-1",
+              executionGeneration: 1,
+              command: "sudo systemctl status hermes",
+              description: "Inspect service status",
+              choices: ["once", "always", "deny"],
+              persistentGrant: {
+                pattern: "sudo systemctl status *",
+                scope: "local/default",
+                revokeHint: "hermes approvals revoke apr-a11y-sudo",
+              },
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Approval A11y Session",
+              cwd: "/srv/hermes/app",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+          {
+            gateway: {
+              approvalId: "apr-a11y-incomplete",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y-apr",
+              turnId: "turn-a11y-2",
+              executionGeneration: 1,
+              command: "rm -rf /tmp/scratch",
+              description: "Destructive command without cwd",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Approval A11y Session",
+              cwd: null,
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+          {
+            gateway: {
+              approvalId: "apr-a11y-bg",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y-bg",
+              turnId: "turn-a1y-bg",
+              executionGeneration: 1,
+              command: "ls -la",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Background Badge Session",
+              cwd: "/srv/hermes/bg",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+        ],
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await expect(page.locator('[data-testid="approval-card"]')).toHaveCount(2);
+    await expect(page.getByTestId("session-needs-input-badge")).toHaveCount(2);
+    await checkAxe("approval cards + needs-input badge");
+
+    await page.locator('[data-testid="approval-inspect-btn"]').first().click();
+    await expect(page.getByRole("dialog", { name: "Approval 只读详情" })).toBeVisible();
+    await checkAxe("approval inspect modal");
+  });
 });
