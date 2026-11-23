@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, feat/hermes-desktop-v1-integration]
+  push:
+    branches: [feat/hermes-desktop-v1-integration]
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      run_x64_portability:
+        description: "Run non-blocking macos-15-intel x64 build portability check"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pr-macos-arm64:
+    if: github.event_name != 'schedule'
+    name: macOS arm64 PR Gate
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      PLAYWRIGHT_RETRIES: "0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: "pnpm"
+
+      - name: Cache Electron, electron-builder, and Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~/Library/Caches/ms-playwright
+          key: ${{ runner.os }}-arm64-bins-${{ hashFiles('pnpm-lock.yaml', 'apps/desktop/package.json', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-arm64-bins-
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Ensure Playwright Chromium is installed
+        run: pnpm exec playwright install chromium
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit & Contract Tests
+        run: pnpm test
+
+      - name: Guard - No Official Desktop
+        run: pnpm verify:no-official-desktop
+
+      - name: Guard - Architecture Boundaries
+        run: pnpm verify:architecture
+
+      - name: Build Electron & Web
+        run: pnpm build
+
+      - name: Browser Mock E2E (0 retries)
+        run: pnpm test:e2e
+
+      - name: Accessibility Gate (0 retries)
+        run: pnpm test:a11y
+
+      - name: Electron Hardened Smoke (0 retries)
+        run: pnpm test:electron
+
+      - name: Package macOS arm64 .app
+        run: pnpm package:mac
+
+      - name: Packaged Launch Smoke & ASAR Guards
+        run: pnpm smoke:packaged
+
+      - name: Upload packaged arm64 .app artifact (7 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-desktop-macos-arm64
+          path: |
+            apps/desktop/release/mac-arm64/Hermes Desktop.app
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: warn
+
+  x64-portability-check:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_x64_portability
+    name: macOS x64 Portability Check (Non-blocking)
+    runs-on: macos-15-intel
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: "pnpm"
+
+      - name: Cache Electron and electron-builder
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: ${{ runner.os }}-x64-bins-${{ hashFiles('pnpm-lock.yaml', 'apps/desktop/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-x64-bins-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck & Build
+        run: pnpm typecheck && pnpm build
+
+      - name: Package x64 check
+        run: node scripts/package-mac.mjs --arch=x64
+
+  nightly-macos-26:
+    if: github.event_name == 'schedule'
+    name: Nightly macOS 26 & Real Gateway Smoke (Non-blocking)
+    runs-on: macos-26
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.21.0
+
+      - name: Setup Node.js 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build & Package macOS arm64
+        run: pnpm build && pnpm package:mac
+
+      - name: Packaged Launch Smoke
+        run: pnpm smoke:packaged
+
+      - name: Real Gateway Smoke (skipped unless self-hosted hermes CLI present)
+        run: |
+          if command -v hermes >/dev/null 2>&1; then
+            echo "[nightly] hermes CLI detected; running test:real-gateway when available"
+            pnpm run --if-present test:real-gateway
+          else
+            echo "[nightly] test:real-gateway skipped (hermes CLI not preinstalled on GitHub-hosted runner)"
+          fi
+
+      - name: Upload Nightly Diagnostics & Artifacts (14 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-desktop-nightly-macos26
+          path: |
+            apps/desktop/release/
+            test-results/
+          retention-days: 14
+          if-no-files-found: warn

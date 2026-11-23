@@ -96,6 +96,45 @@ test.describe("Electron hardened smoke", () => {
       await expect(page.locator("body")).not.toContainText("Homelab");
       await expect(page.locator("body")).not.toContainText("SIMULATED DATA");
 
+      // Verify same-source AppInfo across bridge.hello, diagnostics.export, and Settings -> About/Updates
+      const diagnosticsCheck = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: {
+            request: (cmd: string, payload?: Record<string, unknown>) => Promise<{ ok: boolean; value: unknown }>;
+          };
+        };
+        const hello = await w.hermesHost.request("bridge.hello", {});
+        const diag = await w.hermesHost.request("diagnostics.export", {});
+        return { hello, diag };
+      });
+      expect(diagnosticsCheck.hello.ok).toBe(true);
+      expect(diagnosticsCheck.diag.ok).toBe(true);
+
+      const helloInfo = diagnosticsCheck.hello.value as {
+        appVersion: string;
+        gitSha: string;
+        buildMode: string;
+        distribution: string;
+        arch: string;
+      };
+      const diagPayload = diagnosticsCheck.diag.value as {
+        appInfo: typeof helloInfo;
+        display: { headline: string; buildLine: string; runtimeLine: string; updatesNotice: string };
+      };
+      expect(diagPayload.appInfo).toEqual(helloInfo);
+      expect(helloInfo.buildMode).toBe("dev");
+      expect(helloInfo.distribution).toBe("local-unsigned");
+      expect(JSON.stringify(diagPayload)).not.toContain(process.cwd());
+
+      await page.getByRole("button", { name: "打开 Settings" }).click();
+      const settingsDialog = page.getByRole("dialog", { name: "Settings" });
+      await expect(settingsDialog).toBeVisible();
+      await expect(settingsDialog).toContainText(diagPayload.display.headline);
+      await expect(settingsDialog).toContainText(diagPayload.display.buildLine);
+      await expect(settingsDialog).toContainText(diagPayload.display.runtimeLine);
+      await expect(settingsDialog).toContainText("本地开发构建，不检查更新");
+      await expect(settingsDialog.getByRole("button", { name: /检查更新|Update/i })).toHaveCount(0);
+
       passed = true;
     } finally {
       await electronApp.close();

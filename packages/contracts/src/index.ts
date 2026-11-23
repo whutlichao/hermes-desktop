@@ -105,6 +105,7 @@ export interface BridgeEvent<T = unknown> {
 }
 
 export type AppCommand =
+  | { type: "open_about" }
   | { type: "open_palette" }
   | { type: "open_settings" }
   | { type: "toggle_workspace" }
@@ -117,11 +118,19 @@ export interface AppInfo {
   bridgeVersion: typeof HOST_BRIDGE_VERSION;
   appName: "Hermes Desktop";
   appVersion: string;
+  gitSha: string;
+  gitDirty: boolean;
+  buildMode: "dev" | "packaged";
+  distribution: "local-unsigned";
+  electronVersion: string;
+  chromiumVersion: string;
+  nodeVersion: string;
+  arch: "arm64" | "x64";
+  macOSVersion?: string;
+  source: "git" | "unknown";
   mode: "electron" | "mock";
   platform: string;
-  arch: string;
   capabilitiesReady: boolean;
-  codeSha?: string;
 }
 
 export interface HostRequestEnvelope {

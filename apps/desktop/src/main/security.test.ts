@@ -6,8 +6,10 @@ import {
   assertSafeSandboxRoot,
   buildAppMenuSpec,
   buildCspHeader,
+  confirmRealHomeAccess,
   createHardenedWebPreferences,
   isAllowedExternalUrl,
+  requiresRealHomeConfirmation,
   resolveSandboxPaths,
 } from "./security";
 
@@ -76,5 +78,56 @@ describe("Electron Main sandbox & hardening", () => {
     expect(accelerators).toContain("CmdOrCtrl+W");
     expect(accelerators).toContain("CmdOrCtrl+Q");
     expect(accelerators).toContain("CmdOrCtrl+Shift+/");
+
+    const topItems = spec.flatMap((top) => top.submenu ?? []);
+    const aboutItem = topItems.find((item) => item.label === "关于 Hermes Desktop");
+    expect(aboutItem).toBeDefined();
+    aboutItem?.click?.();
+    expect(commands).toContain("open_about");
+  });
+
+  it("requires native confirmation before window creation when HERMES_ALLOW_REAL_HOME=1", async () => {
+    const sandbox = createTestSandbox("hermes-realhome-");
+    let passed = false;
+    try {
+      const devSandbox = resolveSandboxPaths({ repoRoot: sandbox.rootDir, env: {} });
+      expect(requiresRealHomeConfirmation(devSandbox)).toBe(false);
+      let dialogCalled = false;
+      expect(
+        await confirmRealHomeAccess({
+          sandbox: devSandbox,
+          showConfirmDialog: () => {
+            dialogCalled = true;
+            return false;
+          },
+        }),
+      ).toBe(true);
+      expect(dialogCalled).toBe(false);
+
+      const realSandbox = resolveSandboxPaths({
+        repoRoot: sandbox.rootDir,
+        env: {
+          HERMES_ALLOW_REAL_HOME: "1",
+          HERMES_HOME: path.join(os.homedir(), ".hermes"),
+        },
+      });
+      expect(requiresRealHomeConfirmation(realSandbox)).toBe(true);
+      expect(
+        await confirmRealHomeAccess({
+          sandbox: realSandbox,
+          showConfirmDialog: () => false,
+        }),
+      ).toBe(false);
+      expect(
+        await confirmRealHomeAccess({
+          sandbox: realSandbox,
+          showConfirmDialog: () => true,
+        }),
+      ).toBe(true);
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
   });
 });

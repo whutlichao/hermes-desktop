@@ -120,4 +120,20 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
       .evaluate((el) => getComputedStyle(el).transitionDuration);
     expect(Number.parseFloat(transitionDuration)).toBeLessThanOrEqual(0.001);
   });
+
+  test("Settings modal displays same-source About info and Updates notice with zero fake update buttons", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: "打开 Settings" }).click();
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    await expect(settings).toBeVisible();
+    await expect(settings).toContainText("Hermes Desktop 0.1.0 (dev+");
+    await expect(settings).toContainText("本地开发构建 · arm64");
+    await expect(settings).toContainText("Electron ");
+    await expect(settings).toContainText("本地开发构建，不检查更新");
+    await expect(settings.getByRole("button", { name: /检查更新|Update/i })).toHaveCount(0);
+  });
 });

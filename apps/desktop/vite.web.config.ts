@@ -1,10 +1,24 @@
 import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { readDesktopPackageMeta, resolveBuildGitMeta } from "../../scripts/build-meta.mjs";
+
+const repoRoot = path.resolve(__dirname, "../..");
+const gitMeta = resolveBuildGitMeta({ repoRoot, buildMode: "dev", allowUnknownSha: true });
+const pkgMeta = readDesktopPackageMeta(__dirname);
 
 export default defineConfig({
   root: path.resolve(__dirname, "src/renderer"),
   plugins: [react()],
+  define: {
+    __HERMES_MOCK_BUILD_META__: JSON.stringify({
+      ...gitMeta,
+      appVersion: pkgMeta.appVersion,
+      electronVersion: pkgMeta.electronVersion,
+      chromiumVersion: "build-time",
+      nodeVersion: process.versions.node,
+    }),
+  },
   resolve: {
     alias: {
       "@hermes/host-adapter": path.resolve(__dirname, "src/mock/mockHostAdapter.ts"),

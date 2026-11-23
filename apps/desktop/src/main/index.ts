@@ -1,8 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, ipcMain, Menu, session, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } from "electron";
 import {
-  HOST_BRIDGE_VERSION,
   type AppCommand,
   type AppInfo,
   type BridgeEvent,
@@ -11,22 +10,38 @@ import {
   type HostRequestEnvelope,
   type HostTopic,
 } from "@hermes/contracts";
-import { createBridgeDispatcher, validateHostTopic } from "@hermes/domain";
+import { createBridgeDispatcher, formatAppInfoDisplay, validateHostTopic } from "@hermes/domain";
+import { createMainAppInfo, type EmbeddedBuildMeta } from "./appInfo";
 import {
   buildAppMenuSpec,
   buildCspHeader,
+  confirmRealHomeAccess,
   createHardenedWebPreferences,
   isAllowedExternalUrl,
   resolveSandboxPaths,
 } from "./security";
 
-const repoRoot = path.resolve(__dirname, "../../../..");
-const sandbox = resolveSandboxPaths({ repoRoot, env: process.env });
+declare const __HERMES_BUILD_META__: EmbeddedBuildMeta | undefined;
+
+const devRepoRoot = path.resolve(__dirname, "../../../..");
+const sandboxBaseRoot = app.isPackaged ? app.getPath("userData") : devRepoRoot;
+const sandbox = resolveSandboxPaths({ repoRoot: sandboxBaseRoot, env: process.env });
 
 fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
-fs.mkdirSync(sandbox.hermesHomeDir, { recursive: true, mode: 0o700 });
 app.setPath("userData", sandbox.userDataDir);
 process.env.HERMES_HOME = sandbox.hermesHomeDir;
+
+const embeddedBuildMeta =
+  typeof __HERMES_BUILD_META__ !== "undefined" ? __HERMES_BUILD_META__ : undefined;
+
+const mainAppInfo: AppInfo = createMainAppInfo({
+  appVersion: app.getVersion(),
+  isPackaged: app.isPackaged,
+  embeddedMeta: embeddedBuildMeta,
+  repoRoot: app.isPackaged ? undefined : devRepoRoot,
+  allowUnknownSha: process.env.ALLOW_UNKNOWN_SHA === "1",
+});
+const appDisplay = formatAppInfoDisplay(mainAppInfo);
 
 const isDev = Boolean(process.env.ELECTRON_RENDERER_URL);
 let mainWindow: BrowserWindow | null = null;
@@ -34,7 +49,21 @@ let isQuitting = false;
 let rendererReady = false;
 const pendingCommands: AppCommand[] = [];
 
+function showNativeAboutPanel(): void {
+  app.setAboutPanelOptions({
+    applicationName: mainAppInfo.appName,
+    applicationVersion: mainAppInfo.appVersion,
+    version: appDisplay.shaLabel,
+    credits: `${appDisplay.headline}\n${appDisplay.buildLine}\n${appDisplay.runtimeLine}`,
+  });
+  app.showAboutPanel();
+}
+
 function dispatchAppCommand(command: AppCommand): void {
+  if (command.type === "open_about") {
+    showNativeAboutPanel();
+    return;
+  }
   if (command.type === "close_window") {
     const focused = BrowserWindow.getFocusedWindow() ?? mainWindow;
     focused?.close();
@@ -77,24 +106,14 @@ const dispatcher = createBridgeDispatcher({
   "bridge.hello": async (): Promise<AppInfo> => {
     rendererReady = true;
     queueMicrotask(flushPendingCommands);
-    return {
-      bridgeVersion: HOST_BRIDGE_VERSION,
-      appName: "Hermes Desktop",
-      appVersion: app.getVersion(),
-      mode: "electron",
-      platform: process.platform,
-      arch: process.arch,
-      capabilitiesReady: false,
-    };
+    return mainAppInfo;
   },
   "connections.list": async () => ({ connections: emptyFleetSnapshot.connections }),
   "profiles.list": async () => ({ profiles: emptyFleetSnapshot.profiles }),
   "sessions.list": async () => ({ sessions: emptyFleetSnapshot.sessions }),
   "diagnostics.export": async () => ({
-    appName: "Hermes Desktop",
-    appVersion: app.getVersion(),
-    bridgeVersion: HOST_BRIDGE_VERSION,
-    mode: "electron",
+    appInfo: mainAppInfo,
+    display: appDisplay,
     sandboxed: !sandbox.isRealHomeAllowed,
     connectionsCount: 0,
   }),
@@ -152,7 +171,37 @@ function createMainWindow(): BrowserWindow {
   return win;
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const realHomeConfirmed = await confirmRealHomeAccess({
+    sandbox,
+    showConfirmDialog: async (prompt) => {
+      const result = await dialog.showMessageBox({
+        type: "warning",
+        buttons: ["取消启动", "继续连接真实 ~/.hermes"],
+        defaultId: 0,
+        cancelId: 0,
+        title: prompt.title,
+        message: prompt.message,
+        detail: prompt.detail,
+      });
+      return result.response === 1;
+    },
+  });
+
+  if (!realHomeConfirmed) {
+    app.quit();
+    return;
+  }
+
+  fs.mkdirSync(sandbox.hermesHomeDir, { recursive: true, mode: 0o700 });
+
+  app.setAboutPanelOptions({
+    applicationName: mainAppInfo.appName,
+    applicationVersion: mainAppInfo.appVersion,
+    version: appDisplay.shaLabel,
+    credits: `${appDisplay.headline}\n${appDisplay.buildLine}\n${appDisplay.runtimeLine}`,
+  });
+
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     const csp = buildCspHeader(isDev);
     callback({

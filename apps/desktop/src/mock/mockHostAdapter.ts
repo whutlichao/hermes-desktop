@@ -11,7 +11,19 @@ import {
   type HostCommand,
   type HostTopic,
 } from "@hermes/contracts";
-import { createBridgeDispatcher } from "@hermes/domain";
+import { createBridgeDispatcher, formatAppInfoDisplay } from "@hermes/domain";
+
+declare const __HERMES_MOCK_BUILD_META__:
+  | {
+      gitSha: string;
+      gitDirty: boolean;
+      source: "git" | "unknown";
+      appVersion: string;
+      electronVersion: string;
+      chromiumVersion: string;
+      nodeVersion: string;
+    }
+  | undefined;
 
 const VALID_TOPICS = new Set<string>(HOST_TOPICS);
 
@@ -23,28 +35,51 @@ const EMPTY_FLEET: FleetSnapshot = {
   activeSessionId: null,
 };
 
+function createMockAppInfo(): AppInfo {
+  const meta =
+    typeof __HERMES_MOCK_BUILD_META__ !== "undefined"
+      ? __HERMES_MOCK_BUILD_META__
+      : {
+          gitSha: "unknown",
+          gitDirty: false,
+          source: "unknown" as const,
+          appVersion: "0.1.0",
+          electronVersion: "45.4.1",
+          chromiumVersion: "134.0.0.0",
+          nodeVersion: "22.13.0",
+        };
+  return {
+    bridgeVersion: HOST_BRIDGE_VERSION,
+    appName: "Hermes Desktop",
+    appVersion: meta.appVersion,
+    gitSha: meta.gitSha,
+    gitDirty: meta.gitDirty,
+    buildMode: "dev",
+    distribution: "local-unsigned",
+    electronVersion: meta.electronVersion,
+    chromiumVersion: meta.chromiumVersion,
+    nodeVersion: meta.nodeVersion,
+    arch: "arm64",
+    source: meta.source,
+    mode: "mock",
+    platform: "darwin",
+    capabilitiesReady: false,
+  };
+}
+
 export function createMockHostBridge(): HermesHost {
   let reqSeq = 0;
   const commandListeners = new Set<(cmd: AppCommand) => void>();
+  const mockAppInfo = createMockAppInfo();
 
   const dispatcher = createBridgeDispatcher({
-    "bridge.hello": async (): Promise<AppInfo> => ({
-      bridgeVersion: HOST_BRIDGE_VERSION,
-      appName: "Hermes Desktop",
-      appVersion: "0.1.0",
-      mode: "mock",
-      platform: "web",
-      arch: "wasm",
-      capabilitiesReady: false,
-    }),
+    "bridge.hello": async (): Promise<AppInfo> => mockAppInfo,
     "connections.list": async () => ({ connections: EMPTY_FLEET.connections }),
     "profiles.list": async () => ({ profiles: EMPTY_FLEET.profiles }),
     "sessions.list": async () => ({ sessions: EMPTY_FLEET.sessions }),
     "diagnostics.export": async () => ({
-      appName: "Hermes Desktop",
-      appVersion: "0.1.0",
-      bridgeVersion: HOST_BRIDGE_VERSION,
-      mode: "mock",
+      appInfo: mockAppInfo,
+      display: formatAppInfoDisplay(mockAppInfo),
       connectionsCount: 0,
     }),
   });
