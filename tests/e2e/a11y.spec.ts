@@ -54,5 +54,11 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await page.getByRole("button", { name: /Sessions\s+0/ }).click();
     await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
     await checkAxe("1280 sessions popover");
+    await page.keyboard.press("Escape");
+
+    // Local Remote/SSH escape hatch modal
+    await page.getByRole("button", { name: "改连 Remote / SSH" }).click();
+    await expect(page.getByRole("dialog", { name: "改连 Remote / SSH" })).toBeVisible();
+    await checkAxe("remote escape modal");
   });
 });

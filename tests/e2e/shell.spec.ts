@@ -120,4 +120,60 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
       .evaluate((el) => getComputedStyle(el).transitionDuration);
     expect(Number.parseFloat(transitionDuration)).toBeLessThanOrEqual(0.001);
   });
+
+  test("E2E-KB-01 & E2E-FAKE-01: Local first-run blocked card exposes reachable repair actions and zero fake buttons", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const localCard = page.locator("section.local-repair-card");
+    await expect(localCard).toBeVisible();
+    await expect(localCard).toContainText("This device");
+    await expect(localCard).toContainText("连接受阻");
+    await expect(localCard).toContainText("发生了什么");
+    await expect(localCard).toContainText("可能原因");
+    await expect(localCard).toContainText("下一步");
+
+    // E2E-KB-01: repair actions and Remote/SSH escape hatch are keyboard reachable
+    const chooseBtn = localCard.getByRole("button", { name: "选择本机 CLI" });
+    const docsBtn = localCard.getByRole("button", { name: "查看安装文档" });
+    const retryBtn = localCard.getByRole("button", { name: "重新检测" });
+    const escapeBtn = localCard.getByRole("button", { name: "改连 Remote / SSH" });
+
+    await expect(chooseBtn).toBeVisible();
+    await expect(docsBtn).toBeVisible();
+    await expect(retryBtn).toBeVisible();
+    await expect(escapeBtn).toBeVisible();
+
+    await chooseBtn.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator('[role="status"]')).toContainText("已取消选择 CLI");
+
+    await retryBtn.focus();
+    await page.keyboard.press("Enter");
+
+    await escapeBtn.focus();
+    await page.keyboard.press("Enter");
+    const escapeDialog = page.getByRole("dialog", { name: "改连 Remote / SSH" });
+    await expect(escapeDialog).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(escapeDialog).toBeHidden();
+    await expect(escapeBtn).toBeFocused();
+
+    // E2E-FAKE-01: zero fake runtime install, fake health, or fake chat buttons
+    const bodyText = await page.locator("body").innerText();
+    for (const forbidden of [
+      "自动安装 Python",
+      "下载 Python",
+      "一键安装",
+      "连接成功",
+      "启动模拟 Gateway",
+      "/Users/",
+    ]) {
+      expect(bodyText).not.toContain(forbidden);
+    }
+    await expect(page.locator("#composer-input")).toHaveAttribute("aria-disabled", "true");
+    await expect(page.getByRole("button", { name: "发送消息" })).toBeDisabled();
+  });
 });

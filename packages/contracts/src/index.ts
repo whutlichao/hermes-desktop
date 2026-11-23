@@ -55,6 +55,9 @@ export const HOST_COMMANDS = [
   "artifacts.list",
   "artifacts.read",
   "diagnostics.export",
+  "local.inspect",
+  "local.selectCli",
+  "local.diagnose",
   "links.openExternal",
 ] as const;
 
@@ -233,4 +236,120 @@ export interface WindowState {
   bounds: WindowBounds;
   theme: WindowTheme;
   panes: [PaneState];
+}
+
+export const LOCAL_FAILURE_CODES = [
+  "hermes_not_found",
+  "cli_not_executable",
+  "cli_unsupported",
+  "protocol_unsupported",
+  "code_sha_mismatch",
+  "gateway_start_failed",
+  "gateway_starting_timeout",
+  "runtime_exited",
+  "owner_lost",
+  "ticket_unavailable",
+  "control_timeout",
+  "socket_permission_denied",
+  "service_unhealthy",
+  "profile_unavailable",
+  "gateway_other_session",
+  "gateway_elevated",
+  "authorization",
+  "update_paused",
+  "invalid_control_state",
+] as const;
+
+export type LocalFailureCode = (typeof LOCAL_FAILURE_CODES)[number];
+
+export const LOCAL_SAFE_ACTION_IDS = [
+  "choose_cli",
+  "open_install_docs",
+  "open_update_docs",
+  "retry",
+  "restart_gateway",
+  "open_status",
+  "open_diagnostics",
+  "switch_profile",
+] as const;
+
+export type LocalSafeActionId = (typeof LOCAL_SAFE_ACTION_IDS)[number];
+
+export type LocalCliSourceKind =
+  | "override"
+  | "login_shell_ilc"
+  | "login_shell_lc"
+  | "common_dir"
+  | "none";
+
+export interface LocalCliSummary {
+  status: "ready" | "missing" | "not_executable" | "unsupported";
+  displayName: string;
+  sourceKind: LocalCliSourceKind;
+  version?: string;
+  hasOverride: boolean;
+  supportsEnsureJson: boolean;
+  supportsAttachJson: boolean;
+  supportsTicketsProbe: boolean;
+}
+
+export type LocalInspectionPhase =
+  | "locate_cli"
+  | "probe_cli"
+  | "probe_capabilities"
+  | "resolve_control_socket"
+  | "ensure_gateway"
+  | "ready"
+  | "blocked";
+
+export interface LocalTypedFailure {
+  code: LocalFailureCode;
+  phase: LocalInspectionPhase;
+  retryable: boolean;
+  autoRetry: boolean;
+  actual: ConnectionActualState;
+  actions: LocalSafeActionId[];
+  profileId?: string;
+  restartAttempts?: { current: number; max: number };
+  reasonCode?: string;
+}
+
+export interface LocalInspectResult {
+  connectionId: "local";
+  label: "This device";
+  actual: ConnectionActualState;
+  cli: LocalCliSummary;
+  failure: LocalTypedFailure | null;
+  checkedAt: string;
+}
+
+export interface LocalSelectCliResult {
+  cancelled: boolean;
+  cli: LocalCliSummary;
+  inspection: LocalInspectResult;
+}
+
+export interface DiagnosticsPhaseEntry {
+  phase: string;
+  outcome: "ok" | "failed" | "timeout" | "skipped";
+  durationMs?: number;
+  code?: string;
+}
+
+export interface SanitizedDiagnosticsPayload {
+  generatedAt: string;
+  appName: "Hermes Desktop";
+  appVersion: string;
+  bridgeVersion: typeof HOST_BRIDGE_VERSION;
+  buildMode: "dev" | "packaged" | "mock";
+  mode: "electron" | "mock";
+  platform: string;
+  arch: string;
+  hermesHomeKind: "sandbox" | "real" | "temp" | "mock";
+  connectionsCount: number;
+  cliSummary: LocalCliSummary | null;
+  typedFailureCode: LocalFailureCode | null;
+  failurePhase: LocalInspectionPhase | null;
+  stages: DiagnosticsPhaseEntry[];
+  notes: string[];
 }

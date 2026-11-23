@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { _electron as electron, expect, test } from "@playwright/test";
 import { createTestSandbox } from "../helpers/sandbox";
@@ -95,6 +96,62 @@ test.describe("Electron hardened smoke", () => {
       await expect(page.locator("footer.status-footer")).toContainText("Electron 宿主模式");
       await expect(page.locator("body")).not.toContainText("Homelab");
       await expect(page.locator("body")).not.toContainText("SIMULATED DATA");
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("renders Local blocked repair card and exports sanitized diagnostics without leaking paths", async () => {
+    const sandbox = createTestSandbox("hermes-electron-local-blocked-");
+    let passed = false;
+
+    const nonExecBin = path.join(sandbox.rootDir, "secret-dir", "hermes");
+    fs.mkdirSync(path.dirname(nonExecBin), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(nonExecBin, "#!/bin/sh\necho hi\n", { encoding: "utf8", mode: 0o644 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: nonExecBin }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+
+      const localCard = page.locator("section.local-repair-card");
+      await expect(localCard).toContainText("This device");
+      await expect(localCard).toContainText("连接受阻");
+      await expect(localCard).toContainText("发生了什么");
+      await expect(localCard).toContainText("不具备可执行权限");
+      await expect(localCard).not.toContainText(sandbox.rootDir);
+      await expect(localCard).not.toContainText("secret-dir");
+
+      const diagBtn = localCard.getByRole("button", { name: "导出脱敏诊断" });
+      await expect(diagBtn).toBeVisible();
+      await diagBtn.click();
+
+      const diagModal = page.getByRole("dialog", { name: "脱敏诊断摘要" });
+      await expect(diagModal).toBeVisible();
+      await expect(diagModal).toContainText("cli_not_executable");
+      await expect(diagModal).toContainText("temp");
+
+      const jsonText = await diagModal.locator("pre.diagnostics-json").innerText();
+      expect(jsonText).not.toContain(sandbox.rootDir);
+      expect(jsonText).not.toContain("secret-dir");
+      expect(jsonText).not.toContain("stderr");
+      expect(jsonText).toContain('"typedFailureCode": "cli_not_executable"');
 
       passed = true;
     } finally {

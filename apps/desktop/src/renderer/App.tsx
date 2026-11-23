@@ -8,9 +8,15 @@ import {
 import type {
   AppCommand,
   FleetSnapshot,
+  LocalInspectResult,
+  LocalSafeActionId,
+  LocalSelectCliResult,
+  SanitizedDiagnosticsPayload,
   WorkspaceTab,
 } from "@hermes/contracts";
 import {
+  HERMES_INSTALL_DOCS_URL,
+  HERMES_UPDATE_DOCS_URL,
   createInitialShellState,
   createSequenceTracker,
   deriveViewportMode,
@@ -19,7 +25,9 @@ import {
   shellReducer,
 } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
+import { DiagnosticsModal } from "./components/DiagnosticsModal";
 import { HermesMark } from "./components/HermesMark";
+import { LocalRepairCard } from "./components/LocalRepairCard";
 import { FocusDialog } from "./components/Modal";
 
 const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string }> = [
@@ -34,6 +42,7 @@ export default function App() {
   const [state, dispatch] = useReducer(shellReducer, undefined, createInitialShellState);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [paletteQuery, setPaletteQuery] = useState("");
+  const [localBusy, setLocalBusy] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const trackerRef = useRef(createSequenceTracker());
@@ -88,12 +97,17 @@ export default function App() {
     }
   }, []);
 
-  // HostBridge bootstrap: hello + fleet subscription + native command listener
+  // HostBridge bootstrap: hello + local.inspect + fleet subscription + native command listener
   useEffect(() => {
     let active = true;
     void host.request("bridge.hello", {}).then((res) => {
       if (!active || !res.ok) return;
       dispatch({ type: "HYDRATE_HELLO", appInfo: res.value as NonNullable<typeof state.appInfo> });
+    });
+
+    void host.request<LocalInspectResult>("local.inspect", {}).then((res) => {
+      if (!active || !res.ok) return;
+      dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: res.value });
     });
 
     const unsubFleet = host.subscribe("fleet", null, (event) => {
@@ -230,6 +244,56 @@ export default function App() {
         item.label.toLowerCase().includes(q) || item.hint.toLowerCase().includes(q),
     );
   }, [paletteCommands, paletteQuery]);
+
+  const handleLocalAction = useCallback(async (action: LocalSafeActionId) => {
+    setLocalBusy(true);
+    try {
+      switch (action) {
+        case "choose_cli": {
+          const res = await host.request<LocalSelectCliResult>("local.selectCli", {});
+          if (res.ok) {
+            dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: res.value.inspection });
+            dispatch({
+              type: "ANNOUNCE",
+              message: res.value.cancelled
+                ? getCopy("local.selectCancelled")
+                : res.value.cli.displayName,
+            });
+          }
+          break;
+        }
+        case "open_install_docs":
+          await host.request("links.openExternal", { url: HERMES_INSTALL_DOCS_URL });
+          break;
+        case "open_update_docs":
+          await host.request("links.openExternal", { url: HERMES_UPDATE_DOCS_URL });
+          break;
+        case "retry":
+        case "restart_gateway": {
+          const res = await host.request<LocalInspectResult>("local.inspect", {});
+          if (res.ok) {
+            dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: res.value });
+            dispatch({ type: "ANNOUNCE", message: res.value.cli.displayName });
+          }
+          break;
+        }
+        case "open_status":
+        case "open_diagnostics": {
+          const res = await host.request<SanitizedDiagnosticsPayload>("local.diagnose", {});
+          if (res.ok) {
+            dispatch({ type: "APPLY_DIAGNOSTICS_REPORT", report: res.value });
+            dispatch({ type: "OPEN_SURFACE", surface: "diagnostics" });
+          }
+          break;
+        }
+        case "switch_profile":
+          dispatch({ type: "OPEN_SURFACE", surface: "scopePopover" });
+          break;
+      }
+    } finally {
+      setLocalBusy(false);
+    }
+  }, []);
 
   const isMockMode = state.appInfo?.mode === "mock";
 
@@ -400,6 +464,15 @@ export default function App() {
                     </button>
                   </div>
                 </section>
+
+                <LocalRepairCard
+                  inspection={state.localInspection}
+                  busy={localBusy}
+                  onAction={(action) => void handleLocalAction(action)}
+                  onOpenRemoteEscape={() =>
+                    dispatch({ type: "OPEN_SURFACE", surface: "remoteEscape" })
+                  }
+                />
 
                 <form
                   className="composer-shell"
@@ -602,6 +675,37 @@ export default function App() {
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" })}
       >
         <p>{getCopy("scope.empty")}</p>
+      </FocusDialog>
+
+      <DiagnosticsModal
+        open={state.surfaceStack.includes("diagnostics")}
+        report={state.diagnosticsReport}
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "diagnostics" })}
+        onCopied={() =>
+          dispatch({ type: "ANNOUNCE", message: getCopy("diagnostics.copiedNotice") })
+        }
+      />
+
+      <FocusDialog
+        open={state.surfaceStack.includes("remoteEscape")}
+        title={getCopy("local.remoteEscapeTitle")}
+        description={getCopy("local.escapeRemoteSshHint")}
+        closeLabel={getCopy("local.remoteEscapeClose")}
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "remoteEscape" })}
+      >
+        <p>{getCopy("local.remoteEscapeBody")}</p>
+        <div className="empty-relay-actions">
+          <button
+            type="button"
+            className="button button-primary"
+            onClick={() => {
+              dispatch({ type: "CLOSE_SURFACE", surface: "remoteEscape" });
+              dispatch({ type: "OPEN_SURFACE", surface: "settings" });
+            }}
+          >
+            {getCopy("local.remoteEscapeAction")}
+          </button>
+        </div>
       </FocusDialog>
     </>
   );

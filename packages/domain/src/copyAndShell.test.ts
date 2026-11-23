@@ -63,4 +63,66 @@ describe("Quiet Relay shell state & layout invariants", () => {
     state = shellReducer(state, { type: "TOGGLE_WORKSPACE" });
     expect(state.workspace.mode).toBe("hidden");
   });
+
+  it("tracks Local inspection state, diagnostics surface, and Remote/SSH escape hatch surface", () => {
+    let state = createInitialShellState();
+    expect(state.localInspection).toBeNull();
+    expect(state.diagnosticsReport).toBeNull();
+
+    state = shellReducer(state, {
+      type: "APPLY_LOCAL_INSPECTION",
+      inspection: {
+        connectionId: "local",
+        label: "This device",
+        actual: "blocked",
+        cli: {
+          status: "missing",
+          displayName: "未检测到 hermes CLI",
+          sourceKind: "none",
+          hasOverride: false,
+          supportsEnsureJson: false,
+          supportsAttachJson: false,
+          supportsTicketsProbe: false,
+        },
+        failure: {
+          code: "hermes_not_found",
+          phase: "locate_cli",
+          retryable: true,
+          autoRetry: false,
+          actual: "blocked",
+          actions: ["choose_cli", "open_install_docs", "retry"],
+        },
+        checkedAt: "2026-11-23T06:00:00.000Z",
+      },
+    });
+    expect(state.localInspection?.failure?.code).toBe("hermes_not_found");
+
+    state = shellReducer(state, {
+      type: "APPLY_DIAGNOSTICS_REPORT",
+      report: {
+        generatedAt: "2026-11-23T06:00:00.000Z",
+        appName: "Hermes Desktop",
+        appVersion: "0.1.0",
+        bridgeVersion: 1,
+        buildMode: "mock",
+        mode: "mock",
+        platform: "web",
+        arch: "wasm",
+        hermesHomeKind: "mock",
+        connectionsCount: 0,
+        cliSummary: null,
+        typedFailureCode: "hermes_not_found",
+        failurePhase: "locate_cli",
+        stages: [],
+        notes: [],
+      },
+    });
+    state = shellReducer(state, { type: "OPEN_SURFACE", surface: "diagnostics" });
+    expect(getTopmostSurface(state)).toBe("diagnostics");
+    expect(state.diagnosticsReport?.typedFailureCode).toBe("hermes_not_found");
+
+    expect(getCopy("local.action.choose_cli")).toBe("选择本机 CLI");
+    expect(getCopy("local.escapeRemoteSsh")).toBe("改连 Remote / SSH");
+    expect(getCopy("diagnostics.title")).toBe("脱敏诊断摘要");
+  });
 });

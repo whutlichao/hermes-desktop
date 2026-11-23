@@ -2,7 +2,9 @@ import type {
   AppInfo,
   BridgeScope,
   ConnectionHealthSummary,
+  LocalInspectResult,
   ProfileSummary,
+  SanitizedDiagnosticsPayload,
   SessionSummary,
   WorkspaceMode,
   WorkspaceTab,
@@ -16,7 +18,9 @@ export type OverlaySurface =
   | "capabilities"
   | "shortcuts"
   | "sessionsPopover"
-  | "scopePopover";
+  | "scopePopover"
+  | "diagnostics"
+  | "remoteEscape";
 
 export interface ShellState {
   appInfo: AppInfo | null;
@@ -25,6 +29,8 @@ export interface ShellState {
   sessions: SessionSummary[];
   activeScope: BridgeScope | null;
   activeSessionId: string | null;
+  localInspection: LocalInspectResult | null;
+  diagnosticsReport: SanitizedDiagnosticsPayload | null;
   workspace: {
     mode: WorkspaceMode;
     activeTab: WorkspaceTab;
@@ -43,6 +49,8 @@ export type ShellAction =
       activeScope: BridgeScope | null;
       activeSessionId: string | null;
     }
+  | { type: "APPLY_LOCAL_INSPECTION"; inspection: LocalInspectResult }
+  | { type: "APPLY_DIAGNOSTICS_REPORT"; report: SanitizedDiagnosticsPayload }
   | { type: "OPEN_SURFACE"; surface: OverlaySurface }
   | { type: "CLOSE_TOPMOST_SURFACE" }
   | { type: "CLOSE_SURFACE"; surface: OverlaySurface }
@@ -63,6 +71,8 @@ export function createInitialShellState(): ShellState {
     sessions: [],
     activeScope: null,
     activeSessionId: null,
+    localInspection: null,
+    diagnosticsReport: null,
     workspace: {
       mode: "closed",
       activeTab: "artifacts",
@@ -92,6 +102,16 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         sessions: action.sessions,
         activeScope: action.activeScope,
         activeSessionId: action.activeSessionId,
+      };
+    case "APPLY_LOCAL_INSPECTION":
+      return {
+        ...state,
+        localInspection: action.inspection,
+      };
+    case "APPLY_DIAGNOSTICS_REPORT":
+      return {
+        ...state,
+        diagnosticsReport: action.report,
       };
     case "OPEN_SURFACE": {
       const filtered = state.surfaceStack.filter((item) => item !== action.surface);

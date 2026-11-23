@@ -34,6 +34,18 @@ const SENSITIVE_KEYS = new Set([
   "ws_url",
   "rawurl",
   "stack",
+  "stderr",
+  "rawstderr",
+  "raw_stderr",
+  "clipath",
+  "cli_path",
+  "path",
+  "homedir",
+  "home_dir",
+  "username",
+  "cookiejar",
+  "keypath",
+  "key_path",
 ]);
 
 const ERROR_CATALOG: Record<ErrorCode, { message: string; retryable: boolean }> = {
@@ -164,12 +176,22 @@ export function redactString(input: string): string {
   let out = input;
   // Remove PEM private keys
   out = out.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, "[REDACTED_KEY]");
-  // Redact ws(s):// and http(s):// URLs (especially userinfo, query, fragment)
+  // Redact SSH public/private key material
+  out = out.replace(/\b(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp\d+)\s*[A-Za-z0-9+/=_-]+/gi, "[REDACTED_KEY]");
+  // Redact ws(s):// and http(s):// URLs (userinfo, query, fragment)
   out = out.replace(/\b(?:wss?|https?):\/\/[^\s"'`<>]+/gi, "[REDACTED_URL]");
   // Redact bearer/token strings
   out = out.replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]");
-  // Redact Unix/macOS home or absolute paths
-  out = out.replace(/\/(?:Users|home|var|tmp|private|etc)\/[^\s"'`:)]+/g, "[REDACTED_PATH]");
+  // Redact key=value secret assignments (token, ticket, cookie, passphrase, password, secret, key)
+  out = out.replace(
+    /\b(token|access_token|refresh_token|ticket|cookies?|passphrase|password|secret|key)\s*[:=]\s*[^\s,;]+/gi,
+    "$1=[REDACTED]",
+  );
+  // Redact raw stderr prefixes/lines
+  out = out.replace(/\b(?:raw_?stderr|stderr)\s*:\s*[^\n]+/gi, "[REDACTED_STDERR]");
+  // Redact Unix/macOS home, tilde, or absolute paths
+  out = out.replace(/\/(?:Users|home|var|tmp|private|etc|opt|usr|Library|Applications)\/[^\s"'`:)]+/g, "[REDACTED_PATH]");
+  out = out.replace(/~\/[^\s"'`:)]+/g, "[REDACTED_PATH]");
   // Redact stack trace lines
   out = out.replace(/\n\s*at\s+.+/g, "");
   return out;
