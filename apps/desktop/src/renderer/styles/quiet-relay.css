@@ -2061,3 +2061,264 @@ button {
   user-select: none;
 }
 
+/* Ticket #42: ExternalAttribution badges, ExtensionInventoryView, and Approval cards */
+.attribution-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.attribution-badge.is-builtin {
+  background: var(--surface);
+  color: var(--ink);
+  border-color: var(--control-line);
+}
+
+.attribution-badge.is-external {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-color: var(--accent-text);
+}
+
+.attribution-badge.is-unknown {
+  background: var(--paper-deep);
+  color: var(--ink);
+  border-color: var(--line-strong);
+}
+
+.ext-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ext-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+
+.ext-tab-btn {
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.ext-tab-btn.is-active {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+  font-weight: 600;
+}
+
+.ext-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ext-top-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--paper-raised);
+}
+
+.ext-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ext-panel-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.ext-intro-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ext-intro-lines p,
+.ext-scope-note,
+.ext-card-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.ext-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ext-cli-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ext-cli-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.ext-cli-code {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink);
+  word-break: break-all;
+}
+
+.ext-cli-note {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ext-card-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ext-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+}
+
+.ext-card-header,
+.ext-card-title-wrap,
+.ext-card-badges,
+.ext-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.ext-card-header {
+  justify-content: space-between;
+}
+
+.ext-card-meta {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+}
+
+.ext-error-code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent-text);
+  margin: 0;
+}
+
+.ext-state-box {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--paper-raised);
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.ext-state-box p {
+  margin: 0;
+  color: var(--ink-soft);
+}
+
+.approval-cards-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--paper-raised);
+}
+
+.approval-cards-heading {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.approval-cards-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.approval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+}
+
+.approval-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.approval-card-summary {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+

@@ -6,6 +6,7 @@ import type {
   CapabilitySnapshot,
 } from "@hermes/contracts";
 import { getCopy, type CopyKey } from "@hermes/domain";
+import { AttributionBadge } from "./AttributionBadge";
 import { FocusDialog } from "./Modal";
 import {
   getCapabilityStatusCopyKey,
@@ -16,6 +17,7 @@ interface CapabilitiesDrawerProps {
   open: boolean;
   snapshot: CapabilitySnapshot;
   handlers: Record<string, CapabilityActionHandler>;
+  onOpenExtensions: () => void;
   onClose: () => void;
 }
 
@@ -44,6 +46,7 @@ export function CapabilitiesDrawer({
   open,
   snapshot,
   handlers,
+  onOpenExtensions,
   onClose,
 }: CapabilitiesDrawerProps) {
   const entriesByDomain = useMemo(() => {
@@ -79,10 +82,20 @@ export function CapabilitiesDrawer({
       onClose={onClose}
     >
       <div className="cap-summary-strip" data-testid="capabilities-counts-summary">
-        <span className="cap-counts-line">{countsLine}</span>
-        <span className="cap-key-meta">
-          {snapshot.key.connectionId} · {snapshot.key.profileId} · gen {snapshot.generation}
-        </span>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <span className="cap-counts-line">{countsLine}</span>
+          <span className="cap-key-meta">
+            {snapshot.key.connectionId} · {snapshot.key.profileId} · gen {snapshot.generation}
+          </span>
+        </div>
+        <button
+          type="button"
+          className="button button-secondary cap-action-btn"
+          data-testid="capabilities-open-extensions-drawer"
+          onClick={onOpenExtensions}
+        >
+          {getCopy("extensions.openDrawerAction")}
+        </button>
       </div>
 
       {snapshot.legacyOwner && (
@@ -128,6 +141,7 @@ export function CapabilitiesDrawer({
                         <div className="cap-domain-title-wrap">
                           <strong>{getCopy(domain.labelKey as CopyKey)}</strong>
                           <span className="cap-class-tag">{classLabel}</span>
+                          <AttributionBadge attribution={domain.attribution} />
                         </div>
                         <span className={`cap-status-badge is-${domain.runtimeStatus}`}>
                           {statusLabel}

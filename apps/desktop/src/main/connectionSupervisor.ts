@@ -48,6 +48,8 @@ import {
   isProfileLinkException,
   reduceTranscriptEvent,
   resolveExplicitMethodAlias,
+  resolveExternalAttribution,
+  resolveMethodWithAlias,
   toSupportedChatActions,
   validateRemoteEndpointUrl,
   type ClassifiedRuntimeCapabilities,
@@ -271,6 +273,26 @@ function mapRawMessage(raw: Record<string, unknown>, sessionId: string): Transcr
               : "completed",
           summary: typeof row.summary === "string" ? row.summary : undefined,
           durationMs: typeof row.duration_ms === "number" ? row.duration_ms : undefined,
+          attribution: resolveExternalAttribution({
+            origin: typeof row.origin === "string" ? row.origin : undefined,
+            source: typeof row.source === "string" ? row.source : undefined,
+            mcpServer:
+              typeof (row.mcp_server ?? row.mcpServer ?? row.server) === "string"
+                ? String(row.mcp_server ?? row.mcpServer ?? row.server)
+                : undefined,
+            pluginName:
+              typeof (row.plugin ?? row.pluginName) === "string"
+                ? String(row.plugin ?? row.pluginName)
+                : undefined,
+            skillName:
+              typeof (row.skill ?? row.skillName) === "string"
+                ? String(row.skill ?? row.skillName)
+                : undefined,
+            toolset:
+              typeof (row.external_provider ?? row.toolset) === "string"
+                ? String(row.external_provider ?? row.toolset)
+                : undefined,
+          }),
         }))
       : undefined;
   return {
@@ -386,6 +408,7 @@ export class ConnectionSupervisor {
       this.syncRegistryEntries(initialSnap);
       this.syncHealthPlaceholdersFromRegistry(initialSnap);
       this.unsubRegistry = this.registryStore.subscribe((ev) => {
+        this.invalidateCapabilitiesOnRegistryDiff(ev.diff);
         this.syncRegistryEntries(ev.snapshot);
         this.syncHealthPlaceholdersFromRegistry(ev.snapshot);
       });
@@ -733,6 +756,26 @@ export class ConnectionSupervisor {
     }
   }
 
+  private invalidateCapabilitiesOnRegistryDiff(diff?: RegistryDiff): void {
+    if (this.disposed || !diff) return;
+    let shouldInvalidateCapabilities = false;
+    const activeCapConnectionId = this.capabilityRegistry.getSnapshot().key.connectionId;
+    for (const change of diff.changes) {
+      if (change.kind === "connection_removed") {
+        if (change.connectionId === activeCapConnectionId) {
+          shouldInvalidateCapabilities = true;
+        }
+      } else if (change.kind === "connection_updated" && change.dialMaterialChanged) {
+        if (change.connectionId === activeCapConnectionId) {
+          shouldInvalidateCapabilities = true;
+        }
+      }
+    }
+    if (shouldInvalidateCapabilities || diff.credentialsChanged) {
+      this.capabilityRegistry.invalidate({ reason: "registry_changed" });
+      this.emitCapabilities();
+    }
+  }
   getFleetSnapshot(): FleetSnapshot {
     const allSessions: SessionSummary[] = [];
     for (const list of this.sessionsByScope.values()) {
@@ -1089,6 +1132,7 @@ export class ConnectionSupervisor {
   }
 
   async handleRegistrySnapshot(snapshot: RegistrySnapshotView, diff?: RegistryDiff): Promise<void> {
+    this.invalidateCapabilitiesOnRegistryDiff(diff);
     this.syncRegistryEntries(snapshot);
     this.syncHealthPlaceholdersFromRegistry(snapshot);
     if (diff) {
@@ -3200,7 +3244,7 @@ export class ConnectionSupervisor {
     entry: GatewayTransportEntry,
     profileId: string,
     domain: CapabilityDomainId,
-    options?: { force?: boolean },
+    options?: { force?: boolean; action?: "reload" },
   ): Promise<void> {
     if (this.disposed || entry.disposed) return;
     const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === domain);
@@ -3210,7 +3254,12 @@ export class ConnectionSupervisor {
 
     const currentSnap = this.capabilityRegistry.getSnapshot();
     const existingDom = currentSnap.domains.find((d) => d.domain === domain);
-    if (existingDom?.probed && !options?.force) {
+    if (existingDom?.probed && !options?.force && !options?.action) {
+      return;
+    }
+
+    if (domain === "plugins" || domain === "skills" || domain === "tools" || domain === "mcp") {
+      await this.probeExtensionDomain(entry, profileId, domain, options);
       return;
     }
 
@@ -3291,6 +3340,346 @@ export class ConnectionSupervisor {
           expectedAuthorityEpoch: entry.authorityEpoch,
           expectedGeneration: startGeneration,
         });
+      }
+    }
+  }
+
+  private async probeExtensionDomain(
+    entry: GatewayTransportEntry,
+    profileId: string,
+    domain: "plugins" | "skills" | "tools" | "mcp",
+    options?: { force?: boolean; action?: "reload" },
+  ): Promise<void> {
+    const currentSnap = this.capabilityRegistry.getSnapshot();
+    const startGeneration = currentSnap.generation;
+    const baseKey = {
+      expectedOwnerGeneration: entry.ownerGeneration,
+      expectedAuthorityEpoch: entry.authorityEpoch,
+      expectedGeneration: startGeneration,
+    };
+
+    if (domain === "plugins") {
+      if (this.capabilityRegistry.isMethodRefused("plugins.list")) {
+        this.capabilityRegistry.applyPluginsInventory({ ...baseKey, outcome: "refused" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "plugins",
+          method: "plugins.list",
+          outcome: "refused",
+        });
+        return;
+      }
+      if (this.capabilityRegistry.getMethodTier("plugins.list") === "older") {
+        this.capabilityRegistry.applyPluginsInventory({ ...baseKey, outcome: "older" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "plugins",
+          method: "plugins.list",
+          outcome: "ok",
+        });
+        return;
+      }
+
+      try {
+        const res = await entry.client.call<unknown>(
+          "plugins.list",
+          { profile_id: profileId },
+          { timeoutMs: this.probeTimeoutMs },
+        );
+        const rawPlugins = Array.isArray(res)
+          ? res
+          : res && typeof res === "object" && Array.isArray((res as Record<string, unknown>).plugins)
+            ? (res as Record<string, unknown>).plugins
+            : null;
+        if (rawPlugins === null) {
+          this.capabilityRegistry.applyPluginsInventory({
+            ...baseKey,
+            outcome: "error",
+            errorCode: "INVALID_PAYLOAD",
+          });
+          return;
+        }
+        this.capabilityRegistry.applyPluginsInventory({
+          ...baseKey,
+          outcome: "ok",
+          rawPlugins,
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "plugins",
+          method: "plugins.list",
+          outcome: "ok",
+        });
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          this.capabilityRegistry.applyPluginsInventory({
+            ...baseKey,
+            outcome: "method_not_found",
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "plugins",
+            method: "plugins.list",
+            outcome: "method_not_found",
+          });
+        } else {
+          const code =
+            err instanceof GatewayTransportError && err.code === "timeout"
+              ? "RPC_TIMEOUT"
+              : "PLUGINS_FETCH_FAILED";
+          this.capabilityRegistry.applyPluginsInventory({
+            ...baseKey,
+            outcome: "error",
+            errorCode: code,
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "plugins",
+            method: "plugins.list",
+            outcome: "timeout",
+          });
+        }
+      }
+      return;
+    }
+
+    if (domain === "skills") {
+      if (this.capabilityRegistry.isMethodRefused("skills.list")) {
+        this.capabilityRegistry.applySkillsInventory({ ...baseKey, outcome: "refused" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "skills",
+          method: "skills.list",
+          outcome: "refused",
+        });
+        return;
+      }
+
+      let reloaded = false;
+      if (options?.action === "reload") {
+        const reloadRes = resolveMethodWithAlias("reload.skills", currentSnap.methodTiers);
+        if (reloadRes.tier === "served") {
+          try {
+            await entry.client.call(
+              reloadRes.method,
+              { profile_id: profileId },
+              { timeoutMs: this.probeTimeoutMs },
+            );
+            reloaded = true;
+          } catch (err) {
+            if (isJsonRpcMethodNotFound(err)) {
+              this.capabilityRegistry.markMethodNotFound({
+                method: reloadRes.method,
+                expectedOwnerGeneration: entry.ownerGeneration,
+                expectedAuthorityEpoch: entry.authorityEpoch,
+              });
+            }
+          }
+        }
+      }
+
+      try {
+        const res = await entry.client.call<unknown>(
+          "skills.list",
+          { profile_id: profileId },
+          { timeoutMs: this.probeTimeoutMs },
+        );
+        const rawSkills = Array.isArray(res)
+          ? res
+          : res && typeof res === "object" && Array.isArray((res as Record<string, unknown>).skills)
+            ? (res as Record<string, unknown>).skills
+            : [];
+        this.capabilityRegistry.applySkillsInventory({
+          ...baseKey,
+          outcome: "ok",
+          rawSkills,
+          reloaded,
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "skills",
+          method: "skills.list",
+          outcome: "ok",
+        });
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          this.capabilityRegistry.applySkillsInventory({
+            ...baseKey,
+            outcome: "method_not_found",
+            reloaded,
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "skills",
+            method: "skills.list",
+            outcome: "method_not_found",
+          });
+        } else {
+          this.capabilityRegistry.applySkillsInventory({
+            ...baseKey,
+            outcome: "error",
+            errorCode: "SKILLS_FETCH_FAILED",
+            reloaded,
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "skills",
+            method: "skills.list",
+            outcome: "timeout",
+          });
+        }
+      }
+      return;
+    }
+
+    if (domain === "tools") {
+      if (this.capabilityRegistry.isMethodRefused("tools.show")) {
+        this.capabilityRegistry.applyToolsInventory({ ...baseKey, outcome: "refused" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "tools",
+          method: "tools.show",
+          outcome: "refused",
+        });
+        return;
+      }
+
+      try {
+        const res = await entry.client.call<unknown>(
+          "tools.show",
+          { profile_id: profileId },
+          { timeoutMs: this.probeTimeoutMs },
+        );
+        const rawTools = Array.isArray(res)
+          ? res
+          : res && typeof res === "object" && Array.isArray((res as Record<string, unknown>).tools)
+            ? (res as Record<string, unknown>).tools
+            : [];
+        this.capabilityRegistry.applyToolsInventory({
+          ...baseKey,
+          outcome: "ok",
+          rawTools,
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "tools",
+          method: "tools.show",
+          outcome: "ok",
+        });
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          this.capabilityRegistry.applyToolsInventory({
+            ...baseKey,
+            outcome: "method_not_found",
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "tools",
+            method: "tools.show",
+            outcome: "method_not_found",
+          });
+        } else {
+          this.capabilityRegistry.applyToolsInventory({
+            ...baseKey,
+            outcome: "error",
+            errorCode: "TOOLS_FETCH_FAILED",
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "tools",
+            method: "tools.show",
+            outcome: "timeout",
+          });
+        }
+      }
+      return;
+    }
+
+    if (domain === "mcp") {
+      if (this.capabilityRegistry.isMethodRefused("mcp.list")) {
+        this.capabilityRegistry.applyMcpInventory({ ...baseKey, outcome: "refused" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "mcp",
+          method: "mcp.list",
+          outcome: "refused",
+        });
+        return;
+      }
+
+      let reloaded = false;
+      if (options?.action === "reload") {
+        const reloadRes = resolveMethodWithAlias("reload.mcp", currentSnap.methodTiers);
+        if (reloadRes.tier === "served") {
+          try {
+            await entry.client.call(
+              reloadRes.method,
+              { profile_id: profileId },
+              { timeoutMs: this.probeTimeoutMs },
+            );
+            reloaded = true;
+          } catch (err) {
+            if (isJsonRpcMethodNotFound(err)) {
+              this.capabilityRegistry.markMethodNotFound({
+                method: reloadRes.method,
+                expectedOwnerGeneration: entry.ownerGeneration,
+                expectedAuthorityEpoch: entry.authorityEpoch,
+              });
+            }
+          }
+        }
+      }
+
+      try {
+        const res = await entry.client.call<unknown>(
+          "mcp.list",
+          { profile_id: profileId },
+          { timeoutMs: this.probeTimeoutMs },
+        );
+        const rawServers = Array.isArray(res)
+          ? res
+          : res && typeof res === "object" && Array.isArray((res as Record<string, unknown>).servers)
+            ? (res as Record<string, unknown>).servers
+            : [];
+        this.capabilityRegistry.applyMcpInventory({
+          ...baseKey,
+          outcome: "ok",
+          rawServers,
+          reloaded,
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "mcp",
+          method: "mcp.list",
+          outcome: "ok",
+        });
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          this.capabilityRegistry.applyMcpInventory({
+            ...baseKey,
+            outcome: "method_not_found",
+            reloaded,
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "mcp",
+            method: "mcp.list",
+            outcome: "method_not_found",
+          });
+        } else {
+          this.capabilityRegistry.applyMcpInventory({
+            ...baseKey,
+            outcome: "error",
+            errorCode: "MCP_FETCH_FAILED",
+            reloaded,
+          });
+          this.capabilityRegistry.applyProbeOutcome({
+            ...baseKey,
+            domain: "mcp",
+            method: "mcp.list",
+            outcome: "timeout",
+          });
+        }
       }
     }
   }
@@ -3425,12 +3814,27 @@ export class ConnectionSupervisor {
       const rawTool = (
         params.tool_row && typeof params.tool_row === "object" ? params.tool_row : params
       ) as Record<string, unknown>;
+      const toolName = asString(rawTool.name ?? rawTool.tool, "tool");
+      const knownTool = this.capabilityRegistry
+        .getSnapshot()
+        .extensions.tools.items.find((item) => item.name === toolName);
+      const hasExplicitAttributionField =
+        rawTool.origin !== undefined ||
+        rawTool.source !== undefined ||
+        rawTool.mcp_server !== undefined ||
+        rawTool.mcpServer !== undefined ||
+        rawTool.server !== undefined ||
+        rawTool.plugin !== undefined ||
+        rawTool.pluginName !== undefined ||
+        rawTool.skill !== undefined ||
+        rawTool.skillName !== undefined ||
+        rawTool.external_provider !== undefined;
       const toolRow: ToolExecutionRow = {
         toolCallId: asString(
           rawTool.tool_call_id ?? rawTool.toolCallId ?? rawTool.id,
           `tc-${Date.now()}`,
         ),
-        name: asString(rawTool.name ?? rawTool.tool, "tool"),
+        name: toolName,
         status:
           rawTool.status === "completed" ||
           rawTool.status === "failed" ||
@@ -3439,6 +3843,28 @@ export class ConnectionSupervisor {
             : "running",
         summary: typeof rawTool.summary === "string" ? rawTool.summary : undefined,
         durationMs: typeof rawTool.duration_ms === "number" ? rawTool.duration_ms : undefined,
+        attribution: hasExplicitAttributionField
+          ? resolveExternalAttribution({
+              origin: typeof rawTool.origin === "string" ? rawTool.origin : undefined,
+              source: typeof rawTool.source === "string" ? rawTool.source : undefined,
+              mcpServer:
+                typeof (rawTool.mcp_server ?? rawTool.mcpServer ?? rawTool.server) === "string"
+                  ? String(rawTool.mcp_server ?? rawTool.mcpServer ?? rawTool.server)
+                  : undefined,
+              pluginName:
+                typeof (rawTool.plugin ?? rawTool.pluginName) === "string"
+                  ? String(rawTool.plugin ?? rawTool.pluginName)
+                  : undefined,
+              skillName:
+                typeof (rawTool.skill ?? rawTool.skillName) === "string"
+                  ? String(rawTool.skill ?? rawTool.skillName)
+                  : undefined,
+              toolset:
+                typeof (rawTool.external_provider ?? rawTool.toolset) === "string"
+                  ? String(rawTool.external_provider ?? rawTool.toolset)
+                  : undefined,
+            })
+          : knownTool?.attribution ?? resolveExternalAttribution({}),
       };
       const turnId = asString(params.turn_id ?? params.turnId) || undefined;
       const messageId = asString(params.message_id ?? params.messageId) || undefined;
@@ -3796,6 +4222,7 @@ export class ConnectionSupervisor {
       }
       const domain =
         typeof payload.domain === "string" ? (payload.domain as CapabilityDomainId) : undefined;
+      const action = payload.action === "reload" ? "reload" : undefined;
       if (domain) {
         const connectionId = this.resolveTargetConnectionId(payload, scope);
         const profileId = this.resolveTargetProfile(payload, scope, connectionId);
@@ -3803,6 +4230,7 @@ export class ConnectionSupervisor {
         if (entry) {
           await this.probeDomain(entry, profileId, domain, {
             force: payload.refresh === true,
+            action,
           });
           this.emitCapabilities();
         }

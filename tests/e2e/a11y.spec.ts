@@ -341,4 +341,189 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await drawer.getByRole("tab", { name: "Terminal" }).click();
     await checkAxe("workspace terminal tab");
   });
+
+  test("passes axe-core serious/critical = 0 on Extensions drawer, Settings Plugins section, and transcript attribution/approval cards", async ({
+    page,
+  }) => {
+    const checkAxe = async (label: string) => {
+      const results = await new AxeBuilder({ page }).analyze();
+      const severe = results.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(severe, `axe serious/critical violations on ${label}`).toEqual([]);
+    };
+
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y-42",
+              title: "Extensions A11y Session",
+              preview: "Checking a11y",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-a11y-42" },
+          activeSessionId: "sess-a11y-42",
+        },
+        transcripts: {
+          "local::default::sess-a11y-42": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-a11y-42",
+            messages: [
+              {
+                messageId: "m-a11y-1",
+                sessionId: "sess-a11y-42",
+                role: "assistant",
+                text: "Testing attribution accessibility.",
+                createdAt: "2026-11-23T08:00:00.000Z",
+                toolRows: [
+                  {
+                    toolCallId: "tc-a11y-ext",
+                    name: "mcp_read",
+                    status: "completed",
+                    attribution: {
+                      origin: "external",
+                      provider: { kind: "mcp", id: "filesystem", label: "MCP · filesystem" },
+                      sourceLabel: "外部提供 · MCP · filesystem",
+                      accessibleLabel: "外部提供 · MCP · filesystem",
+                    },
+                  },
+                  {
+                    toolCallId: "tc-a11y-unk",
+                    name: "unknown_tool",
+                    status: "completed",
+                  },
+                ],
+              },
+            ],
+            pendingApprovals: [
+              {
+                approvalId: "appr-a11y-1",
+                sessionId: "sess-a11y-42",
+                toolName: "git_commit_external",
+                summary: "Approval attribution a11y check",
+                status: "pending",
+                requestedAt: "2026-11-23T08:00:01.000Z",
+                attribution: {
+                  origin: "external",
+                  provider: { kind: "plugin", id: "git-helper", label: "Plugin · git-helper" },
+                  sourceLabel: "外部提供 · Plugin · git-helper",
+                  accessibleLabel: "外部提供 · Plugin · git-helper",
+                },
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        capabilities: {
+          servedMethods: [
+            "prompt.submit",
+            "prompt.cancel",
+            "session.list",
+            "session.create",
+            "session.resume",
+            "plugins.list",
+            "skills.list",
+            "reload.skills",
+            "tools.show",
+            "mcp.list",
+            "reload.mcp",
+          ],
+          capabilityTags: ["plugin-rpc-v1"],
+          plugins: {
+            outcome: "ok",
+            items: [
+              {
+                name: "git-helper",
+                version: "1.4.2",
+                enabled: true,
+                status: "loaded",
+                tool_count: 2,
+                hook_count: 1,
+                command_count: 3,
+              },
+            ],
+          },
+          skills: {
+            outcome: "ok",
+            items: [{ id: "git-review", name: "git-review", source: "plugin", plugin_name: "git-helper" }],
+          },
+          tools: {
+            outcome: "ok",
+            items: [{ id: "fs-read", name: "read_file", toolset: "filesystem", origin: "builtin" }],
+          },
+          mcp: {
+            outcome: "ok",
+            items: [{ id: "filesystem", name: "filesystem", status: "connected", tool_count: 4 }],
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await expect(page.getByTestId("pending-approvals-section")).toBeVisible();
+    await checkAxe("transcript with tool attribution and pending approvals");
+
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    await page.getByTestId("capabilities-open-extensions-drawer").click();
+    const extDrawer = page.getByRole("dialog", { name: "扩展清单（只读）" });
+    await expect(extDrawer).toBeVisible();
+    await checkAxe("extensions drawer plugins tab");
+
+    await extDrawer.getByTestId("ext-drawer-tab-skills").click();
+    await checkAxe("extensions drawer skills tab");
+
+    await extDrawer.getByTestId("ext-drawer-tab-tools").click();
+    await checkAxe("extensions drawer tools tab");
+
+    await extDrawer.getByTestId("ext-drawer-tab-mcp").click();
+    await checkAxe("extensions drawer mcp tab");
+
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Control+,");
+    await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    await checkAxe("settings modal with plugins inventory");
+  });
 });

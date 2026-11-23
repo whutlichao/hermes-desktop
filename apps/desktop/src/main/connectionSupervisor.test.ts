@@ -1762,4 +1762,292 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   });
+
+  it("lazily fetches read-only Plugins/Skills/Tools/MCP inventories on demand, supports native Skills/MCP reload, enforces field whitelist, attaches ExternalAttribution to tool rows, and invalidates on resync/scope change (EXT-INV-01..05, EXT-ATTR-01..03, EXT-GUARD-01..02)", async () => {
+    const sandbox = createTestSandbox("hermes-supervisor-ext-");
+    let passed = false;
+    const validTickets = new Set<string>();
+    let pluginsMode: "available" | "empty" | "not_found" | "error" = "available";
+    let skillsReloadCount = 0;
+    let mcpReloadCount = 0;
+    let latestSendNotification: ((method: string, params: Record<string, unknown>) => void) | null = null;
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        { profile_id: "default", display_name: "Default", is_default: true },
+        { profile_id: "work", display_name: "Work", is_default: false },
+      ],
+      initialSessions: [
+        {
+          session_id: "sess_ext_1",
+          profile_id: "default",
+          title: "Extension session",
+          updated_at: "2026-11-23T09:00:00.000Z",
+        },
+      ],
+      onRpc: (method, _params, ctx) => {
+        latestSendNotification = ctx.sendNotification;
+        if (method === "runtime.describe") {
+          ctx.replyResult({
+            version: "2026.11.1",
+            code_sha: "sha_ext_1",
+            authority_epoch: 1,
+            capabilities: ["session-authority-v1", "chat-v1", "plugin-rpc-v1"],
+            served_methods: [
+              "prompt.submit",
+              "session.list",
+              "session.resume",
+              "profiles.list",
+              "plugins.list",
+              "skills.list",
+              "reload.skills",
+              "tools.show",
+              "mcp.list",
+              "reload.mcp",
+            ],
+            older_methods: ["skills.install", "tools.configure"],
+          });
+          return true;
+        }
+        if (method === "plugins.list") {
+          if (pluginsMode === "empty") {
+            ctx.replyResult({ plugins: [] });
+            return true;
+          }
+          if (pluginsMode === "not_found") {
+            ctx.replyError(-32601, "Method not found");
+            return true;
+          }
+          if (pluginsMode === "error") {
+            ctx.replyError(-32000, "Internal plugin failure");
+            return true;
+          }
+          ctx.replyResult({
+            plugins: [
+              {
+                name: "repo-guardian",
+                key: "repo-guardian",
+                version: "1.0.4",
+                enabled: true,
+                tools: ["rg_scan", "rg_report"],
+                hooks: ["pre_commit"],
+                commands: ["/guardian"],
+                install_dir: "/Users/alice/.hermes/plugins/repo-guardian",
+                settings_schema: { token: { type: "string" } },
+                servers: ["internal-mcp"],
+              },
+              {
+                name: "broken-plugin",
+                key: "broken-plugin",
+                enabled: false,
+                error: "EACCES: /Users/alice/.hermes/plugins/broken token=sk-secret999999",
+                install_dir: "/Users/alice/.hermes/plugins/broken",
+              },
+            ],
+          });
+          return true;
+        }
+        if (method === "reload.skills") {
+          skillsReloadCount += 1;
+          ctx.replyResult({ ok: true });
+          return true;
+        }
+        if (method === "skills.list") {
+          ctx.replyResult({
+            skills: [
+              { id: "sk_1", name: "bundled-summarizer", source: "bundled", enabled: true },
+              { id: "sk_2", name: "hub-reviewer", source: "hub", enabled: true },
+              { id: "sk_3", name: "mystery-skill", enabled: true },
+            ],
+          });
+          return true;
+        }
+        if (method === "tools.show") {
+          ctx.replyResult({
+            tools: [
+              { name: "shell_exec", source: "bundled", toolset: "core" },
+              { name: "fs_read", mcp_server: "filesystem" },
+            ],
+          });
+          return true;
+        }
+        if (method === "reload.mcp") {
+          mcpReloadCount += 1;
+          ctx.replyResult({ ok: true });
+          return true;
+        }
+        if (method === "mcp.list") {
+          ctx.replyResult({
+            servers: [
+              { name: "filesystem", status: "connected", tools: ["fs_read", "fs_write"] },
+            ],
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      const backend = new LocalBackendManager(ports);
+      const supervisor = new LocalConnectionSupervisor(backend);
+      await supervisor.connectLocal("default", { activate: true });
+
+      // Wait for core probes only — extension methods must NOT be polled or called on connect!
+      await supervisor.handlers["capabilities.describe"]({}, { connectionId: "local", profileId: "default" });
+      const initialMethods = gw.rpcCalls.map((c) => c.method);
+      expect(initialMethods).not.toContain("plugins.list");
+      expect(initialMethods).not.toContain("skills.list");
+      expect(initialMethods).not.toContain("tools.show");
+      expect(initialMethods).not.toContain("mcp.list");
+      expect(initialMethods.some((m) => m.startsWith("plugin."))).toBe(false);
+
+      // 1. Open Plugins drawer -> calls capabilities.describe({ domain: "plugins" })
+      const snapPlugins = (await supervisor.handlers["capabilities.describe"](
+        { domain: "plugins" },
+        { connectionId: "local", profileId: "default" },
+      )) as import("@hermes/contracts").CapabilitySnapshot;
+
+      expect(snapPlugins.extensions.status).toBe("available");
+      expect(snapPlugins.extensions.pluginRpcAdvertised).toBe(true);
+      expect(snapPlugins.extensions.plugins.map((p) => p.name)).toEqual([
+        "broken-plugin",
+        "repo-guardian",
+      ]);
+      expect(snapPlugins.extensions.plugins[0]?.loadStatus).toBe("failed");
+      expect(snapPlugins.extensions.plugins[0]?.errorCode).toBe("PLUGIN_LOAD_FAILED");
+      expect(JSON.stringify(snapPlugins.extensions.plugins)).not.toContain("/Users/alice");
+      expect(JSON.stringify(snapPlugins.extensions.plugins)).not.toContain("sk-secret999999");
+      expect(JSON.stringify(snapPlugins.extensions.plugins)).not.toContain("rg_scan");
+
+      // Empty state on manual refresh
+      pluginsMode = "empty";
+      const snapEmpty = (await supervisor.handlers["capabilities.describe"](
+        { domain: "plugins", refresh: true },
+        { connectionId: "local", profileId: "default" },
+      )) as import("@hermes/contracts").CapabilitySnapshot;
+      expect(snapEmpty.extensions.status).toBe("empty");
+
+      // Error state on manual refresh
+      pluginsMode = "error";
+      const snapError = (await supervisor.handlers["capabilities.describe"](
+        { domain: "plugins", refresh: true },
+        { connectionId: "local", profileId: "default" },
+      )) as import("@hermes/contracts").CapabilitySnapshot;
+      expect(snapError.extensions.status).toBe("error");
+
+      // -32601 unsupported state on manual refresh
+      pluginsMode = "not_found";
+      const snapUnsupported = (await supervisor.handlers["capabilities.describe"](
+        { domain: "plugins", refresh: true },
+        { connectionId: "local", profileId: "default" },
+      )) as import("@hermes/contracts").CapabilitySnapshot;
+      expect(snapUnsupported.extensions.status).toBe("unsupported");
+
+      // 2. Skills inventory + native reload.skills
+      const snapSkills = (await supervisor.handlers["capabilities.describe"](
+        { domain: "skills", action: "reload", refresh: true },
+        { connectionId: "local", profileId: "default" },
+      )) as import("@hermes/contracts").CapabilitySnapshot;
+      expect(skillsReloadCount).toBe(1);
+      expect(snapSkills.extensions.skills.status).toBe("available");
+      expect(snapSkills.extensions.skills.reloadSupported).toBe(true);
+      expect(snapSkills.extensions.skills.items.map((s) => s.attribution.origin)).toEqual([
+        "builtin",
+        "external",
+        "unknown",
+      ]);
+
+      // 3. Tools inventory (read-only tools.show, never calls tools.configure)
+      const snapTools = (await supervisor.handlers["capabilities.describe"](
+        { domain: "tools" },
+        { connectionId: "local", profileId: "default" },
+      )) as import("@hermes/contracts").CapabilitySnapshot;
+      expect(snapTools.extensions.tools.status).toBe("available");
+      expect(snapTools.extensions.tools.items).toHaveLength(2);
+      expect(gw.rpcCalls.map((c) => c.method)).not.toContain("tools.configure");
+
+      // 4. MCP inventory + native reload.mcp
+      const snapMcp = (await supervisor.handlers["capabilities.describe"](
+        { domain: "mcp", action: "reload", refresh: true },
+        { connectionId: "local", profileId: "default" },
+      )) as import("@hermes/contracts").CapabilitySnapshot;
+      expect(mcpReloadCount).toBe(1);
+      expect(snapMcp.extensions.mcp.status).toBe("available");
+      expect(snapMcp.extensions.mcp.items[0]?.attribution.sourceLabel).toBe(
+        "外部提供 · MCP · filesystem",
+      );
+
+      // 5. Activity notification resolves ExternalAttribution on ToolExecutionRow
+      await supervisor.handlers["sessions.select"](
+        { sessionId: "sess_ext_1" },
+        { connectionId: "local", profileId: "default" },
+      );
+      let capturedActivityRow: import("@hermes/contracts").ToolExecutionRow | null = null;
+      const unsubActivity = supervisor.subscribe(
+        "activity",
+        { connectionId: "local", profileId: "default", sessionId: "sess_ext_1" },
+        (ev) => {
+          const payload = ev.payload as import("@hermes/contracts").ActivityEventPayload;
+          if (payload?.toolRow) {
+            capturedActivityRow = payload.toolRow;
+          }
+        },
+      );
+      const notifyGateway = latestSendNotification as
+        | ((method: string, params: Record<string, unknown>) => void)
+        | null;
+      notifyGateway?.("activity", {
+        session_id: "sess_ext_1",
+        profile_id: "default",
+        tool_row: {
+          tool_call_id: "tc_mcp_1",
+          name: "fs_read",
+          status: "completed",
+          mcp_server: "filesystem",
+        },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      unsubActivity();
+      const observedActivityRow =
+        capturedActivityRow as import("@hermes/contracts").ToolExecutionRow | null;
+      expect(observedActivityRow?.attribution?.sourceLabel).toBe("外部提供 · MCP · filesystem");
+
+      // 6. Resync notification invalidates cached extension inventories
+      notifyGateway?.("resync_required", { authority_epoch: 2 });
+      await new Promise((r) => setTimeout(r, 30));
+      const afterResync = supervisor.getCapabilitySnapshot();
+      expect(afterResync.extensions.skills.items).toEqual([]);
+      expect(afterResync.extensions.tools.items).toEqual([]);
+      expect(afterResync.extensions.mcp.items).toEqual([]);
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

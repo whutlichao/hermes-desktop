@@ -81,6 +81,10 @@ import { CapabilitiesDrawer } from "./components/CapabilitiesDrawer";
 import { ChatThread } from "./components/ChatThread";
 import { CommandPalette } from "./components/CommandPalette";
 import { DiagnosticsModal } from "./components/DiagnosticsModal";
+import {
+  ExtensionInventoryViewPanel,
+  type ExtensionDomainTab,
+} from "./components/ExtensionInventoryView";
 import { GatewaysSettings } from "./components/GatewaysSettings";
 import { HermesMark } from "./components/HermesMark";
 import { FocusDialog } from "./components/Modal";
@@ -101,6 +105,12 @@ export default function App() {
   const [fleetResyncNonce, setFleetResyncNonce] = useState(0);
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const [configSnapshot, setConfigSnapshot] = useState<GatewayConfigSnapshot | null>(null);
+  const [extensionDrawerDomain, setExtensionDrawerDomain] =
+    useState<ExtensionDomainTab>("plugins");
+  const [settingsExtDomain, setSettingsExtDomain] =
+    useState<ExtensionDomainTab>("plugins");
+  const [extBusyDomain, setExtBusyDomain] = useState<ExtensionDomainTab | null>(null);
+  const attemptedExtFetchRef = useRef<Map<ExtensionDomainTab, string>>(new Map());
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const paletteTriggerRef = useRef<HTMLButtonElement>(null);
@@ -638,9 +648,70 @@ export default function App() {
 
   const isScopePopoverOpen = state.surfaceStack.includes("scopePopover");
   const isSettingsOpen = state.surfaceStack.includes("settings");
+  const isExtensionsOpen = state.surfaceStack.includes("extensions");
   const profileDomainProbed = Boolean(
     state.capabilities.domains.find((d) => d.domain === "profile")?.probed,
   );
+
+  // Lazy-fetch active extension domain ONLY when drawer or Settings is open (zero polling);
+  // clears per-domain attempt tracking once probed so invalidation triggers a fresh fetch.
+  useEffect(() => {
+    const capKey = state.capabilities.key;
+    const keySig = `${capKey.connectionId}::${capKey.profileId}::${capKey.ownerGeneration}::${capKey.authorityEpoch}::${capKey.gatewayVersionOrSha}::${state.capabilities.invalidatedReason ?? ""}`;
+
+    for (const dom of ["plugins", "skills", "tools", "mcp"] as const) {
+      const domProbed = Boolean(state.capabilities.domains.find((d) => d.domain === dom)?.probed);
+      if (domProbed) {
+        attemptedExtFetchRef.current.delete(dom);
+      }
+    }
+
+    if (!state.capabilities.capabilitiesReady || (!isExtensionsOpen && !isSettingsOpen)) {
+      return;
+    }
+
+    const targets: ExtensionDomainTab[] = [];
+    if (isExtensionsOpen) {
+      targets.push(extensionDrawerDomain);
+    }
+    if (isSettingsOpen && !targets.includes(settingsExtDomain)) {
+      targets.push(settingsExtDomain);
+    }
+
+    let active = true;
+    for (const dom of targets) {
+      const domProbed = Boolean(state.capabilities.domains.find((d) => d.domain === dom)?.probed);
+      if (domProbed || attemptedExtFetchRef.current.get(dom) === keySig) {
+        continue;
+      }
+      attemptedExtFetchRef.current.set(dom, keySig);
+      setExtBusyDomain(dom);
+      void host
+        .request<CapabilitySnapshot>("capabilities.describe", { domain: dom }, effectiveScope)
+        .then((res) => {
+          if (active && res.ok) {
+            dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+          }
+        })
+        .finally(() => {
+          setExtBusyDomain((curr) => (curr === dom ? null : curr));
+        });
+    }
+
+    return () => {
+      active = false;
+    };
+  }, [
+    effectiveScope,
+    extensionDrawerDomain,
+    isExtensionsOpen,
+    isSettingsOpen,
+    settingsExtDomain,
+    state.capabilities.capabilitiesReady,
+    state.capabilities.domains,
+    state.capabilities.invalidatedReason,
+    state.capabilities.key,
+  ]);
 
   useEffect(() => {
     if (!isScopePopoverOpen || !hasReadyConnection || profileDomainProbed) return;
@@ -1019,8 +1090,77 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleAppCommand, state.appInfo?.mode, state.surfaceStack.length, state.workspace.mode]);
 
+  const handleRefreshExtensionDomain = useCallback(
+    async (domain: ExtensionDomainTab) => {
+      setExtBusyDomain(domain);
+      dispatch({ type: "ANNOUNCE", message: getCopy("capabilities.probing") });
+      try {
+        const res = await host.request<CapabilitySnapshot>(
+          "capabilities.describe",
+          { domain, refresh: true },
+          effectiveScope,
+        );
+        if (res.ok) {
+          dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+        }
+      } finally {
+        setExtBusyDomain((curr) => (curr === domain ? null : curr));
+      }
+    },
+    [effectiveScope],
+  );
+
+  const handleReloadExtensionDomain = useCallback(
+    async (domain: "skills" | "mcp") => {
+      setExtBusyDomain(domain);
+      try {
+        const res = await host.request<CapabilitySnapshot>(
+          "capabilities.describe",
+          { domain, action: "reload" },
+          effectiveScope,
+        );
+        if (res.ok) {
+          dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy(
+              domain === "skills"
+                ? "extensions.skills.reloadedNotice"
+                : "extensions.mcp.reloadedNotice",
+            ),
+          });
+        }
+      } finally {
+        setExtBusyDomain((curr) => (curr === domain ? null : curr));
+      }
+    },
+    [effectiveScope],
+  );
+
+  const handleCopyExtCli = useCallback((command: string) => {
+    try {
+      void navigator.clipboard?.writeText(command);
+    } catch {
+      // Ignore clipboard rejection in headless contexts
+    }
+    dispatch({
+      type: "ANNOUNCE",
+      message: `${getCopy("extensions.cli.copiedNotice")}: ${command}`,
+    });
+  }, []);
+
+  const handleOpenExtDocs = useCallback((url: string) => {
+    void host.request("links.openExternal", { url });
+  }, []);
+
   const handleProbeDomain = useCallback(
     async (domain: CapabilityDomainId) => {
+      if (domain === "plugins" || domain === "skills" || domain === "tools" || domain === "mcp") {
+        setExtensionDrawerDomain(domain);
+        dispatch({ type: "OPEN_SURFACE", surface: "extensions" });
+        dispatch({ type: "ANNOUNCE", message: getCopy("extensions.title") });
+        return;
+      }
       dispatch({ type: "ANNOUNCE", message: getCopy("capabilities.probing") });
       const res = await host.request<CapabilitySnapshot>(
         "capabilities.describe",
@@ -1743,14 +1883,59 @@ export default function App() {
             </button>
           </div>
         </section>
+
+        <section
+          className="settings-section"
+          data-settings-section="plugins"
+          aria-label={getCopy("settings.section.plugins")}
+        >
+          <h3 className="settings-section-title">{getCopy("settings.section.plugins")}</h3>
+          <ExtensionInventoryViewPanel
+            extensions={state.capabilities.extensions}
+            activeTab={settingsExtDomain}
+            busyDomain={extBusyDomain}
+            testIdPrefix="ext-settings"
+            onSelectTab={setSettingsExtDomain}
+            onRefresh={(dom) => void handleRefreshExtensionDomain(dom)}
+            onReload={(dom) => void handleReloadExtensionDomain(dom)}
+            onCopyCli={handleCopyExtCli}
+            onOpenDocs={handleOpenExtDocs}
+          />
+        </section>
       </FocusDialog>
 
       <CapabilitiesDrawer
         open={state.surfaceStack.includes("capabilities")}
         snapshot={state.capabilities}
         handlers={capabilityHandlers}
+        onOpenExtensions={() => {
+          setExtensionDrawerDomain("plugins");
+          dispatch({ type: "OPEN_SURFACE", surface: "extensions" });
+        }}
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "capabilities" })}
       />
+
+      <FocusDialog
+        open={isExtensionsOpen}
+        title={getCopy("extensions.title")}
+        description={getCopy("extensions.description")}
+        closeLabel={getCopy("extensions.close")}
+        className="capabilities-drawer extensions-drawer"
+        scrimClassName="is-drawer"
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "extensions" })}
+      >
+        <ExtensionInventoryViewPanel
+          extensions={state.capabilities.extensions}
+          activeTab={extensionDrawerDomain}
+          busyDomain={extBusyDomain}
+          testIdPrefix="ext-drawer"
+          onSelectTab={setExtensionDrawerDomain}
+          onRefresh={(dom) => void handleRefreshExtensionDomain(dom)}
+          onReload={(dom) => void handleReloadExtensionDomain(dom)}
+          onCopyCli={handleCopyExtCli}
+          onOpenDocs={handleOpenExtDocs}
+        />
+      </FocusDialog>
 
       <FocusDialog
         open={state.surfaceStack.includes("shortcuts")}

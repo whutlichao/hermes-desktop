@@ -22,6 +22,7 @@ export type OverlaySurface =
   | "palette"
   | "settings"
   | "capabilities"
+  | "extensions"
   | "shortcuts"
   | "sessionsPopover"
   | "scopePopover"

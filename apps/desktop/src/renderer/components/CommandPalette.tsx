@@ -1,6 +1,7 @@
 import { useEffect, useId, useMemo, useState } from "react";
 import type { CapabilityEntry } from "@hermes/contracts";
 import { getCopy, type CopyKey } from "@hermes/domain";
+import { AttributionBadge } from "./AttributionBadge";
 import { FocusDialog } from "./Modal";
 import {
   getCapabilityStatusCopyKey,
@@ -182,6 +183,7 @@ export function CommandPalette({
                 <span className="palette-option-main">
                   <span className="palette-option-title-row">
                     <strong>{label}</strong>
+                    <AttributionBadge attribution={entry.attribution} />
                     <span className={`cap-status-badge is-${entry.runtimeStatus}`}>
                       {statusLabel}
                     </span>
