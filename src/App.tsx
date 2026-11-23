@@ -8,8 +8,18 @@ import { SettingsOverlay } from "./components/Settings";
 import { WorkspaceRail } from "./components/Workspace";
 import { CommandPalette } from "./components/CommandPalette";
 import { GlobalOverlays, ToastView, WindowTitlebar } from "./components/Overlays";
+import { OnboardingPrototype } from "./prototype/onboarding/OnboardingPrototype";
 
 export default function App() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has("variant") || window.location.pathname.includes("/prototype/quiet-relay-onboarding")) {
+    return <OnboardingPrototype />;
+  }
+
+  return <QuietRelayApp />;
+}
+
+function QuietRelayApp() {
   const { state, dispatch } = useApp();
 
   useEffect(() => {
