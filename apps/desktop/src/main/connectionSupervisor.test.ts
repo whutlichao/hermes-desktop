@@ -10,8 +10,10 @@ import type {
   CapabilitySnapshot,
   ChatSessionProjection,
   SafeBackgroundNotification,
+  DraftExportBundle,
   SessionTranscriptSnapshot,
 } from "@hermes/contracts";
+import { makeActiveChatDraftKey, makeNewChatDraftKey } from "@hermes/domain";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
 import { startFakeGatewayServer } from "../../../../tests/helpers/fakeGatewayServer";
 import { ChatSessionStateStore } from "./chatSessionStateStore";
@@ -3203,4 +3205,233 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   }, 15_000);
+
+  it("enforces Ticket #38 Draft receipt clearing, delivery_unknown, no offline queue/flush, atomic session.create migration, and OrphanedDraft lifecycle", async () => {
+    const sandbox = createTestSandbox("hermes-s1-s3-drafts-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_d_1", "tkt_d_2"]);
+    let failSessionCreate = true;
+    let submitMode: "delivery_unknown" | "accepted" | "admitted" = "delivery_unknown";
+    let sessionsList = [
+      { profile_id: "default", session_id: "sess-active", title: "Active Chat" },
+      { profile_id: "default", session_id: "sess-inactive", title: "Inactive Chat" },
+      { profile_id: "ops", session_id: "sess-ops", title: "Ops Chat" },
+    ];
+    let profilesList = [
+      { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+      { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+    ];
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: profilesList,
+      initialSessions: sessionsList,
+      onRpc: (method, params, ctx) => {
+        if (method === "profiles.list") {
+          ctx.replyResult({ profiles: profilesList });
+          return true;
+        }
+        if (method === "session.list" || method === "sessions.list") {
+          const pid = typeof params.profile_id === "string" ? params.profile_id : "default";
+          ctx.replyResult({
+            sessions: sessionsList.filter((s) => s.profile_id === pid),
+          });
+          return true;
+        }
+        if (method === "session.create") {
+          if (failSessionCreate) {
+            ctx.replyError(-32000, "create failed temporarily");
+            return true;
+          }
+          ctx.replyResult({
+            session: {
+              profile_id: params.profile_id,
+              session_id: "sess-migrated-1",
+              title: params.title ?? "New Migrated",
+            },
+          });
+          return true;
+        }
+        if (method === "prompt.submit") {
+          if (submitMode === "delivery_unknown") {
+            ctx.replyResult({ receipt: "delivery_unknown" });
+            return true;
+          }
+          ctx.replyResult({
+            receipt: submitMode,
+            turn_id: `turn-${submitMode}`,
+            user_message_id: `u-${submitMode}`,
+            assistant_message_id: `a-${submitMode}`,
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const backend = new LocalBackendManager(ports);
+      const supervisor = new LocalConnectionSupervisor(backend, { chatSessionStateStore: store });
+
+      // 1) Offline saveDraft works locally, prompts.send rejects without queuing or auto-sending on connect
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: "default",
+          sessionId: "sess-active",
+          text: "offline draft text",
+        },
+        { connectionId: "local", profileId: "default", sessionId: "sess-active" },
+      );
+      await expect(
+        supervisor.handlers["prompts.send"](
+          { sessionId: "sess-active", text: "offline draft text" },
+          { connectionId: "local", profileId: "default", sessionId: "sess-active" },
+        ),
+      ).rejects.toThrow();
+
+      await supervisor.connectLocal("default");
+      // Must NOT auto-send prompt.submit on connect!
+      expect(gw.rpcCalls.filter((c) => c.method === "prompt.submit")).toHaveLength(0);
+      expect(
+        store.getProjection().draftsByKey?.[makeActiveChatDraftKey("local", "default", "sess-active")]?.text,
+      ).toBe("offline draft text");
+
+      // 2) delivery_unknown keeps draft & marks deliveryStatus="delivery_unknown"; accepted clears draft
+      const unknownRes = (await supervisor.handlers["prompts.send"](
+        { sessionId: "sess-active", text: "offline draft text" },
+        { connectionId: "local", profileId: "default", sessionId: "sess-active" },
+      )) as { accepted: boolean; deliveryUnknown?: boolean };
+      expect(unknownRes.accepted).toBe(false);
+      expect(unknownRes.deliveryUnknown).toBe(true);
+      expect(
+        store.getProjection().draftsByKey?.[makeActiveChatDraftKey("local", "default", "sess-active")]
+          ?.deliveryStatus,
+      ).toBe("delivery_unknown");
+
+      submitMode = "admitted";
+      const admittedRes = (await supervisor.handlers["prompts.send"](
+        { sessionId: "sess-active", text: "offline draft text" },
+        { connectionId: "local", profileId: "default", sessionId: "sess-active" },
+      )) as { accepted: boolean; receipt?: string };
+      expect(admittedRes.accepted).toBe(true);
+      expect(admittedRes.receipt).toBe("admitted");
+      expect(
+        store.getProjection().draftsByKey?.[makeActiveChatDraftKey("local", "default", "sess-active")],
+      ).toBeUndefined();
+
+      // 3) New-chat draft migration: failure keeps original draftId, success migrates atomically
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: "default",
+          draftId: "draft-new-abc",
+          text: "new conversation prompt",
+        },
+        { connectionId: "local", profileId: "default" },
+      );
+
+      await expect(
+        supervisor.handlers["sessions.create"](
+          { title: "Will Fail", draftId: "draft-new-abc" },
+          { connectionId: "local", profileId: "default" },
+        ),
+      ).rejects.toThrow();
+      expect(
+        store.getProjection().draftsByKey?.[makeNewChatDraftKey("local", "default", "draft-new-abc")]
+          ?.draftId,
+      ).toBe("draft-new-abc");
+
+      failSessionCreate = false;
+      const created = (await supervisor.handlers["sessions.create"](
+        { title: "Will Succeed", draftId: "draft-new-abc" },
+        { connectionId: "local", profileId: "default" },
+      )) as { session: { sessionId: string } };
+      expect(created.session.sessionId).toBe("sess-migrated-1");
+      expect(
+        store.getProjection().draftsByKey?.[makeNewChatDraftKey("local", "default", "draft-new-abc")],
+      ).toBeUndefined();
+      const migratedDraft =
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", "default", "sess-migrated-1")
+        ];
+      expect(migratedDraft?.draftId).toBe("draft-new-abc");
+      expect(migratedDraft?.text).toBe("new conversation prompt");
+
+      // 4) Non-active session deleted + profile removed create OrphanedDrafts; export & delete work
+      await supervisor.handlers["chatState.saveDraft"](
+        { sessionId: "sess-inactive", text: "inactive unsent" },
+        { connectionId: "local", profileId: "default", sessionId: "sess-inactive" },
+      );
+      await supervisor.handlers["chatState.saveDraft"](
+        { profileId: "ops", sessionId: "sess-ops", text: "ops unsent" },
+        { connectionId: "local", profileId: "ops", sessionId: "sess-ops" },
+      );
+
+      // Remove sess-inactive from gateway session.list and refresh
+      sessionsList = sessionsList.filter((s) => s.session_id !== "sess-inactive");
+      await supervisor.handlers["sessions.list"](
+        { profileId: "default" },
+        { connectionId: "local", profileId: "default" },
+      );
+      expect(
+        store.getProjection().orphanedDrafts?.some(
+          (o) => o.reason === "session_deleted" && o.text === "inactive unsent",
+        ),
+      ).toBe(true);
+
+      // Remove ops profile from gateway profiles.list and refresh
+      profilesList = profilesList.filter((p) => p.profile_id !== "ops");
+      await supervisor.handlers["profiles.list"](
+        { connectionId: "local" },
+        { connectionId: "local" },
+      );
+      const opsOrphan = store
+        .getProjection()
+        .orphanedDrafts?.find((o) => o.reason === "profile_removed" && o.text === "ops unsent");
+      expect(opsOrphan).toBeDefined();
+
+      const exportedOrphan = (await supervisor.handlers["chatState.exportOrphanedDraft"](
+        { orphanedId: opsOrphan!.orphanedId },
+        null,
+      )) as DraftExportBundle | null;
+      expect(exportedOrphan?.text).toBe("ops unsent");
+
+      const afterDeleteOrphan = (await supervisor.handlers["chatState.deleteOrphanedDraft"](
+        { orphanedId: opsOrphan!.orphanedId },
+        null,
+      )) as ChatSessionProjection;
+      expect(
+        afterDeleteOrphan.orphanedDrafts?.some((o) => o.orphanedId === opsOrphan!.orphanedId),
+      ).toBe(false);
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

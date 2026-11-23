@@ -20,6 +20,11 @@ import {
   type CapabilitySnapshot,
   type ChatSessionProjection,
   type CheckpointDiffSnapshot,
+  type DraftAttachment,
+  type DraftAttachmentKind,
+  type DraftContextItem,
+  type DraftExportBundle,
+  type DraftRecord,
   type FleetSnapshot,
   type GatewayConfigSnapshot,
   type GatewayConfigUpdateResult,
@@ -28,6 +33,7 @@ import {
   type LocalSafeActionId,
   type LocalSelectCliResult,
   type MissingSessionExport,
+  type OrphanedDraftRecord,
   type ProfileSummary,
   type RegistrySnapshotView,
   type SanitizedDiagnosticsPayload,
@@ -50,6 +56,7 @@ import {
   HERMES_UPDATE_DOCS_URL,
   addWorkspaceAnnotation,
   aggregateAttentionState,
+  buildActiveDraftExport,
   closeWorkspace,
   createInitialShellState,
   createInitialWorkspaceSessionState,
@@ -58,6 +65,7 @@ import {
   deriveViewportMode,
   filterProfilesForConnection,
   filterSessionsForScope,
+  findActiveChatDraft,
   formatAppInfoDisplay,
   getActiveChatWorkspaceView,
   getActiveScopeWorkspaceView,
@@ -65,6 +73,7 @@ import {
   getTopmostSurface,
   hideWorkspace,
   invalidateWorkspaceGeneration,
+  listScopeNewChatDrafts,
   markWorkspaceArtifactsExternalStale,
   markWorkspaceCheckpointRestored,
   markWorkspaceFilesExternalStale,
@@ -75,6 +84,7 @@ import {
   reconcileWorkspaceCheckpoints,
   reconcileWorkspaceFiles,
   reconcileWorkspaceGitDiffs,
+  resolveDraftKey,
   resolveProfileManagementAvailability,
   resolveWorkspaceChatKey,
   selectWorkspaceAgent,
@@ -127,6 +137,14 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
+  const [draftAttachments, setDraftAttachments] = useState<DraftAttachment[]>([]);
+  const [draftContexts, setDraftContexts] = useState<DraftContextItem[]>([]);
+  const [draftCapacityError, setDraftCapacityError] = useState<
+    "over_single_limit" | "over_total_limit" | null
+  >(null);
+  const [exportedDraft, setExportedDraft] = useState<DraftExportBundle | null>(null);
+  const [exportedOrphanedDraft, setExportedOrphanedDraft] = useState<DraftExportBundle | null>(null);
+  const [activeNewDraftIdByScope, setActiveNewDraftIdByScope] = useState<Record<string, string>>({});
   const [exportedMissing, setExportedMissing] = useState<MissingSessionExport | null>(null);
   const [fleetResyncNonce, setFleetResyncNonce] = useState(0);
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
@@ -159,6 +177,15 @@ export default function App() {
   const approvalTrackerRef = useRef(createSequenceTracker());
   const transcriptSyncRef = useRef(createTranscriptSyncController());
   const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingDraftSaveRef = useRef<{
+    key: string;
+    scope: BridgeScope;
+    payload: Record<string, unknown>;
+  } | null>(null);
+  const dirtyDraftKeyRef = useRef<string | null>(null);
+  const prevDraftKeyRef = useRef<string | null>(null);
+  const hydratedChatStateKeyRef = useRef<string | null>(null);
+  const newDraftSeqRef = useRef(0);
 
   const viewportMode = deriveViewportMode(viewportWidth);
   const topmostSurface = getTopmostSurface(state);
@@ -465,20 +492,174 @@ export default function App() {
     refreshWorkspaceData,
   ]);
 
-  // Hydrate persisted Draft annotations from chatState sessionSummaries
+  // Hydrate persisted Draft annotations from chatState sessionSummaries / draftsByKey
   useEffect(() => {
     if (!activeChatScope?.sessionId || !state.chatState) return;
     const chatKey = resolveWorkspaceChatKey(activeChatScope);
-    const summary = state.chatState.sessionSummaries[chatKey];
-    if (summary?.annotations) {
+    const persisted = findActiveChatDraft(state.chatState.draftsByKey, activeChatScope);
+    const annotations =
+      persisted?.annotations ?? state.chatState.sessionSummaries?.[chatKey]?.annotations;
+    if (annotations) {
       setWorkspaceState((prev) =>
-        setWorkspaceAnnotations(prev, summary.annotations ?? [], activeChatScope),
+        setWorkspaceAnnotations(prev, annotations ?? [], activeChatScope),
       );
     }
   }, [
     activeChatScope?.connectionId,
     activeChatScope?.profileId,
     activeChatScope?.sessionId,
+    state.chatState,
+  ]);
+
+  const effectiveDraftScope: BridgeScope | null = useMemo(() => {
+    if (activeChatScope) return activeChatScope;
+    if (state.chatState?.lastActiveChat) {
+      return {
+        connectionId: state.chatState.lastActiveChat.connectionId,
+        profileId: state.chatState.lastActiveChat.profileId,
+        ...(state.chatState.lastActiveChat.sessionId
+          ? { sessionId: state.chatState.lastActiveChat.sessionId }
+          : {}),
+      };
+    }
+    return null;
+  }, [activeChatScope, state.chatState?.lastActiveChat]);
+
+  const scopeNewDrafts = useMemo(
+    () => listScopeNewChatDrafts(state.chatState?.draftsByKey, effectiveDraftScope),
+    [effectiveDraftScope, state.chatState?.draftsByKey],
+  );
+
+  const draftScopeKey = effectiveDraftScope
+    ? `${effectiveDraftScope.connectionId}::${effectiveDraftScope.profileId ?? "default"}`
+    : null;
+
+  const activeNewDraftId = useMemo(() => {
+    if (!draftScopeKey || effectiveDraftScope?.sessionId) return null;
+    return (
+      activeNewDraftIdByScope[draftScopeKey] ??
+      scopeNewDrafts[0]?.draftId ??
+      `draft-new-${draftScopeKey}`
+    );
+  }, [activeNewDraftIdByScope, draftScopeKey, effectiveDraftScope?.sessionId, scopeNewDrafts]);
+
+  const currentDraftKey = useMemo(() => {
+    if (!effectiveDraftScope) return null;
+    return resolveDraftKey({
+      connectionId: effectiveDraftScope.connectionId,
+      profileId: effectiveDraftScope.profileId ?? "default",
+      sessionId: effectiveDraftScope.sessionId,
+      draftId: effectiveDraftScope.sessionId ? undefined : activeNewDraftId ?? undefined,
+    });
+  }, [activeNewDraftId, effectiveDraftScope]);
+
+  const currentPersistedDraft = useMemo(() => {
+    if (!currentDraftKey || !state.chatState?.draftsByKey) return null;
+    return state.chatState.draftsByKey[currentDraftKey] ?? null;
+  }, [currentDraftKey, state.chatState?.draftsByKey]);
+
+  const persistDraftPayload = useCallback(
+    async (scope: BridgeScope, payload: Record<string, unknown>) => {
+      const res = await host.request<ChatSessionProjection>("chatState.saveDraft", payload, scope);
+      if (res.ok) {
+        setDraftCapacityError(null);
+        dispatch({ type: "APPLY_CHAT_STATE", chatState: res.value });
+      } else {
+        const msg = res.error.message ?? "";
+        setDraftCapacityError(msg.includes("50 MiB") ? "over_total_limit" : "over_single_limit");
+      }
+      return res;
+    },
+    [],
+  );
+
+  const flushPendingDraftSave = useCallback(() => {
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+    const pending = pendingDraftSaveRef.current;
+    pendingDraftSaveRef.current = null;
+    if (pending) {
+      void persistDraftPayload(pending.scope, pending.payload);
+    }
+  }, [persistDraftPayload]);
+
+  // Hydrate persisted ActiveChat or Scope+draftId Draft when key switches or chatState loads
+  useEffect(() => {
+    const readHydratedFields = () => {
+      if (currentPersistedDraft) {
+        return {
+          text: currentPersistedDraft.text,
+          attachments: currentPersistedDraft.attachments,
+          contexts: currentPersistedDraft.contexts,
+        };
+      }
+      if (effectiveDraftScope?.sessionId && state.chatState) {
+        const sumKey = `${effectiveDraftScope.connectionId}::${effectiveDraftScope.profileId ?? "default"}::${effectiveDraftScope.sessionId}`;
+        const summary = state.chatState.sessionSummaries?.[sumKey];
+        if (summary?.draftText) {
+          return {
+            text: summary.draftText,
+            attachments: [] as DraftAttachment[],
+            contexts: [] as DraftContextItem[],
+          };
+        }
+      }
+      return {
+        text: "",
+        attachments: [] as DraftAttachment[],
+        contexts: [] as DraftContextItem[],
+      };
+    };
+
+    if (prevDraftKeyRef.current !== currentDraftKey) {
+      flushPendingDraftSave();
+      prevDraftKeyRef.current = currentDraftKey;
+      dirtyDraftKeyRef.current = null;
+      const fields = readHydratedFields();
+      setComposerDraft(fields.text);
+      setDraftAttachments(fields.attachments);
+      setDraftContexts(fields.contexts);
+      setDraftCapacityError(null);
+      setExportedDraft(null);
+      hydratedChatStateKeyRef.current = state.chatState && currentDraftKey ? currentDraftKey : null;
+      return;
+    }
+
+    if (!currentDraftKey || !state.chatState) return;
+
+    if (hydratedChatStateKeyRef.current !== currentDraftKey) {
+      hydratedChatStateKeyRef.current = currentDraftKey;
+      if (dirtyDraftKeyRef.current !== currentDraftKey) {
+        const fields = readHydratedFields();
+        setComposerDraft(fields.text);
+        setDraftAttachments(fields.attachments);
+        setDraftContexts(fields.contexts);
+      }
+      return;
+    }
+
+    if (currentPersistedDraft) {
+      setDraftAttachments((prev) => {
+        if (prev.length !== currentPersistedDraft.attachments.length) {
+          return dirtyDraftKeyRef.current === currentDraftKey
+            ? prev
+            : currentPersistedDraft.attachments;
+        }
+        const expiredChanged = prev.some(
+          (att, idx) => Boolean(att.expired) !== Boolean(currentPersistedDraft.attachments[idx]?.expired),
+        );
+        return expiredChanged ? currentPersistedDraft.attachments : prev;
+      });
+    }
+  }, [
+    currentDraftKey,
+    currentPersistedDraft,
+    effectiveDraftScope?.connectionId,
+    effectiveDraftScope?.profileId,
+    effectiveDraftScope?.sessionId,
+    flushPendingDraftSave,
     state.chatState,
   ]);
 
@@ -551,20 +732,18 @@ export default function App() {
         return updated;
       });
 
-      if (activeChatScope?.sessionId && nextAnnotationsToSave) {
-        void host.request(
-          "chatState.saveDraft",
-          {
-            sessionId: activeChatScope.sessionId,
-            profileId: activeChatScope.profileId ?? "default",
-            text: composerDraft,
-            annotations: nextAnnotationsToSave,
-          },
-          activeChatScope,
-        );
+      if (effectiveDraftScope && nextAnnotationsToSave) {
+        void persistDraftPayload(effectiveDraftScope, {
+          ...(effectiveDraftScope.sessionId
+            ? { sessionId: effectiveDraftScope.sessionId }
+            : { draftId: activeNewDraftId ?? undefined }),
+          profileId: effectiveDraftScope.profileId ?? "default",
+          text: composerDraft,
+          annotations: nextAnnotationsToSave,
+        });
       }
     },
-    [activeChatScope, composerDraft],
+    [activeChatScope, activeNewDraftId, composerDraft, effectiveDraftScope, persistDraftPayload],
   );
 
   const handleRefreshAgentTail = useCallback(
@@ -990,30 +1169,40 @@ export default function App() {
     workspaceState.frame.mode,
   ]);
 
-  const handleCreateSession = useCallback(async () => {
-    if (!hasReadyConnection || !effectiveScope || !canCreateSession) {
-      dispatch({ type: "ANNOUNCE", message: getCopy("empty.body") });
-      return null;
-    }
-    const res = await host.request<{ session?: SessionSummary; transcript?: SessionTranscriptSnapshot }>(
-      "sessions.create",
-      { title: getCopy("chat.newSessionDefaultTitle"), profileId: effectiveScope.profileId ?? "default" },
-      effectiveScope,
-    );
-    if (res.ok && res.value.transcript) {
-      const applied = transcriptSyncRef.current.applySnapshot(
-        res.value.transcript,
-        res.value.transcript.snapshotSeq ?? 0,
-        { replace: true, resynced: res.value.transcript.resynced },
+  const handleCreateSession = useCallback(
+    async (migrateDraftId?: string) => {
+      if (!hasReadyConnection || !effectiveScope || !canCreateSession) {
+        dispatch({ type: "ANNOUNCE", message: getCopy("empty.body") });
+        return null;
+      }
+      const draftIdToMigrate =
+        migrateDraftId ?? (!state.activeSessionId ? activeNewDraftId ?? undefined : undefined);
+      const res = await host.request<{ session?: SessionSummary; transcript?: SessionTranscriptSnapshot }>(
+        "sessions.create",
+        {
+          title: getCopy("chat.newSessionDefaultTitle"),
+          profileId: effectiveScope.profileId ?? "default",
+          ...(draftIdToMigrate ? { draftId: draftIdToMigrate } : {}),
+        },
+        effectiveScope,
       );
-      dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
-    }
-    setExportedMissing(null);
-    return res.ok ? res.value.session ?? null : null;
-  }, [canCreateSession, effectiveScope, hasReadyConnection]);
+      if (res.ok && res.value.transcript) {
+        const applied = transcriptSyncRef.current.applySnapshot(
+          res.value.transcript,
+          res.value.transcript.snapshotSeq ?? 0,
+          { replace: true, resynced: res.value.transcript.resynced },
+        );
+        dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
+      }
+      setExportedMissing(null);
+      return res.ok ? res.value.session ?? null : null;
+    },
+    [activeNewDraftId, canCreateSession, effectiveScope, hasReadyConnection, state.activeSessionId],
+  );
 
   const handleSelectSession = useCallback(
     async (session: SessionSummary) => {
+      flushPendingDraftSave();
       const targetScope: BridgeScope = {
         connectionId: session.connectionId,
         profileId: session.profileId,
@@ -1057,42 +1246,281 @@ export default function App() {
         dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" });
       }
     },
-    [state.surfaceStack],
+    [flushPendingDraftSave, state.surfaceStack],
+  );
+
+  const buildDraftPayload = useCallback(
+    (
+      nextText: string,
+      nextAttachments: DraftAttachment[],
+      nextContexts: DraftContextItem[],
+    ): Record<string, unknown> | null => {
+      if (!effectiveDraftScope) return null;
+      return {
+        ...(effectiveDraftScope.sessionId
+          ? { sessionId: effectiveDraftScope.sessionId }
+          : { draftId: activeNewDraftId ?? undefined }),
+        profileId: effectiveDraftScope.profileId ?? "default",
+        text: nextText,
+        attachments: nextAttachments,
+        contexts: nextContexts,
+      };
+    },
+    [activeNewDraftId, effectiveDraftScope],
   );
 
   const handleDraftChange = useCallback(
     (nextDraft: string) => {
       setComposerDraft(nextDraft);
+      setExportedDraft(null);
       if (draftSaveTimerRef.current) {
         clearTimeout(draftSaveTimerRef.current);
+        draftSaveTimerRef.current = null;
       }
       if (
-        !hasReadyConnection ||
-        !effectiveScope ||
-        !state.activeSessionId ||
-        state.chatState?.activeStatus === "session_missing"
+        !effectiveDraftScope ||
+        !currentDraftKey ||
+        state.chatState?.activeStatus === "session_missing" ||
+        (!hasReadyConnection && !activeConnection && !state.chatState?.lastActiveChat)
       ) {
         return;
       }
-      const targetScope: BridgeScope = {
-        connectionId: effectiveScope.connectionId,
-        profileId: effectiveScope.profileId ?? "default",
-        sessionId: state.activeSessionId,
-      };
+      dirtyDraftKeyRef.current = currentDraftKey;
+      const payload = buildDraftPayload(nextDraft, draftAttachments, draftContexts);
+      if (!payload) return;
+      const targetScope = effectiveDraftScope;
+      const keyForSave = currentDraftKey;
+      pendingDraftSaveRef.current = { key: keyForSave, scope: targetScope, payload };
       draftSaveTimerRef.current = setTimeout(() => {
-        void host.request(
-          "chatState.saveDraft",
-          {
-            sessionId: targetScope.sessionId,
-            profileId: targetScope.profileId,
-            text: nextDraft,
-          },
-          targetScope,
-        );
+        draftSaveTimerRef.current = null;
+        pendingDraftSaveRef.current = null;
+        void persistDraftPayload(targetScope, payload);
       }, 150);
     },
-    [effectiveScope, hasReadyConnection, state.activeSessionId, state.chatState?.activeStatus],
+    [
+      activeConnection,
+      buildDraftPayload,
+      currentDraftKey,
+      draftAttachments,
+      draftContexts,
+      effectiveDraftScope,
+      hasReadyConnection,
+      persistDraftPayload,
+      state.chatState?.activeStatus,
+      state.chatState?.lastActiveChat,
+    ],
   );
+
+  const handleAttachFiles = useCallback(
+    (files: FileList, reattachId?: string | null) => {
+      if (!effectiveDraftScope || !currentDraftKey) return;
+      const inferKind = (file: File): DraftAttachmentKind => {
+        if (file.type.startsWith("image/")) return "image";
+        if (file.type.startsWith("text/") || /\.(md|txt|json|ts|tsx|js|css)$/i.test(file.name)) {
+          return "text";
+        }
+        return "file";
+      };
+      const fileArr = Array.from(files);
+      if (fileArr.length === 0) return;
+
+      let nextAttachments = [...draftAttachments];
+      if (reattachId) {
+        const replacement = fileArr[0];
+        newDraftSeqRef.current += 1;
+        nextAttachments = nextAttachments.map((att) =>
+          att.attachmentId === reattachId
+            ? {
+                ...att,
+                handle: `handle-${Date.now()}-${newDraftSeqRef.current}`,
+                displayName: replacement.name,
+                kind: inferKind(replacement),
+                sizeBytes: replacement.size,
+                expired: false,
+              }
+            : att,
+        );
+      } else {
+        for (const file of fileArr) {
+          newDraftSeqRef.current += 1;
+          nextAttachments.push({
+            attachmentId: `att-${Date.now()}-${newDraftSeqRef.current}`,
+            handle: `handle-${Date.now()}-${newDraftSeqRef.current}`,
+            displayName: file.name,
+            kind: inferKind(file),
+            sizeBytes: file.size,
+          });
+        }
+      }
+
+      dirtyDraftKeyRef.current = currentDraftKey;
+      setDraftAttachments(nextAttachments);
+      const payload = buildDraftPayload(composerDraft, nextAttachments, draftContexts);
+      if (payload) {
+        void persistDraftPayload(effectiveDraftScope, payload);
+      }
+    },
+    [
+      buildDraftPayload,
+      composerDraft,
+      currentDraftKey,
+      draftAttachments,
+      draftContexts,
+      effectiveDraftScope,
+      persistDraftPayload,
+    ],
+  );
+
+  const handleRemoveAttachment = useCallback(
+    (attachmentId: string) => {
+      if (!effectiveDraftScope || !currentDraftKey) return;
+      const nextAttachments = draftAttachments.filter((a) => a.attachmentId !== attachmentId);
+      dirtyDraftKeyRef.current = currentDraftKey;
+      setDraftAttachments(nextAttachments);
+      const payload = buildDraftPayload(composerDraft, nextAttachments, draftContexts);
+      if (payload) {
+        void persistDraftPayload(effectiveDraftScope, payload);
+      }
+    },
+    [
+      buildDraftPayload,
+      composerDraft,
+      currentDraftKey,
+      draftAttachments,
+      draftContexts,
+      effectiveDraftScope,
+      persistDraftPayload,
+    ],
+  );
+
+  const handleRemoveContext = useCallback(
+    (contextId: string) => {
+      if (!effectiveDraftScope || !currentDraftKey) return;
+      const nextContexts = draftContexts.filter((c) => c.contextId !== contextId);
+      dirtyDraftKeyRef.current = currentDraftKey;
+      setDraftContexts(nextContexts);
+      const payload = buildDraftPayload(composerDraft, draftAttachments, nextContexts);
+      if (payload) {
+        void persistDraftPayload(effectiveDraftScope, payload);
+      }
+    },
+    [
+      buildDraftPayload,
+      composerDraft,
+      currentDraftKey,
+      draftAttachments,
+      draftContexts,
+      effectiveDraftScope,
+      persistDraftPayload,
+    ],
+  );
+
+  const handleClearDraft = useCallback(async () => {
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+    pendingDraftSaveRef.current = null;
+    dirtyDraftKeyRef.current = null;
+    setComposerDraft("");
+    setDraftAttachments([]);
+    setDraftContexts([]);
+    setDraftCapacityError(null);
+    setExportedDraft(null);
+    if (!effectiveDraftScope) return;
+    const res = await host.request<ChatSessionProjection>(
+      "chatState.clearDraft",
+      {
+        ...(effectiveDraftScope.sessionId
+          ? { sessionId: effectiveDraftScope.sessionId }
+          : { draftId: activeNewDraftId ?? undefined }),
+        profileId: effectiveDraftScope.profileId ?? "default",
+      },
+      effectiveDraftScope,
+    );
+    if (res.ok) {
+      dispatch({ type: "APPLY_CHAT_STATE", chatState: res.value });
+    }
+  }, [activeNewDraftId, effectiveDraftScope]);
+
+  const handleExportCurrentDraft = useCallback(() => {
+    if (!effectiveDraftScope) return;
+    const record: DraftRecord = currentPersistedDraft
+      ? {
+          ...currentPersistedDraft,
+          text: composerDraft,
+          attachments: draftAttachments,
+          contexts: draftContexts,
+        }
+      : {
+          draftId: activeNewDraftId ?? `draft-${effectiveDraftScope.sessionId ?? "local"}`,
+          ...(effectiveDraftScope.sessionId ? { sessionId: effectiveDraftScope.sessionId } : {}),
+          scope: {
+            connectionId: effectiveDraftScope.connectionId,
+            profileId: effectiveDraftScope.profileId ?? "default",
+          },
+          text: composerDraft,
+          attachments: draftAttachments,
+          contexts: draftContexts,
+          composer: {},
+          updatedAt: new Date().toISOString(),
+          revision: 1,
+          origin: {
+            connectionId: effectiveDraftScope.connectionId,
+            profileId: effectiveDraftScope.profileId ?? "default",
+            ...(effectiveDraftScope.sessionId ? { sessionId: effectiveDraftScope.sessionId } : {}),
+          },
+        };
+    setExportedDraft(buildActiveDraftExport(record, new Date().toISOString()));
+    dispatch({ type: "ANNOUNCE", message: getCopy("settings.data.exportedNotice") });
+  }, [activeNewDraftId, composerDraft, currentPersistedDraft, draftAttachments, draftContexts, effectiveDraftScope]);
+
+  const handleSelectNewDraft = useCallback(
+    (draftId: string) => {
+      if (!draftScopeKey) return;
+      flushPendingDraftSave();
+      setActiveNewDraftIdByScope((prev) => ({ ...prev, [draftScopeKey]: draftId }));
+    },
+    [draftScopeKey, flushPendingDraftSave],
+  );
+
+  const handleStartNewDraft = useCallback(() => {
+    if (!draftScopeKey) return;
+    flushPendingDraftSave();
+    newDraftSeqRef.current += 1;
+    const freshId = `draft-${Date.now()}-${newDraftSeqRef.current}`;
+    setActiveNewDraftIdByScope((prev) => ({ ...prev, [draftScopeKey]: freshId }));
+  }, [draftScopeKey, flushPendingDraftSave]);
+
+  const handleCopyOrphanedDraft = useCallback((orphan: OrphanedDraftRecord) => {
+    try {
+      void navigator.clipboard?.writeText(orphan.text);
+    } catch {
+      // Ignore clipboard failure in headless mode
+    }
+    dispatch({ type: "ANNOUNCE", message: getCopy("settings.data.copiedNotice") });
+  }, []);
+
+  const handleExportOrphanedDraft = useCallback(async (orphanedId: string) => {
+    const res = await host.request<DraftExportBundle>("chatState.exportOrphanedDraft", {
+      orphanedId,
+    });
+    if (res.ok) {
+      setExportedOrphanedDraft(res.value);
+      dispatch({ type: "ANNOUNCE", message: getCopy("settings.data.exportedNotice") });
+    }
+  }, []);
+
+  const handleDeleteOrphanedDraft = useCallback(async (orphanedId: string) => {
+    const res = await host.request<ChatSessionProjection>("chatState.deleteOrphanedDraft", {
+      orphanedId,
+    });
+    if (res.ok) {
+      setExportedOrphanedDraft((prev) => (prev?.draftId && !res.value.orphanedDrafts?.some((o) => o.draftId === prev.draftId) ? null : prev));
+      dispatch({ type: "APPLY_CHAT_STATE", chatState: res.value });
+      dispatch({ type: "ANNOUNCE", message: getCopy("settings.data.deletedNotice") });
+    }
+  }, []);
 
   const handleDismissRouteBanner = useCallback(async () => {
     const res = await host.request<ChatSessionProjection>("chatState.dismissRouteBanner", {});
@@ -1310,13 +1738,22 @@ export default function App() {
 
   const handleSendPrompt = useCallback(async () => {
     const text = composerDraft.trim();
-    if (!text || !hasReadyConnection || !effectiveScope || state.chatBusy) return;
+    if (
+      !text ||
+      !hasReadyConnection ||
+      !effectiveScope ||
+      state.chatBusy ||
+      draftAttachments.some((a) => Boolean(a.expired))
+    ) {
+      return;
+    }
+    flushPendingDraftSave();
     dispatch({ type: "SET_CHAT_BUSY", busy: true });
     dispatch({ type: "SET_STOP_ERROR", message: null });
     try {
       let targetSessionId = state.activeSessionId;
       if (!targetSessionId) {
-        const created = await handleCreateSession();
+        const created = await handleCreateSession(activeNewDraftId ?? undefined);
         targetSessionId = created?.sessionId ?? null;
       }
       if (!targetSessionId) {
@@ -1328,25 +1765,62 @@ export default function App() {
         profileId: effectiveScope.profileId ?? "default",
         sessionId: targetSessionId,
       };
-      const res = await host.request("prompts.send", { sessionId: targetSessionId, text }, targetScope);
+      const draftIdToSend = currentPersistedDraft?.draftId ?? activeNewDraftId ?? undefined;
+      const res = await host.request<{
+        accepted?: boolean;
+        admitted?: boolean;
+        deliveryUnknown?: boolean;
+        receipt?: string;
+        receiptStatus?: string;
+      }>(
+        "prompts.send",
+        {
+          sessionId: targetSessionId,
+          text,
+          ...(draftIdToSend ? { draftId: draftIdToSend } : {}),
+        },
+        targetScope,
+      );
       if (res.ok) {
-        setComposerDraft("");
-        if (draftSaveTimerRef.current) {
-          clearTimeout(draftSaveTimerRef.current);
-          draftSaveTimerRef.current = null;
+        const receipt = res.value.receipt ?? res.value.receiptStatus;
+        const confirmedReceipt =
+          !res.value.deliveryUnknown &&
+          (res.value.accepted === true ||
+            res.value.admitted === true ||
+            receipt === "accepted" ||
+            receipt === "admitted");
+        if (confirmedReceipt) {
+          dirtyDraftKeyRef.current = null;
+          setComposerDraft("");
+          setDraftAttachments([]);
+          setDraftContexts([]);
+          setDraftCapacityError(null);
+          setExportedDraft(null);
+          if (draftSaveTimerRef.current) {
+            clearTimeout(draftSaveTimerRef.current);
+            draftSaveTimerRef.current = null;
+          }
+        } else if (res.value.deliveryUnknown || receipt === "delivery_unknown") {
+          dispatch({ type: "ANNOUNCE", message: getCopy("draft.deliveryUnknownBadge") });
         }
-        void host.request(
-          "chatState.saveDraft",
-          { sessionId: targetSessionId, profileId: targetScope.profileId, text: "" },
-          targetScope,
-        );
       } else {
-        dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.sendFailed") });
+        dispatch({ type: "SET_STOP_ERROR", message: res.error.message || getCopy("chat.sendFailed") });
       }
     } finally {
       dispatch({ type: "SET_CHAT_BUSY", busy: false });
     }
-  }, [composerDraft, effectiveScope, handleCreateSession, hasReadyConnection, state.activeSessionId, state.chatBusy]);
+  }, [
+    activeNewDraftId,
+    composerDraft,
+    currentPersistedDraft?.draftId,
+    draftAttachments,
+    effectiveScope,
+    flushPendingDraftSave,
+    handleCreateSession,
+    hasReadyConnection,
+    state.activeSessionId,
+    state.chatBusy,
+  ]);
 
   const handleStopTurn = useCallback(async () => {
     if (!effectiveScope || !state.activeSessionId || !state.transcript?.activeTurnId) return;
@@ -2424,10 +2898,24 @@ export default function App() {
                 localBusy={localBusy}
                 chatBusy={state.chatBusy}
                 composerDraft={composerDraft}
+                draftAttachments={draftAttachments}
+                draftContexts={draftContexts}
+                draftDeliveryStatus={currentPersistedDraft?.deliveryStatus ?? "idle"}
+                draftCapacityError={draftCapacityError}
+                exportedDraft={exportedDraft}
+                scopeNewDrafts={scopeNewDrafts}
+                activeNewDraftId={activeNewDraftId}
                 stopError={state.stopError}
                 canCreateSession={canCreateSession}
                 composerRef={composerRef}
                 onDraftChange={handleDraftChange}
+                onAttachFiles={handleAttachFiles}
+                onRemoveAttachment={handleRemoveAttachment}
+                onRemoveContext={handleRemoveContext}
+                onClearDraft={() => void handleClearDraft()}
+                onExportCurrentDraft={handleExportCurrentDraft}
+                onSelectNewDraft={handleSelectNewDraft}
+                onStartNewDraft={handleStartNewDraft}
                 onSendPrompt={() => void handleSendPrompt()}
                 onStopTurn={() => void handleStopTurn()}
                 onCreateSession={() => void handleCreateSession()}
@@ -2720,6 +3208,90 @@ export default function App() {
             onCopyCli={handleCopyExtCli}
             onOpenDocs={handleOpenExtDocs}
           />
+        </section>
+
+        <section
+          className="settings-section"
+          data-settings-section="data"
+          aria-label={getCopy("settings.section.data")}
+        >
+          <h3 className="settings-section-title">{getCopy("settings.data.orphanedTitle")}</h3>
+          <p className="settings-section-body">{getCopy("settings.data.orphanedDescription")}</p>
+          {(state.chatState?.orphanedDrafts ?? []).length === 0 ? (
+            <p className="settings-section-body" data-testid="orphaned-drafts-empty">
+              {getCopy("settings.data.orphanedEmpty")}
+            </p>
+          ) : (
+            <ul className="orphaned-draft-list" data-testid="orphaned-draft-list">
+              {(state.chatState?.orphanedDrafts ?? []).map((orphan) => (
+                <li
+                  key={orphan.orphanedId}
+                  className="orphaned-draft-card"
+                  data-testid={`orphaned-draft-${orphan.orphanedId}`}
+                >
+                  <div className="orphaned-draft-meta">
+                    <span className="gateway-badge">
+                      {getCopy(`settings.data.reason.${orphan.reason}` as CopyKey)}
+                    </span>
+                    <span>
+                      {orphan.origin.connectionId} / {orphan.origin.profileId}
+                      {orphan.origin.sessionId ? ` / ${orphan.origin.sessionId}` : ""}
+                      {orphan.origin.title ? ` (${orphan.origin.title})` : ""}
+                    </span>
+                    <span>{orphan.orphanedAt}</span>
+                  </div>
+                  {orphan.text && <pre className="orphaned-draft-text">{orphan.text}</pre>}
+                  {orphan.attachments.length > 0 && (
+                    <div className="draft-attachments-bar">
+                      {orphan.attachments.map((att) => (
+                        <span
+                          key={att.attachmentId}
+                          className={["draft-attachment-chip", att.expired && "is-expired"]
+                            .filter(Boolean)
+                            .join(" ")}
+                        >
+                          <span>{att.displayName}</span>
+                          {att.expired && (
+                            <span className="status-pill is-warn">
+                              {getCopy("draft.attachmentExpiredBadge")}
+                            </span>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className="orphaned-draft-actions">
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() => handleCopyOrphanedDraft(orphan)}
+                    >
+                      {getCopy("settings.data.copyAction")}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() => void handleExportOrphanedDraft(orphan.orphanedId)}
+                    >
+                      {getCopy("settings.data.exportAction")}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() => void handleDeleteOrphanedDraft(orphan.orphanedId)}
+                    >
+                      {getCopy("settings.data.deleteAction")}
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {exportedOrphanedDraft && (
+            <div className="resync-notice" role="status" data-testid="orphaned-draft-export-preview">
+              <pre className="diagnostics-json">{JSON.stringify(exportedOrphanedDraft, null, 2)}</pre>
+            </div>
+          )}
         </section>
       </FocusDialog>
 

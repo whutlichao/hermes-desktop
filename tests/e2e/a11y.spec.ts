@@ -858,3 +858,123 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("approval inspect modal");
   });
 });
+
+test.describe("Ticket #38 Drafts A11y", () => {
+  test("Ticket #38 draft alerts, expired attachment chips, and Settings -> Data orphaned drafts have zero critical/serious axe violations", async ({
+    page,
+  }) => {
+    const checkAxe = async (label: string) => {
+      const results = await new AxeBuilder({ page })
+        .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+        .analyze();
+      const seriousOrCritical = results.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(
+        seriousOrCritical,
+        `${label}: ${JSON.stringify(seriousOrCritical, null, 2)}`,
+      ).toEqual([]);
+    };
+
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "Local Hermes",
+              originDisplay: "127.0.0.1:47371",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              profileExceptionCount: 0,
+              latencyMs: 9,
+              nextRetryAt: null,
+              isPrimary: true,
+              isLastUsed: true,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              label: "Default",
+              actual: "ready",
+              degraded: false,
+              isException: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y",
+              title: "Draft A11y Session",
+              preview: "hello",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-a11y" },
+          activeSessionId: "sess-a11y",
+        },
+        chatState: {
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-a11y" },
+          lastSessionByScope: { "local::default": "sess-a11y" },
+          activeStatus: "ready",
+          draftsByKey: {
+            "chat::local::default::sess-a11y": {
+              draftId: "draft-a11y-1",
+              sessionId: "sess-a11y",
+              scope: { connectionId: "local", profileId: "default" },
+              text: "Unconfirmed draft with expired attachment",
+              attachments: [
+                {
+                  attachmentId: "att-a11y-1",
+                  handle: "opaque://a11y",
+                  displayName: "diagram.png",
+                  kind: "image",
+                  expired: true,
+                },
+              ],
+              contexts: [],
+              composer: {},
+              deliveryStatus: "delivery_unknown",
+              updatedAt: "2026-11-23T08:02:00.000Z",
+              revision: 1,
+              origin: { connectionId: "local", profileId: "default", sessionId: "sess-a11y" },
+            },
+          },
+          orphanedDrafts: [
+            {
+              orphanedId: "orphan-a11y-1",
+              draftId: "draft-orphan-a11y",
+              reason: "connection_removed",
+              text: "Orphaned draft for Settings Data a11y audit",
+              attachments: [],
+              contexts: [],
+              origin: { connectionId: "remote-a11y", profileId: "default" },
+              orphanedAt: "2026-11-23T07:55:00.000Z",
+            },
+          ],
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await expect(page.getByTestId("draft-delivery-unknown-alert")).toBeVisible();
+    await expect(page.getByTestId("draft-attachment-expired-alert")).toBeVisible();
+    await checkAxe("composer with delivery_unknown alert and expired attachment");
+
+    await page.keyboard.press("Control+,");
+    await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    await expect(page.getByTestId("orphaned-draft-list")).toBeVisible();
+    await checkAxe("settings modal with Data orphaned drafts");
+  });
+});

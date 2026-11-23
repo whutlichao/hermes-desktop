@@ -1,4 +1,6 @@
 import {
+  DRAFT_MAX_BYTES,
+  DRAFTS_TOTAL_MAX_BYTES,
   HOST_BRIDGE_VERSION,
   HOST_TOPICS,
   type AppCommand,
@@ -17,6 +19,13 @@ import {
   type ConnectionMutationInput,
   type ConnectionMutationResponse,
   type ConnectionTestResult,
+  type DraftAttachment,
+  type DraftComposerState,
+  type DraftContextItem,
+  type DraftDeliveryStatus,
+  type DraftExportBundle,
+  type DraftOrigin,
+  type DraftRecord,
   type FleetSnapshot,
   type GatewayConfigSnapshot,
   type GatewayConfigUpdateResult,
@@ -28,6 +37,7 @@ import {
   type LocalInspectResult,
   type LocalSelectCliResult,
   type MissingSessionExport,
+  type OrphanedDraftReason,
   type ProfileSummary,
   type RegistryDiff,
   type RegistryIssue,
@@ -65,6 +75,8 @@ import {
   computeSessionPinned,
   assertApprovalDismissPayloadSafe,
   assertApprovalRespondPayloadSafe,
+  buildOrphanedDraftExport,
+  checkDraftCapacity,
   createBridgeDispatcher,
   createEmptyRegistryDocument,
   createEmptyTerminalSnapshot,
@@ -78,13 +90,18 @@ import {
   getSshFailureCopy,
   isAllowedGatewayConfigKey,
   makeScopeKey,
+  isDraftRecordEmpty,
+  makeActiveChatDraftKey,
+  makeNewChatDraftKey,
   mapLocalFailure,
+  measureTotalDraftsBytes,
   normalizeRegistryDocument,
   projectRegistrySnapshot,
   projectTerminalScrollbackLines,
   redactSensitiveData,
   resolveExternalAttribution,
   sanitizeDiagnosticsPayload,
+  shouldClearDraftForReceipt,
   validateCheckpointRestoreBinding,
   validateClientAddConnection,
   validateClientRemoveConnection,
@@ -126,6 +143,16 @@ const EMPTY_CHAT_STATE: ChatSessionProjection = {
   lastValidProfileByConnection: {},
   lastValidScopes: [],
   sessionSummaries: {},
+  draftsByKey: {},
+  orphanedDrafts: [],
+  draftStorageUsage: {
+    totalBytes: 0,
+    maxDraftBytes: DRAFT_MAX_BYTES,
+    maxTotalBytes: DRAFTS_TOTAL_MAX_BYTES,
+    overTotalLimit: false,
+    draftCount: 0,
+    orphanedCount: 0,
+  },
   activeStatus: "empty",
   lastKnownUnverified: false,
   missingSession: null,
@@ -209,6 +236,9 @@ interface MockE2EFixture {
     foregroundProcessName?: string;
     attribution?: ExternalAttribution;
   };
+  promptReceiptMode?: "accepted" | "admitted" | "delivery_unknown";
+  failSessionCreate?: boolean;
+  failPromptSend?: boolean;
 }
 
 function readE2EFixture(): MockE2EFixture | undefined {
@@ -434,7 +464,18 @@ export function createMockHostBridge(): HermesHost {
     ? structuredClone(fixture.fleet)
     : EMPTY_FLEET;
   let currentChatState: ChatSessionProjection = fixture?.chatState
-    ? structuredClone(fixture.chatState)
+    ? recomputeMockDraftState({
+        ...EMPTY_CHAT_STATE,
+        ...structuredClone(fixture.chatState),
+        sessionSummaries: structuredClone(fixture.chatState.sessionSummaries ?? {}),
+        lastSessionByScope: structuredClone(fixture.chatState.lastSessionByScope ?? {}),
+        lastValidProfileByConnection: structuredClone(
+          fixture.chatState.lastValidProfileByConnection ?? {},
+        ),
+        lastValidScopes: structuredClone(fixture.chatState.lastValidScopes ?? []),
+        draftsByKey: structuredClone(fixture.chatState.draftsByKey ?? {}),
+        orphanedDrafts: structuredClone(fixture.chatState.orphanedDrafts ?? []),
+      })
     : EMPTY_CHAT_STATE;
   const transcriptMap = new Map<string, SessionTranscriptSnapshot>(
     Object.entries(fixture?.transcripts ?? {}),
@@ -802,6 +843,306 @@ export function createMockHostBridge(): HermesHost {
         revision: 1,
         payload: currentChatState,
       });
+    }
+  }
+
+  let mockDraftCounter = 0;
+  function makeMockDraftId(): string {
+    mockDraftCounter += 1;
+    return `mock-draft-${Date.now()}-${mockDraftCounter}`;
+  }
+
+  function recomputeMockDraftState(nextState: ChatSessionProjection): ChatSessionProjection {
+    const draftsByKey = { ...(nextState.draftsByKey ?? {}) };
+    const orphanedDrafts = [...(nextState.orphanedDrafts ?? [])];
+    const nextSummaries = { ...nextState.sessionSummaries };
+
+    for (const [sumKey, summary] of Object.entries(nextSummaries)) {
+      const chatKey = makeActiveChatDraftKey(
+        summary.connectionId,
+        summary.profileId,
+        summary.sessionId,
+      );
+      const draft = draftsByKey[chatKey];
+      if (draft) {
+        nextSummaries[sumKey] = {
+          ...summary,
+          hasDraft: !isDraftRecordEmpty(draft),
+          ...(draft.text.trim().length > 0 ? { draftText: draft.text } : { draftText: undefined }),
+          ...(draft.annotations && draft.annotations.length > 0
+            ? { annotations: draft.annotations }
+            : { annotations: undefined }),
+        };
+      } else if (summary.hasDraft || summary.draftText || summary.annotations?.length) {
+        nextSummaries[sumKey] = {
+          ...summary,
+          hasDraft: false,
+          draftText: undefined,
+          annotations: undefined,
+        };
+      }
+    }
+
+    for (const draft of Object.values(draftsByKey)) {
+      if (!draft.sessionId) continue;
+      const sumKey = `${draft.scope.connectionId}::${draft.scope.profileId ?? "default"}::${draft.sessionId}`;
+      const existingSum = nextSummaries[sumKey];
+      nextSummaries[sumKey] = {
+        connectionId: draft.scope.connectionId,
+        profileId: draft.scope.profileId ?? "default",
+        sessionId: draft.sessionId,
+        title: existingSum?.title ?? draft.sessionId,
+        preview: existingSum?.preview,
+        updatedAt: existingSum?.updatedAt,
+        hasDraft: !isDraftRecordEmpty(draft),
+        ...(draft.text.trim().length > 0 ? { draftText: draft.text } : {}),
+        ...(draft.annotations && draft.annotations.length > 0
+          ? { annotations: draft.annotations }
+          : {}),
+        lastKnownMessages: existingSum?.lastKnownMessages,
+      };
+    }
+
+    const totalBytes = measureTotalDraftsBytes(draftsByKey, orphanedDrafts);
+    return {
+      ...nextState,
+      sessionSummaries: nextSummaries,
+      draftsByKey,
+      orphanedDrafts,
+      draftStorageUsage: {
+        totalBytes,
+        maxDraftBytes: DRAFT_MAX_BYTES,
+        maxTotalBytes: DRAFTS_TOTAL_MAX_BYTES,
+        overTotalLimit: totalBytes > DRAFTS_TOTAL_MAX_BYTES,
+        draftCount: Object.keys(draftsByKey).length,
+        orphanedCount: orphanedDrafts.length,
+      },
+    };
+  }
+
+  function resolveMockDraftOrigin(
+    connectionId: string,
+    profileId: string,
+    sessionId?: string,
+    override?: Partial<DraftOrigin>,
+  ): DraftOrigin {
+    const sess = sessionId
+      ? currentFleet.sessions.find(
+          (s) =>
+            s.connectionId === connectionId &&
+            s.profileId === profileId &&
+            s.sessionId === sessionId,
+        ) ??
+        mockSessions.find(
+          (s) =>
+            s.connectionId === connectionId &&
+            s.profileId === profileId &&
+            s.sessionId === sessionId,
+        )
+      : undefined;
+    return {
+      connectionId,
+      profileId,
+      ...(sessionId ? { sessionId } : {}),
+      ...(override?.title || sess?.title ? { title: override?.title ?? sess?.title } : {}),
+    };
+  }
+
+  function sanitizeMockAttachments(raw: unknown): DraftAttachment[] {
+    if (!Array.isArray(raw)) return [];
+    const out: DraftAttachment[] = [];
+    for (let i = 0; i < raw.length; i += 1) {
+      const item = raw[i];
+      if (!item || typeof item !== "object") continue;
+      const obj = item as Record<string, unknown>;
+      if (typeof obj.handle !== "string" || typeof obj.displayName !== "string") continue;
+      const kind =
+        obj.kind === "image" || obj.kind === "text" || obj.kind === "binary" ? obj.kind : "file";
+      out.push({
+        attachmentId:
+          typeof obj.attachmentId === "string" && obj.attachmentId
+            ? obj.attachmentId
+            : `att-${i + 1}-${obj.handle}`,
+        handle: obj.handle,
+        displayName: obj.displayName,
+        kind,
+        ...(typeof obj.sizeBytes === "number" ? { sizeBytes: obj.sizeBytes } : {}),
+        ...(typeof obj.expired === "boolean" ? { expired: obj.expired } : {}),
+      });
+    }
+    return out;
+  }
+
+  function sanitizeMockContexts(raw: unknown): DraftContextItem[] {
+    if (!Array.isArray(raw)) return [];
+    const out: DraftContextItem[] = [];
+    for (const item of raw) {
+      if (!item || typeof item !== "object") continue;
+      const obj = item as Record<string, unknown>;
+      if (typeof obj.contextId !== "string" || typeof obj.label !== "string") continue;
+      const kind =
+        obj.kind === "artifact" || obj.kind === "line_range" || obj.kind === "snippet"
+          ? obj.kind
+          : "file";
+      out.push({
+        contextId: obj.contextId,
+        kind,
+        ref: typeof obj.ref === "string" ? obj.ref : obj.label,
+        label: obj.label,
+        ...(typeof obj.version === "string" || typeof obj.version === "number"
+          ? { version: obj.version }
+          : {}),
+      });
+    }
+    return out;
+  }
+
+  function sanitizeMockComposer(raw: unknown, existing?: DraftComposerState): DraftComposerState {
+    if (!raw || typeof raw !== "object") return existing ?? {};
+    const obj = raw as Record<string, unknown>;
+    return {
+      ...(typeof obj.selectionStart === "number"
+        ? { selectionStart: obj.selectionStart }
+        : existing?.selectionStart !== undefined
+          ? { selectionStart: existing.selectionStart }
+          : {}),
+      ...(typeof obj.selectionEnd === "number"
+        ? { selectionEnd: obj.selectionEnd }
+        : existing?.selectionEnd !== undefined
+          ? { selectionEnd: existing.selectionEnd }
+          : {}),
+      ...(typeof obj.sendOnEnter === "boolean"
+        ? { sendOnEnter: obj.sendOnEnter }
+        : existing?.sendOnEnter !== undefined
+          ? { sendOnEnter: existing.sendOnEnter }
+          : {}),
+    };
+  }
+
+  function orphanMockDraftsMatching(
+    predicate: (key: string, draft: DraftRecord) => boolean,
+    reason: OrphanedDraftReason,
+  ): number {
+    const draftsByKey = { ...(currentChatState.draftsByKey ?? {}) };
+    const orphanedDrafts = [...(currentChatState.orphanedDrafts ?? [])];
+    let count = 0;
+    for (const [key, draft] of Object.entries(draftsByKey)) {
+      if (!predicate(key, draft)) continue;
+      delete draftsByKey[key];
+      if (isDraftRecordEmpty(draft)) continue;
+      mockDraftCounter += 1;
+      orphanedDrafts.unshift({
+        orphanedId: `orphan-${Date.now()}-${mockDraftCounter}`,
+        draftId: draft.draftId,
+        text: draft.text,
+        attachments: draft.attachments.map((a) => ({ ...a })),
+        contexts: draft.contexts.map((c) => ({ ...c })),
+        ...(draft.annotations?.length ? { annotations: [...draft.annotations] } : {}),
+        origin: { ...draft.origin },
+        reason,
+        orphanedAt: new Date().toISOString(),
+      });
+      count += 1;
+    }
+    if (count > 0) {
+      currentChatState = recomputeMockDraftState({
+        ...currentChatState,
+        draftsByKey,
+        orphanedDrafts,
+      });
+      emitChatStatePatch();
+    }
+    return count;
+  }
+
+  function migrateMockNewChatDraft(
+    connectionId: string,
+    profileId: string,
+    draftId: string | undefined,
+    sessionId: string,
+  ): void {
+    const draftsByKey = { ...(currentChatState.draftsByKey ?? {}) };
+    let sourceKey: string | undefined;
+    if (draftId) {
+      const candidateKey = makeNewChatDraftKey(connectionId, profileId, draftId);
+      if (draftsByKey[candidateKey]) sourceKey = candidateKey;
+    }
+    if (!sourceKey) return;
+    const source = draftsByKey[sourceKey];
+    const targetKey = makeActiveChatDraftKey(connectionId, profileId, sessionId);
+    delete draftsByKey[sourceKey];
+    draftsByKey[targetKey] = {
+      ...source,
+      sessionId,
+      scope: { connectionId, profileId },
+      origin: resolveMockDraftOrigin(connectionId, profileId, sessionId, source.origin),
+      revision: source.revision + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    currentChatState = recomputeMockDraftState({
+      ...currentChatState,
+      draftsByKey,
+    });
+    emitChatStatePatch();
+  }
+
+  function markMockDraftDeliveryStatus(
+    connectionId: string,
+    profileId: string,
+    sessionId: string | undefined,
+    draftId: string | undefined,
+    status: DraftDeliveryStatus,
+  ): void {
+    const draftsByKey = { ...(currentChatState.draftsByKey ?? {}) };
+    const key = sessionId
+      ? makeActiveChatDraftKey(connectionId, profileId, sessionId)
+      : draftId
+        ? makeNewChatDraftKey(connectionId, profileId, draftId)
+        : undefined;
+    if (!key || !draftsByKey[key]) return;
+    draftsByKey[key] = {
+      ...draftsByKey[key],
+      deliveryStatus: status,
+      revision: draftsByKey[key].revision + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    currentChatState = recomputeMockDraftState({
+      ...currentChatState,
+      draftsByKey,
+    });
+    emitChatStatePatch();
+  }
+
+  function clearMockDraftOnReceipt(
+    connectionId: string,
+    profileId: string,
+    sessionId: string | undefined,
+    draftId: string | undefined,
+    receiptStatus: "accepted" | "admitted",
+  ): void {
+    if (!shouldClearDraftForReceipt(receiptStatus)) return;
+    const draftsByKey = { ...(currentChatState.draftsByKey ?? {}) };
+    let changed = false;
+    if (sessionId) {
+      const activeKey = makeActiveChatDraftKey(connectionId, profileId, sessionId);
+      if (draftsByKey[activeKey]) {
+        delete draftsByKey[activeKey];
+        changed = true;
+      }
+    }
+    if (draftId) {
+      const newKey = makeNewChatDraftKey(connectionId, profileId, draftId);
+      if (draftsByKey[newKey]) {
+        delete draftsByKey[newKey];
+        changed = true;
+      }
+    }
+    if (changed) {
+      currentChatState = recomputeMockDraftState({
+        ...currentChatState,
+        draftsByKey,
+      });
+      emitChatStatePatch();
     }
   }
 
@@ -1652,6 +1993,10 @@ export function createMockHostBridge(): HermesHost {
         approvalCoordinator.setActiveScope(mockActiveScope);
         emitMockFleet();
       }
+      orphanMockDraftsMatching(
+        (_k, draft) => draft.scope.connectionId === connectionId,
+        "connection_removed",
+      );
       return {
         committed: true,
         snapshot,
@@ -2017,6 +2362,13 @@ export function createMockHostBridge(): HermesHost {
     },
     "sessions.create": async (payload, scope) => {
       e2eCounts.sessionsCreateCalls += 1;
+      const liveFixture = readE2EFixture() ?? fixture;
+      const draftId = typeof payload.draftId === "string" && payload.draftId ? payload.draftId : undefined;
+      if (liveFixture?.failSessionCreate) {
+        const err = new Error("session.create failed");
+        (err as { code?: string }).code = "unavailable";
+        throw err;
+      }
       if (fixture) {
         const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
         const profileId =
@@ -2052,9 +2404,13 @@ export function createMockHostBridge(): HermesHost {
           activeStatus: "ready",
           missingSession: null,
         };
+        if (draftId) {
+          migrateMockNewChatDraft(connectionId, profileId, draftId, sessionId);
+        } else {
+          emitChatStatePatch();
+        }
         emitSessionsSnapshot();
         emitFleetSnapshot();
-        emitChatStatePatch();
         approvalCoordinator.setActiveScope(currentFleet.activeScope);
         return { session: created, transcript, fleet: currentFleet };
       }
@@ -2109,6 +2465,9 @@ export function createMockHostBridge(): HermesHost {
       mockActiveScope = { connectionId: cid, profileId: pid, sessionId };
       mockActiveSessionId = sessionId;
       approvalCoordinator.setActiveScope(mockActiveScope);
+      if (draftId) {
+        migrateMockNewChatDraft(cid, pid, draftId, sessionId);
+      }
       emitMockFleet();
       return { session, transcript: snapshot, fleet: getMockFleet() };
     },
@@ -2347,44 +2706,223 @@ export function createMockHostBridge(): HermesHost {
       return currentChatState;
     },
     "chatState.saveDraft": async (payload, scope) => {
-      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const connectionId =
+        scope?.connectionId ??
+        currentFleet.activeScope?.connectionId ??
+        mockActiveScope?.connectionId ??
+        "local";
       const profileId =
         typeof payload.profileId === "string"
           ? payload.profileId
-          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+          : scope?.profileId ??
+            currentFleet.activeScope?.profileId ??
+            mockActiveScope?.profileId ??
+            "default";
       const sessionId =
-        typeof payload.sessionId === "string" ? payload.sessionId : scope?.sessionId;
-      if (!sessionId) return currentChatState;
-      const text = typeof payload.text === "string" ? payload.text : undefined;
-      const key = `${connectionId}::${profileId}::${sessionId}`;
-      const existing = currentChatState.sessionSummaries[key];
-      const nextText = text !== undefined ? text : existing?.draftText ?? "";
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : scope?.sessionId;
+      const requestedDraftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
+      const key = sessionId
+        ? makeActiveChatDraftKey(connectionId, profileId, sessionId)
+        : makeNewChatDraftKey(connectionId, profileId, requestedDraftId ?? makeMockDraftId());
+      const existing = currentChatState.draftsByKey?.[key];
+      const existingSummary = sessionId
+        ? currentChatState.sessionSummaries[`${connectionId}::${profileId}::${sessionId}`]
+        : undefined;
+      const draftId = existing?.draftId ?? requestedDraftId ?? makeMockDraftId();
+      const nextText =
+        typeof payload.text === "string"
+          ? payload.text
+          : existing?.text ?? existingSummary?.draftText ?? "";
+      const nextAttachments = Array.isArray(payload.attachments)
+        ? sanitizeMockAttachments(payload.attachments)
+        : existing?.attachments ?? [];
+      const nextContexts = Array.isArray(payload.contexts)
+        ? sanitizeMockContexts(payload.contexts)
+        : existing?.contexts ?? [];
+      const nextComposer = sanitizeMockComposer(payload.composer, existing?.composer);
       const nextAnnotations = Array.isArray(payload.annotations)
         ? (payload.annotations as ArtifactAnnotation[])
-        : existing?.annotations;
-      const hasText = nextText.trim().length > 0;
-      const hasAnnotations = Boolean(nextAnnotations && nextAnnotations.length > 0);
-      const hasDraft = hasText || hasAnnotations;
-      currentChatState = {
-        ...currentChatState,
-        sessionSummaries: {
-          ...currentChatState.sessionSummaries,
-          [key]: {
-            connectionId,
-            profileId,
-            sessionId,
-            title: existing?.title ?? sessionId,
-            preview: existing?.preview,
-            updatedAt: existing?.updatedAt,
-            hasDraft,
-            ...(hasText ? { draftText: nextText } : {}),
-            ...(hasAnnotations && nextAnnotations ? { annotations: nextAnnotations } : {}),
-            lastKnownMessages: existing?.lastKnownMessages,
-          },
-        },
+        : existing?.annotations ?? existingSummary?.annotations;
+      const candidate: DraftRecord = {
+        draftId,
+        ...(sessionId ? { sessionId } : {}),
+        scope: { connectionId, profileId },
+        text: nextText,
+        attachments: nextAttachments,
+        contexts: nextContexts,
+        ...(nextAnnotations && nextAnnotations.length > 0 ? { annotations: nextAnnotations } : {}),
+        composer: nextComposer,
+        updatedAt: new Date().toISOString(),
+        revision: (existing?.revision ?? 0) + 1,
+        origin: resolveMockDraftOrigin(
+          connectionId,
+          profileId,
+          sessionId,
+          payload.origin && typeof payload.origin === "object"
+            ? (payload.origin as Partial<DraftOrigin>)
+            : existing?.origin,
+        ),
+        ...(typeof payload.deliveryStatus === "string"
+          ? { deliveryStatus: payload.deliveryStatus as DraftDeliveryStatus }
+          : existing?.deliveryStatus
+            ? { deliveryStatus: existing.deliveryStatus }
+            : {}),
       };
+
+      const draftsByKey = { ...(currentChatState.draftsByKey ?? {}) };
+      if (isDraftRecordEmpty(candidate)) {
+        delete draftsByKey[key];
+      } else {
+        const capacity = checkDraftCapacity(
+          candidate,
+          draftsByKey,
+          key,
+          currentChatState.orphanedDrafts ?? [],
+        );
+        if (!capacity.ok) {
+          const err = new Error(
+            capacity.reason === "over_single_limit"
+              ? getCopy("draft.capacityExceededSingle")
+              : getCopy("draft.capacityExceededTotal"),
+          );
+          (err as { code?: ErrorCode }).code = "invalid_request";
+          throw err;
+        }
+        draftsByKey[key] = candidate;
+      }
+
+      currentChatState = recomputeMockDraftState({
+        ...currentChatState,
+        draftsByKey,
+      });
       emitChatStatePatch();
       return currentChatState;
+    },
+    "chatState.clearDraft": async (payload, scope) => {
+      const connectionId =
+        scope?.connectionId ??
+        currentFleet.activeScope?.connectionId ??
+        mockActiveScope?.connectionId ??
+        "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ??
+            currentFleet.activeScope?.profileId ??
+            mockActiveScope?.profileId ??
+            "default";
+      const sessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : scope?.sessionId;
+      const draftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
+      const key = sessionId
+        ? makeActiveChatDraftKey(connectionId, profileId, sessionId)
+        : draftId
+          ? makeNewChatDraftKey(connectionId, profileId, draftId)
+          : undefined;
+      if (key && currentChatState.draftsByKey?.[key]) {
+        const draftsByKey = { ...(currentChatState.draftsByKey ?? {}) };
+        delete draftsByKey[key];
+        currentChatState = recomputeMockDraftState({
+          ...currentChatState,
+          draftsByKey,
+        });
+        emitChatStatePatch();
+      }
+      return currentChatState;
+    },
+    "chatState.markAttachmentExpired": async (payload, scope) => {
+      const connectionId =
+        scope?.connectionId ??
+        currentFleet.activeScope?.connectionId ??
+        mockActiveScope?.connectionId ??
+        "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ??
+            currentFleet.activeScope?.profileId ??
+            mockActiveScope?.profileId ??
+            "default";
+      const sessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : scope?.sessionId;
+      const draftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
+      const handle = typeof payload.handle === "string" ? payload.handle : "";
+      const key = sessionId
+        ? makeActiveChatDraftKey(connectionId, profileId, sessionId)
+        : draftId
+          ? makeNewChatDraftKey(connectionId, profileId, draftId)
+          : undefined;
+      const existing = key ? currentChatState.draftsByKey?.[key] : undefined;
+      if (key && existing && handle) {
+        const draftsByKey = {
+          ...(currentChatState.draftsByKey ?? {}),
+          [key]: {
+            ...existing,
+            attachments: existing.attachments.map((att) =>
+              att.handle === handle ? { ...att, expired: true } : att,
+            ),
+            revision: existing.revision + 1,
+            updatedAt: new Date().toISOString(),
+          },
+        };
+        currentChatState = recomputeMockDraftState({
+          ...currentChatState,
+          draftsByKey,
+        });
+        emitChatStatePatch();
+      }
+      return currentChatState;
+    },
+    "chatState.deleteOrphanedDraft": async (payload) => {
+      const orphanId =
+        typeof payload.orphanedId === "string"
+          ? payload.orphanedId
+          : typeof payload.orphanId === "string"
+            ? payload.orphanId
+            : "";
+      if (
+        orphanId &&
+        (currentChatState.orphanedDrafts ?? []).some((o) => o.orphanedId === orphanId)
+      ) {
+        currentChatState = recomputeMockDraftState({
+          ...currentChatState,
+          orphanedDrafts: (currentChatState.orphanedDrafts ?? []).filter(
+            (o) => o.orphanedId !== orphanId,
+          ),
+        });
+        emitChatStatePatch();
+      }
+      return currentChatState;
+    },
+    "chatState.exportOrphanedDraft": async (payload): Promise<DraftExportBundle> => {
+      const orphanId =
+        typeof payload.orphanedId === "string"
+          ? payload.orphanedId
+          : typeof payload.orphanId === "string"
+            ? payload.orphanId
+            : "";
+      const hit = (currentChatState.orphanedDrafts ?? []).find((o) => o.orphanedId === orphanId);
+      if (!hit) {
+        const err = new Error(`Orphaned draft not found: ${orphanId}`);
+        (err as { code?: ErrorCode }).code = "not_found";
+        throw err;
+      }
+      return buildOrphanedDraftExport(hit, new Date().toISOString());
     },
     "artifacts.list": async (payload, scope) => {
       const liveFixture = readE2EFixture() ?? fixture;
@@ -2867,6 +3405,12 @@ export function createMockHostBridge(): HermesHost {
     "chatState.exportMissingSession": async (): Promise<MissingSessionExport | null> => {
       if (!currentChatState.missingSession) return null;
       const m = currentChatState.missingSession;
+      const key = makeActiveChatDraftKey(m.connectionId, m.profileId, m.sessionId);
+      const draft = currentChatState.draftsByKey?.[key];
+      orphanMockDraftsMatching(
+        (k) => k === key,
+        "session_missing_exported",
+      );
       return {
         exportedAt: "2026-11-23T07:00:00.000Z",
         windowId: "primary",
@@ -2877,11 +3421,21 @@ export function createMockHostBridge(): HermesHost {
           sessionId: m.sessionId,
         },
         sessionTitle: m.title,
-        draftText: m.draftText ?? "",
+        draftText: draft?.text ?? m.draftText ?? "",
+        ...(draft?.attachments.length ? { attachments: draft.attachments } : {}),
+        ...(draft?.contexts.length ? { contexts: draft.contexts } : {}),
         messages: m.lastKnownMessages ?? [],
       };
     },
     "chatState.dismissMissingSession": async () => {
+      const m = currentChatState.missingSession;
+      if (m) {
+        const key = makeActiveChatDraftKey(m.connectionId, m.profileId, m.sessionId);
+        orphanMockDraftsMatching(
+          (k) => k === key,
+          "session_missing_closed",
+        );
+      }
       const fallback = currentFleet.sessions[0] ?? null;
       currentFleet = {
         ...currentFleet,
@@ -2911,6 +3465,105 @@ export function createMockHostBridge(): HermesHost {
       return currentChatState;
     },
     "prompts.send": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      const draftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
+      if (fixture) {
+        const cid =
+          typeof payload.connectionId === "string" && payload.connectionId
+            ? payload.connectionId
+            : scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "";
+        const pid =
+          typeof payload.profileId === "string" && payload.profileId
+            ? payload.profileId
+            : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+        const sid =
+          typeof payload.sessionId === "string" && payload.sessionId
+            ? payload.sessionId
+            : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+        const text = typeof payload.text === "string" ? payload.text.trim() : "";
+        const connReady = currentFleet.connections.some(
+          (c) => c.connectionId === cid && c.actual === "ready",
+        );
+        if (!cid || !sid || !connReady) {
+          const err = new Error("Not connected to Gateway");
+          (err as { code?: string }).code = "unreachable";
+          throw err;
+        }
+        if (liveFixture?.failPromptSend) {
+          markMockDraftDeliveryStatus(cid, pid, sid, draftId, "delivery_unknown");
+          const err = new Error("Delivery status unknown");
+          (err as { code?: string }).code = "gateway_error";
+          throw err;
+        }
+        const receiptMode = liveFixture?.promptReceiptMode ?? "accepted";
+        if (receiptMode === "delivery_unknown") {
+          markMockDraftDeliveryStatus(cid, pid, sid, draftId, "delivery_unknown");
+          return {
+            accepted: false,
+            deliveryUnknown: true,
+            receipt: "delivery_unknown",
+            receiptStatus: "delivery_unknown",
+            connectionId: cid,
+            profileId: pid,
+            sessionId: sid,
+          };
+        }
+
+        const now = new Date().toISOString();
+        const turnId = `mock-turn-${Date.now()}`;
+        const txKey = `${cid}::${pid}::${sid}`;
+        const baseTx =
+          lookupTranscript(transcriptMap, cid, pid, sid) ??
+          makeEmptyTranscript(cid, pid, sid);
+        const userMsg = {
+          messageId: `mock-u-${Date.now()}`,
+          sessionId: sid,
+          role: "user" as const,
+          text,
+          createdAt: now,
+          status: "complete" as const,
+        };
+        const assistantMsg = {
+          messageId: `mock-a-${Date.now() + 1}`,
+          sessionId: sid,
+          role: "assistant" as const,
+          text: `Mock Gateway (${cid}) received: ${text}`,
+          createdAt: now,
+          turnId,
+          streaming: false,
+          status: "complete" as const,
+        };
+        const nextTx: SessionTranscriptSnapshot = {
+          ...baseTx,
+          messages: [...baseTx.messages, userMsg, assistantMsg],
+        };
+        transcriptMap.set(txKey, nextTx);
+        emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
+          type: "message_upsert",
+          sessionId: sid,
+          message: userMsg,
+        });
+        emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
+          type: "message_upsert",
+          sessionId: sid,
+          message: assistantMsg,
+        });
+        clearMockDraftOnReceipt(cid, pid, sid, draftId, receiptMode);
+        return {
+          accepted: receiptMode === "accepted",
+          admitted: receiptMode === "admitted",
+          receipt: receiptMode,
+          receiptStatus: receiptMode,
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          turnId,
+        };
+      }
+
       const cid =
         typeof payload.connectionId === "string" && payload.connectionId
           ? payload.connectionId
@@ -2966,8 +3619,10 @@ export function createMockHostBridge(): HermesHost {
           message: assistantMsg,
         });
       }
+      clearMockDraftOnReceipt(cid, pid, sid, draftId, "accepted");
       return {
         accepted: true,
+        receiptStatus: "accepted",
         connectionId: cid,
         profileId: pid,
         sessionId: sid,
@@ -3546,6 +4201,8 @@ export function createMockHostBridge(): HermesHost {
         const sid = scope.sessionId;
         const cid = scope.connectionId ?? "local";
         const pid = scope.profileId ?? "default";
+        const entry = { scope, seq: 0, listener };
+        transcriptListeners.add(entry);
         let active = true;
         queueMicrotask(() => {
           if (!active) return;
@@ -3562,13 +4219,14 @@ export function createMockHostBridge(): HermesHost {
           }
           const snap =
             lookupTranscript(transcriptMap, cid, pid, sid) ?? makeEmptyTranscript(cid, pid, sid);
+          entry.seq = 0;
           listener({
             topic: "session.transcript",
             scope,
             kind: "snapshot",
             seq: 0,
             revision: 1,
-            payload: snap,
+            payload: { ...snap, messages: [...snap.messages] },
           });
           const events = fixture.transcriptEventsOnSubscribe?.[sid];
           if (events && !emittedTranscriptSubs.has(sid)) {
@@ -3583,6 +4241,7 @@ export function createMockHostBridge(): HermesHost {
         });
         return () => {
           active = false;
+          transcriptListeners.delete(entry);
         };
       } else if (topic === "session.transcript") {
         const entry = { scope, seq: 0, listener };

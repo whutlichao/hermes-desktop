@@ -16,3 +16,4 @@ export * from "./fleetLifecycle";
 export * from "./backgroundJournal";
 export * from "./approvalCoordinator";
 export * from "./terminal";
+export * from "./drafts";

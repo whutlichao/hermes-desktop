@@ -1269,3 +1269,218 @@ describe("MockHostBridge Ticket #37 Background journal, attention, markRead, and
     }
   });
 });
+
+describe("MockHostBridge Ticket #38 Drafts and OrphanedDrafts parity", () => {
+  it("supports ActiveChat and new-chat Drafts, capacity check, atomic session.create migration, delivery_unknown vs receipt clearing, and OrphanedDraft lifecycle", async () => {
+    const prevFixture = (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__;
+    try {
+      const fix: Record<string, unknown> = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              label: "This device",
+              kind: "local",
+              originDisplay: "127.0.0.1",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              title: "Session One",
+              preview: "",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+          activeSessionId: "sess-1",
+        },
+      };
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = fix;
+
+      const mock = createMockHostBridge();
+      const scope = { connectionId: "local", profileId: "default", sessionId: "sess-1" };
+
+      // 1. Save new-chat draft & keep it when session.create fails
+      const saveNew = await mock.request<{
+        draftsByKey?: Record<string, { draftId: string; text: string; revision: number }>;
+      }>(
+        "chatState.saveDraft",
+        {
+          draftId: "draft-new-1",
+          profileId: "default",
+          text: "Hello before session create",
+          attachments: [{ handle: "att-1", displayName: "notes.txt", kind: "file" }],
+        },
+        { connectionId: "local", profileId: "default" },
+      );
+      expect(saveNew.ok).toBe(true);
+      if (saveNew.ok) {
+        expect(saveNew.value.draftsByKey?.["new::local::default::draft-new-1"]?.text).toBe(
+          "Hello before session create",
+        );
+      }
+
+      fix.failSessionCreate = true;
+      const failCreate = await mock.request("sessions.create", {
+        title: "Should fail",
+        profileId: "default",
+        draftId: "draft-new-1",
+      });
+      expect(failCreate.ok).toBe(false);
+
+      // Draft stays intact under new:: key
+      const afterFail = await mock.request<{
+        draftsByKey?: Record<string, { draftId: string; text: string }>;
+      }>("chatState.get", {});
+      expect(afterFail.ok).toBe(true);
+      if (afterFail.ok) {
+        expect(afterFail.value.draftsByKey?.["new::local::default::draft-new-1"]?.draftId).toBe(
+          "draft-new-1",
+        );
+      }
+
+      // 2. Atomic migration when session.create succeeds
+      fix.failSessionCreate = false;
+      const okCreate = await mock.request<{ session: { sessionId: string } }>(
+        "sessions.create",
+        { title: "Migrated", profileId: "default", draftId: "draft-new-1" },
+        { connectionId: "local", profileId: "default" },
+      );
+      expect(okCreate.ok).toBe(true);
+      const createdId = okCreate.ok ? okCreate.value.session.sessionId : "";
+
+      const afterMigrate = await mock.request<{
+        draftsByKey?: Record<string, { draftId: string; sessionId?: string; text: string }>;
+      }>("chatState.get", {});
+      expect(afterMigrate.ok).toBe(true);
+      if (afterMigrate.ok) {
+        expect(afterMigrate.value.draftsByKey?.["new::local::default::draft-new-1"]).toBeUndefined();
+        expect(
+          afterMigrate.value.draftsByKey?.[`chat::local::default::${createdId}`]?.draftId,
+        ).toBe("draft-new-1");
+      }
+
+      // 3. delivery_unknown keeps draft; accepted clears draft
+      fix.promptReceiptMode = "delivery_unknown";
+      const unknownSend = await mock.request<{ deliveryUnknown?: boolean }>(
+        "prompts.send",
+        { sessionId: createdId, text: "Hello before session create", draftId: "draft-new-1" },
+        { connectionId: "local", profileId: "default", sessionId: createdId },
+      );
+      expect(unknownSend.ok && unknownSend.value.deliveryUnknown).toBe(true);
+      const afterUnknown = await mock.request<{
+        draftsByKey?: Record<string, { deliveryStatus?: string }>;
+      }>("chatState.get", {});
+      expect(
+        afterUnknown.ok &&
+          afterUnknown.value.draftsByKey?.[`chat::local::default::${createdId}`]?.deliveryStatus,
+      ).toBe("delivery_unknown");
+
+      fix.promptReceiptMode = "accepted";
+      const acceptedSend = await mock.request<{ accepted?: boolean }>(
+        "prompts.send",
+        { sessionId: createdId, text: "Hello before session create", draftId: "draft-new-1" },
+        { connectionId: "local", profileId: "default", sessionId: createdId },
+      );
+      expect(acceptedSend.ok && acceptedSend.value.accepted).toBe(true);
+      const afterAccepted = await mock.request<{
+        draftsByKey?: Record<string, unknown>;
+      }>("chatState.get", {});
+      expect(
+        afterAccepted.ok && afterAccepted.value.draftsByKey?.[`chat::local::default::${createdId}`],
+      ).toBeUndefined();
+
+      // 4. Capacity check > 1 MiB rejects overwrite & markAttachmentExpired flags handle
+      const oversized = await mock.request(
+        "chatState.saveDraft",
+        { sessionId: "sess-1", profileId: "default", text: "x".repeat(1024 * 1024 + 512) },
+        scope,
+      );
+      expect(oversized.ok).toBe(false);
+
+      await mock.request(
+        "chatState.saveDraft",
+        {
+          sessionId: "sess-1",
+          profileId: "default",
+          text: "keep attachment",
+          attachments: [{ handle: "att-exp-1", displayName: "doc.pdf", kind: "file" }],
+        },
+        scope,
+      );
+      const expRes = await mock.request<{
+        draftsByKey?: Record<string, { attachments: Array<{ expired?: boolean }> }>;
+      }>(
+        "chatState.markAttachmentExpired",
+        { sessionId: "sess-1", profileId: "default", handle: "att-exp-1" },
+        scope,
+      );
+      expect(
+        expRes.ok &&
+          expRes.value.draftsByKey?.["chat::local::default::sess-1"]?.attachments[0]?.expired,
+      ).toBe(true);
+
+      // 5. Connection removal orphans non-empty drafts and supports export + delete
+      const addSsh = await mock.request<ConnectionMutationResponse>("connections.add", {
+        kind: "ssh",
+        label: "Temp Node",
+        host: "lab.local",
+        user: "ubuntu",
+      });
+      expect(addSsh.ok && addSsh.value.committed).toBe(true);
+      const tempConnId = addSsh.ok ? addSsh.value.snapshot.connections[1]?.id ?? "temp-node" : "temp-node";
+
+      await mock.request(
+        "chatState.saveDraft",
+        {
+          draftId: "draft-orphan-1",
+          profileId: "default",
+          text: "Orphan me on remove",
+        },
+        { connectionId: tempConnId, profileId: "default" },
+      );
+
+      await mock.request("connections.remove", { connectionId: tempConnId });
+      const afterRemove = await mock.request<{
+        orphanedDrafts?: Array<{ orphanedId: string; reason: string; text: string }>;
+      }>("chatState.get", {});
+      const orphan = afterRemove.ok ? afterRemove.value.orphanedDrafts?.[0] : undefined;
+      expect(orphan?.reason).toBe("connection_removed");
+      expect(orphan?.text).toBe("Orphan me on remove");
+
+      const expOrphan = await mock.request<{ kind: string; text: string }>(
+        "chatState.exportOrphanedDraft",
+        { orphanedId: orphan?.orphanedId },
+      );
+      expect(expOrphan.ok && expOrphan.value.kind).toBe("orphaned_draft");
+
+      const delOrphan = await mock.request<{ orphanedDrafts?: unknown[] }>(
+        "chatState.deleteOrphanedDraft",
+        { orphanedId: orphan?.orphanedId },
+      );
+      expect(delOrphan.ok && delOrphan.value.orphanedDrafts).toHaveLength(0);
+    } finally {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
+    }
+  });
+});
