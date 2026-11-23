@@ -301,61 +301,8 @@ export function createMockHostBridge(): HermesHost {
     mcpListCalls: 0,
     mcpReloadCalls: 0,
   };
-  let mockOwnerGen = 1;
-  function applyMockCapabilitiesHandshake(connectionId: string, profileId: string) {
-    const liveFixture = readE2EFixture() ?? fixture;
-    const served = liveFixture?.capabilities?.servedMethods ?? [
-      "prompt.submit",
-      "prompt.cancel",
-      "session.steer",
-      "session.list",
-      "session.create",
-      "session.resume",
-      "profiles.list",
-      "config.get",
-      "config.update",
-    ];
-    capabilityRegistry.applyConnectHandshake({
-      connectionId,
-      profileId,
-      ownerGeneration: mockOwnerGen,
-      authorityEpoch: 1,
-      gatewayVersionOrSha: "mock-e2e-v1",
-      serverRequestsSupported: true,
-      describeResult: {
-        served_methods: served,
-        older_methods: liveFixture?.capabilities?.olderMethods ?? [],
-        refused_methods: liveFixture?.capabilities?.refusedMethods ?? [],
-        ...(liveFixture?.capabilities?.capabilityTags
-          ? { capabilities: liveFixture.capabilities.capabilityTags }
-          : {}),
-        session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
-      },
-    });
-    if (liveFixture?.capabilities?.probedDomains) {
-      for (const [dom, outcome] of Object.entries(liveFixture.capabilities.probedDomains)) {
-        const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === dom);
-        if (meta?.probeMethod) {
-          capabilityRegistry.applyProbeOutcome({
-            domain: dom as CapabilityDomainId,
-            method: meta.probeMethod,
-            outcome,
-            expectedOwnerGeneration: mockOwnerGen,
-            expectedAuthorityEpoch: 1,
-          });
-        }
-      }
-    }
-  }
   if (fixture) {
     (globalThis as { __HERMES_E2E_COUNTS__?: typeof e2eCounts }).__HERMES_E2E_COUNTS__ = e2eCounts;
-    const readyConn = currentFleet.connections.find((c) => c.actual === "ready");
-    if (readyConn || fixture.capabilities) {
-      applyMockCapabilitiesHandshake(
-        currentFleet.activeScope?.connectionId ?? readyConn?.connectionId ?? "local",
-        currentFleet.activeScope?.profileId ?? "default",
-      );
-    }
   }
 
   const defaultConfigValues: Record<string, GatewayConfigValue> = {};
@@ -446,13 +393,20 @@ export function createMockHostBridge(): HermesHost {
     "subagent.tail",
   ];
 
-  function applyMockCapabilityHandshake(liveFix?: MockE2EFixture) {
+  function applyMockCapabilityHandshake(
+    liveFix?: MockE2EFixture,
+    overrideScope?: { connectionId?: string; profileId?: string },
+  ) {
     const activeConn =
       currentFleet.connections.find((c) => c.actual === "ready") ??
       mockConnections.find((c) => c.actual === "ready");
     if (!activeConn && !liveFix?.capabilities) return;
-    const cid = currentFleet.activeScope?.connectionId ?? activeConn?.connectionId ?? "local";
-    const pid = currentFleet.activeScope?.profileId ?? "default";
+    const cid =
+      overrideScope?.connectionId ??
+      currentFleet.activeScope?.connectionId ??
+      activeConn?.connectionId ??
+      "local";
+    const pid = overrideScope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
     const served =
       liveFix?.capabilities?.servedMethods ??
       liveFix?.servedMethods ??
@@ -470,6 +424,9 @@ export function createMockHostBridge(): HermesHost {
         served_methods: served,
         older_methods: older,
         refused_methods: refused,
+        ...(liveFix?.capabilities?.capabilityTags
+          ? { capabilities: liveFix.capabilities.capabilityTags }
+          : {}),
         session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
       },
     });
@@ -1580,7 +1537,10 @@ export function createMockHostBridge(): HermesHost {
         const capKey = capabilityRegistry.getSnapshot().key;
         if (capKey.connectionId !== cid || capKey.profileId !== pid) {
           mockOwnerGen += 1;
-          applyMockCapabilitiesHandshake(cid, pid);
+          applyMockCapabilityHandshake(readE2EFixture() ?? fixture, {
+            connectionId: cid,
+            profileId: pid,
+          });
           emitCapabilitiesPatch();
         }
         emitFleetSnapshot();
