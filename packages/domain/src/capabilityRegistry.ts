@@ -12,6 +12,10 @@ import type {
   CapabilityRuntimeStatus,
   CapabilitySnapshot,
   CapabilitySource,
+  CronJobRow,
+  CronJobStatus,
+  CronStateView,
+  DomainInspectStatus,
   ExtensionCliAction,
   ExtensionInventoryStatus,
   ExtensionInventoryView,
@@ -19,6 +23,10 @@ import type {
   ExternalAttribution,
   McpInventoryRow,
   McpInventoryView,
+  MemoryContextSection,
+  MemoryContextView,
+  MessagingConnectorRow,
+  MessagingStatusView,
   SkillInventoryRow,
   SkillsInventoryView,
   ToolInventoryRow,
@@ -261,6 +269,10 @@ export const EXPLICIT_METHOD_ALIASES: Readonly<Record<string, string>> = Object.
   "checkpoint.restore": "rollback.restore",
   "reload.skills": "skills.reload",
   "reload.mcp": "mcp.reload",
+  "routines.status": "cron.status",
+  "routines.submit": "cron.submit",
+  "routines.cancel": "cron.cancel",
+  "routines.recover": "cron.recover",
 });
 
 const EXPLICIT_REVERSE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
@@ -276,7 +288,24 @@ const EXPLICIT_REVERSE_ALIASES: Readonly<Record<string, string>> = Object.freeze
   "rollback.restore": "checkpoint.restore",
   "skills.reload": "reload.skills",
   "mcp.reload": "reload.mcp",
+  "cron.status": "routines.status",
+  "cron.submit": "routines.submit",
+  "cron.cancel": "routines.cancel",
+  "cron.recover": "routines.recover",
 });
+
+const EXPLICIT_DOMAIN_ALIASES: Readonly<Record<string, CapabilityDomainId>> = Object.freeze({
+  routines: "cron",
+});
+
+export function resolveCapabilityDomainAlias(rawDomain: string): CapabilityDomainId | null {
+  const normalized = rawDomain.trim().toLowerCase();
+  if (Object.hasOwn(EXPLICIT_DOMAIN_ALIASES, normalized)) {
+    return EXPLICIT_DOMAIN_ALIASES[normalized];
+  }
+  const match = CAPABILITY_DOMAIN_CATALOG.find((item) => item.domain === normalized);
+  return match ? match.domain : null;
+}
 
 export function resolveExplicitMethodAlias(method: string): string | null {
   if (Object.hasOwn(EXPLICIT_METHOD_ALIASES, method)) {
@@ -555,7 +584,7 @@ const ACTION_TEMPLATES: readonly ActionTemplate[] = [
     hintKey: "cap.hint.memory.inspect",
     classification: "read_only",
     requiredMethods: ["session.context_breakdown"],
-    handlerId: "capabilities.probeDomain",
+    handlerId: "surface.openMemoryInspect",
     evidenceTestId: "cap-action-memory-inspect",
   },
   {
@@ -566,7 +595,7 @@ const ACTION_TEMPLATES: readonly ActionTemplate[] = [
     hintKey: "cap.hint.cron.status",
     classification: "native",
     requiredMethods: ["cron.status"],
-    handlerId: "capabilities.probeDomain",
+    handlerId: "surface.openCronInspect",
     evidenceTestId: "cap-action-cron-status",
   },
   {
@@ -577,7 +606,7 @@ const ACTION_TEMPLATES: readonly ActionTemplate[] = [
     hintKey: "cap.hint.messaging.status",
     classification: "read_only",
     requiredMethods: ["messaging.status"],
-    handlerId: "capabilities.probeDomain",
+    handlerId: "surface.openMessagingInspect",
     evidenceTestId: "cap-action-messaging-status",
     deepLink: {
       kind: "docs",
@@ -911,6 +940,12 @@ export const OFFICIAL_TOOLS_DOCS_URL =
   "https://hermes-agent.nousresearch.com/docs/user-guide/tools";
 export const OFFICIAL_MCP_DOCS_URL =
   "https://hermes-agent.nousresearch.com/docs/user-guide/mcp";
+export const OFFICIAL_MEMORY_DOCS_URL =
+  "https://hermes-agent.nousresearch.com/docs/user-guide/memory";
+export const OFFICIAL_MESSAGING_DOCS_URL =
+  "https://hermes-agent.nousresearch.com/docs/user-guide/messaging";
+export const OFFICIAL_CRON_DOCS_URL =
+  "https://hermes-agent.nousresearch.com/docs/user-guide/cron";
 
 function buildCliAction(id: string, label: string, command: string): ExtensionCliAction {
   return {
@@ -1059,6 +1094,267 @@ export function projectSkillRows(rawSkills: unknown): SkillInventoryRow[] {
   }
 
   rows.sort((a, b) => a.name.localeCompare(b.name, "en"));
+  return rows;
+}
+
+const MEMORY_GRAPH_LEAK_RE = /memory[_\s-]?graph/i;
+const OAUTH_OR_CONNECT_LEAK_RE = /oauth|client_secret|连接账号/i;
+
+function extractFiniteInt(val: unknown): number | undefined {
+  if (typeof val === "number" && Number.isFinite(val) && val >= 0) {
+    return Math.floor(val);
+  }
+  return undefined;
+}
+
+export function projectMemoryPayload(rawPayload: unknown): {
+  sessionId?: string;
+  totalTokens?: number;
+  maxTokens?: number;
+  sections: MemoryContextSection[];
+  notes: string[];
+} {
+  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+    return { sections: [], notes: [] };
+  }
+  const obj = rawPayload as Record<string, unknown>;
+  const sessionId = sanitizeProviderToken(obj.session_id ?? obj.sessionId) ?? undefined;
+  const totalTokens = extractFiniteInt(obj.total_tokens ?? obj.totalTokens ?? obj.context_tokens);
+  const maxTokens = extractFiniteInt(obj.max_tokens ?? obj.maxTokens ?? obj.context_window);
+
+  const rawSections = Array.isArray(obj.sections)
+    ? obj.sections
+    : Array.isArray(obj.breakdown)
+      ? obj.breakdown
+      : Array.isArray(obj.categories)
+        ? obj.categories
+        : [];
+  const sections: MemoryContextSection[] = [];
+  for (let i = 0; i < rawSections.length && sections.length < 24; i += 1) {
+    const item = rawSections[i];
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const raw = item as Record<string, unknown>;
+    const id = sanitizeProviderToken(raw.id ?? raw.key) ?? `section-${i + 1}`;
+    if (MEMORY_GRAPH_LEAK_RE.test(id)) continue;
+    const label = sanitizeDisplayText(raw.label ?? raw.name ?? raw.title, 80);
+    if (!label || MEMORY_GRAPH_LEAK_RE.test(label)) continue;
+    const tokens = extractFiniteInt(raw.tokens ?? raw.token_count ?? raw.tokenCount);
+    const percentage =
+      typeof raw.percentage === "number" && Number.isFinite(raw.percentage) && raw.percentage >= 0
+        ? Math.min(100, Math.round(raw.percentage * 10) / 10)
+        : undefined;
+    const entryCount = extractFiniteInt(raw.entry_count ?? raw.entryCount ?? raw.count);
+    const summary = sanitizeDisplayText(raw.summary ?? raw.note, 160);
+    sections.push({
+      id,
+      label,
+      ...(tokens !== undefined ? { tokens } : {}),
+      ...(percentage !== undefined ? { percentage } : {}),
+      ...(entryCount !== undefined ? { entryCount } : {}),
+      ...(summary && !MEMORY_GRAPH_LEAK_RE.test(summary) ? { summary } : {}),
+    });
+  }
+
+  const notes: string[] = [];
+  if (Array.isArray(obj.notes)) {
+    for (const rawNote of obj.notes) {
+      if (notes.length >= 12) break;
+      const safe = sanitizeDisplayText(rawNote, 160);
+      if (safe && !MEMORY_GRAPH_LEAK_RE.test(safe)) {
+        notes.push(safe);
+      }
+    }
+  } else {
+    const single = sanitizeDisplayText(obj.memory_summary ?? obj.summary, 160);
+    if (single && !MEMORY_GRAPH_LEAK_RE.test(single)) {
+      notes.push(single);
+    }
+  }
+
+  return {
+    ...(sessionId ? { sessionId } : {}),
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    sections,
+    notes,
+  };
+}
+
+export function projectMessagingConnectors(rawPayload: unknown): MessagingConnectorRow[] {
+  const list = Array.isArray(rawPayload)
+    ? rawPayload
+    : rawPayload && typeof rawPayload === "object" && !Array.isArray(rawPayload)
+      ? Array.isArray((rawPayload as Record<string, unknown>).connectors)
+        ? ((rawPayload as Record<string, unknown>).connectors as unknown[])
+        : Array.isArray((rawPayload as Record<string, unknown>).channels)
+          ? ((rawPayload as Record<string, unknown>).channels as unknown[])
+          : []
+      : [];
+
+  const rows: MessagingConnectorRow[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const raw = item as Record<string, unknown>;
+    const platform =
+      sanitizeDisplayText(raw.platform ?? raw.kind ?? raw.name, 48) ??
+      sanitizeProviderToken(raw.id) ??
+      undefined;
+    if (!platform) continue;
+    const connectorId =
+      sanitizeProviderToken(raw.id ?? raw.connector_id ?? raw.connectorId) ?? platform.toLowerCase();
+    const label = sanitizeDisplayText(raw.label ?? raw.name, 64) ?? platform;
+    if (OAUTH_OR_CONNECT_LEAK_RE.test(label)) continue;
+
+    const rawStatus = typeof raw.status === "string" ? raw.status.trim().toLowerCase() : "";
+    const hasError =
+      rawStatus === "error" ||
+      rawStatus === "failed" ||
+      (raw.error !== undefined && raw.error !== null && raw.error !== "");
+    const status: MessagingConnectorRow["status"] = hasError
+      ? "error"
+      : rawStatus === "connected" || rawStatus === "ready" || raw.connected === true
+        ? "connected"
+        : rawStatus === "configured" || rawStatus === "enabled"
+          ? "configured"
+          : rawStatus === "disconnected" || rawStatus === "offline" || raw.connected === false
+            ? "disconnected"
+            : "unknown";
+    const statusLabel = getCopy(`messaging.status.${status}`);
+    const rawDetail = sanitizeDisplayText(raw.detail ?? raw.description, 120);
+    const detail = rawDetail && !OAUTH_OR_CONNECT_LEAK_RE.test(rawDetail) ? rawDetail : undefined;
+    const errorCode =
+      status === "error"
+        ? sanitizeSafeErrorCode(raw.error_code ?? raw.error, "MESSAGING_CONNECTOR_ERROR")
+        : undefined;
+    const rawCli = sanitizeDisplayText(raw.cli_command ?? raw.cliCommand, 80);
+    const cliCommand =
+      rawCli && /^hermes\s+[a-z0-9_.:-\s]+$/i.test(rawCli) && !OAUTH_OR_CONNECT_LEAK_RE.test(rawCli)
+        ? rawCli
+        : undefined;
+
+    rows.push({
+      connectorId,
+      platform,
+      label,
+      status,
+      statusLabel,
+      ...(detail ? { detail } : {}),
+      ...(errorCode ? { errorCode } : {}),
+      ...(cliCommand ? { cliCommand } : {}),
+      attribution: resolveExternalAttribution({
+        origin: typeof raw.origin === "string" ? raw.origin : undefined,
+        source: typeof raw.source === "string" ? raw.source : undefined,
+        providerKind:
+          typeof raw.provider_kind === "string"
+            ? (raw.provider_kind as CapabilityProviderKind)
+            : typeof raw.gateway_id === "string"
+              ? "gateway"
+              : undefined,
+        providerId: typeof raw.provider_id === "string" ? raw.provider_id : undefined,
+        gatewayId: typeof raw.gateway_id === "string" ? raw.gateway_id : undefined,
+        pluginName: typeof raw.plugin === "string" ? raw.plugin : undefined,
+        mcpServer: typeof raw.mcp_server === "string" ? raw.mcp_server : undefined,
+      }),
+    });
+  }
+
+  return rows;
+}
+
+export function projectCronPayload(
+  rawPayload: unknown,
+  caps: { canCancel: boolean; canRecover: boolean },
+): { jobs: CronJobRow[]; recentRunSummary?: string } {
+  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+    const list = Array.isArray(rawPayload) ? rawPayload : [];
+    return {
+      jobs: projectCronJobList(list, caps),
+    };
+  }
+  const obj = rawPayload as Record<string, unknown>;
+  const list = Array.isArray(obj.jobs)
+    ? obj.jobs
+    : Array.isArray(obj.routines)
+      ? obj.routines
+      : Array.isArray(obj.items)
+        ? obj.items
+        : [];
+  const recentRunSummary = sanitizeDisplayText(
+    obj.recent_run_summary ?? obj.recentRunSummary ?? obj.summary,
+    140,
+  );
+  return {
+    jobs: projectCronJobList(list, caps),
+    ...(recentRunSummary ? { recentRunSummary } : {}),
+  };
+}
+
+function projectCronJobList(
+  list: unknown[],
+  caps: { canCancel: boolean; canRecover: boolean },
+): CronJobRow[] {
+  const rows: CronJobRow[] = [];
+  for (let i = 0; i < list.length && rows.length < 50; i += 1) {
+    const item = list[i];
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const raw = item as Record<string, unknown>;
+    const jobId = sanitizeProviderToken(raw.id ?? raw.job_id ?? raw.jobId) ?? `cron-${i + 1}`;
+    const name = sanitizeDisplayText(raw.name ?? raw.title ?? raw.id, 80) ?? jobId;
+    const schedule = sanitizeDisplayText(raw.schedule ?? raw.cron, 48) ?? "* * * * *";
+    const promptSummary = sanitizeDisplayText(raw.prompt_summary ?? raw.promptSummary ?? raw.prompt, 140);
+    const rawStatus = typeof raw.status === "string" ? raw.status.trim().toLowerCase() : "scheduled";
+    const status: CronJobStatus =
+      rawStatus === "running"
+        ? "running"
+        : rawStatus === "succeeded" || rawStatus === "completed" || rawStatus === "ok"
+          ? "succeeded"
+          : rawStatus === "failed" || rawStatus === "error"
+            ? "failed"
+            : rawStatus === "paused"
+              ? "paused"
+              : rawStatus === "cancelled" || rawStatus === "canceled"
+                ? "cancelled"
+                : "scheduled";
+    const statusLabel = getCopy(`cron.status.${status}`);
+    const lastRunAt = sanitizeDisplayText(raw.last_run_at ?? raw.lastRunAt, 40);
+    const nextRunAt = sanitizeDisplayText(raw.next_run_at ?? raw.nextRunAt, 40);
+    const lastOutcome = sanitizeDisplayText(raw.last_outcome ?? raw.lastOutcome, 100);
+    const errorCode =
+      status === "failed"
+        ? sanitizeSafeErrorCode(raw.error_code ?? raw.error, "CRON_JOB_FAILED")
+        : undefined;
+
+    const canCancel =
+      caps.canCancel && (status === "scheduled" || status === "running" || status === "paused");
+    const canRecover =
+      caps.canRecover && (status === "failed" || status === "paused" || status === "cancelled");
+
+    rows.push({
+      jobId,
+      name,
+      schedule,
+      ...(promptSummary ? { promptSummary } : {}),
+      status,
+      statusLabel,
+      ...(lastRunAt ? { lastRunAt } : {}),
+      ...(nextRunAt ? { nextRunAt } : {}),
+      ...(lastOutcome ? { lastOutcome } : {}),
+      ...(errorCode ? { errorCode } : {}),
+      canCancel,
+      canRecover,
+      attribution: resolveExternalAttribution({
+        origin: typeof raw.origin === "string" ? raw.origin : undefined,
+        source: typeof raw.source === "string" ? raw.source : undefined,
+        providerKind:
+          typeof raw.provider_kind === "string"
+            ? (raw.provider_kind as CapabilityProviderKind)
+            : undefined,
+        providerId: typeof raw.provider_id === "string" ? raw.provider_id : undefined,
+        pluginName: typeof raw.plugin === "string" ? raw.plugin : undefined,
+        skillName: typeof raw.skill === "string" ? raw.skill : undefined,
+      }),
+    });
+  }
   return rows;
 }
 
@@ -1365,6 +1661,35 @@ export interface ApplyMcpInventoryInput {
   errorCode?: unknown;
 }
 
+export interface ApplyMemoryStateInput {
+  expectedOwnerGeneration: number;
+  expectedAuthorityEpoch: number;
+  expectedGeneration?: number;
+  outcome: "ok" | "method_not_found" | "refused" | "older" | "error";
+  sourceMethod?: "session.context_breakdown" | "session.info";
+  sessionId?: string;
+  rawPayload?: unknown;
+  errorCode?: unknown;
+}
+
+export interface ApplyMessagingStateInput {
+  expectedOwnerGeneration: number;
+  expectedAuthorityEpoch: number;
+  expectedGeneration?: number;
+  outcome: "ok" | "method_not_found" | "refused" | "older" | "error";
+  rawPayload?: unknown;
+  errorCode?: unknown;
+}
+
+export interface ApplyCronStateInput {
+  expectedOwnerGeneration: number;
+  expectedAuthorityEpoch: number;
+  expectedGeneration?: number;
+  outcome: "ok" | "method_not_found" | "refused" | "older" | "error";
+  rawPayload?: unknown;
+  errorCode?: unknown;
+}
+
 export class CapabilityRegistry {
   private generation = 1;
   private invalidationGeneration = 1;
@@ -1427,6 +1752,51 @@ export class CapabilityRegistry {
     items: [],
   };
 
+  private memoryState: {
+    probed: boolean;
+    status?: DomainInspectStatus;
+    sourceMethod?: "session.context_breakdown" | "session.info";
+    sessionId?: string;
+    totalTokens?: number;
+    maxTokens?: number;
+    sections: MemoryContextSection[];
+    notes: string[];
+    errorCode?: string;
+    degradation?: CapabilityDegradation;
+    fetchedAt: string | null;
+  } = {
+    probed: false,
+    sections: [],
+    notes: [],
+    fetchedAt: null,
+  };
+
+  private messagingState: {
+    probed: boolean;
+    status?: DomainInspectStatus;
+    connectors: MessagingConnectorRow[];
+    errorCode?: string;
+    degradation?: CapabilityDegradation;
+    fetchedAt: string | null;
+  } = {
+    probed: false,
+    connectors: [],
+    fetchedAt: null,
+  };
+
+  private cronState: {
+    probed: boolean;
+    status?: DomainInspectStatus;
+    rawPayload?: unknown;
+    recentRunSummary?: string;
+    errorCode?: string;
+    degradation?: CapabilityDegradation;
+    fetchedAt: string | null;
+  } = {
+    probed: false,
+    fetchedAt: null,
+  };
+
   private key = {
     connectionId: "none",
     profileId: "default",
@@ -1458,6 +1828,21 @@ export class CapabilityRegistry {
     this.mcpState = {
       probed: false,
       items: [],
+    };
+    this.memoryState = {
+      probed: false,
+      sections: [],
+      notes: [],
+      fetchedAt: null,
+    };
+    this.messagingState = {
+      probed: false,
+      connectors: [],
+      fetchedAt: null,
+    };
+    this.cronState = {
+      probed: false,
+      fetchedAt: null,
     };
   }
 
@@ -1833,6 +2218,197 @@ export class CapabilityRegistry {
         items: [],
         errorCode: sanitizeSafeErrorCode(input.errorCode, "MCP_FETCH_FAILED"),
         ...(lastReloadedAt ? { lastReloadedAt } : {}),
+      };
+    }
+
+    this.generation += 1;
+    this.snapshot = this.buildSnapshot();
+    return this.snapshot;
+  }
+
+  private recordDomainMethodOutcome(
+    domain: CapabilityDomainId,
+    method: string,
+    outcome: "ok" | "method_not_found" | "refused" | "older" | "error",
+  ): void {
+    this.probedDomains.add(domain);
+    if (outcome === "ok") {
+      this.timedOutDomains.delete(domain);
+      if (!this.methodTiers[method]) {
+        this.methodTiers[method] = "served";
+      }
+      return;
+    }
+    if (outcome === "method_not_found") {
+      this.timedOutDomains.delete(domain);
+      this.notFoundMethods.add(method);
+      this.methodTiers[method] = "unknown";
+      return;
+    }
+    if (outcome === "refused") {
+      this.timedOutDomains.delete(domain);
+      this.methodTiers[method] = "refused";
+      return;
+    }
+    if (outcome === "older") {
+      this.timedOutDomains.delete(domain);
+      this.methodTiers[method] = "older";
+    }
+  }
+
+  applyMemoryState(input: ApplyMemoryStateInput): CapabilitySnapshot {
+    if (!this.isValidEpochAndGeneration(input)) {
+      return this.snapshot;
+    }
+
+    const method = input.sourceMethod ?? "session.context_breakdown";
+    this.recordDomainMethodOutcome("memory", method, input.outcome);
+    const now = new Date().toISOString();
+
+    if (input.outcome === "ok") {
+      const projected = projectMemoryPayload(input.rawPayload);
+      const hasData =
+        projected.sections.length > 0 ||
+        projected.notes.length > 0 ||
+        projected.totalTokens !== undefined;
+      this.memoryState = {
+        probed: true,
+        status: hasData ? "available" : "empty",
+        sourceMethod: method,
+        sessionId: sanitizeProviderToken(input.sessionId) ?? projected.sessionId,
+        ...(projected.totalTokens !== undefined ? { totalTokens: projected.totalTokens } : {}),
+        ...(projected.maxTokens !== undefined ? { maxTokens: projected.maxTokens } : {}),
+        sections: projected.sections,
+        notes: projected.notes,
+        fetchedAt: now,
+      };
+    } else if (input.outcome === "method_not_found" || input.outcome === "refused") {
+      this.memoryState = {
+        probed: true,
+        status: "unsupported",
+        sections: [],
+        notes: [],
+        degradation: {
+          reason: input.outcome === "refused" ? "refused" : "method_not_found",
+          missingMethods: [method],
+        },
+        fetchedAt: now,
+      };
+    } else if (input.outcome === "older") {
+      this.memoryState = {
+        probed: true,
+        status: "unknown",
+        sections: [],
+        notes: [],
+        degradation: { reason: "older" },
+        fetchedAt: now,
+      };
+    } else {
+      this.memoryState = {
+        probed: true,
+        status: "error",
+        sections: [],
+        notes: [],
+        errorCode: sanitizeSafeErrorCode(input.errorCode, "MEMORY_FETCH_FAILED"),
+        fetchedAt: now,
+      };
+    }
+
+    this.generation += 1;
+    this.snapshot = this.buildSnapshot();
+    return this.snapshot;
+  }
+
+  applyMessagingState(input: ApplyMessagingStateInput): CapabilitySnapshot {
+    if (!this.isValidEpochAndGeneration(input)) {
+      return this.snapshot;
+    }
+
+    this.recordDomainMethodOutcome("messaging", "messaging.status", input.outcome);
+    const now = new Date().toISOString();
+
+    if (input.outcome === "ok") {
+      const connectors = projectMessagingConnectors(input.rawPayload);
+      this.messagingState = {
+        probed: true,
+        status: connectors.length > 0 ? "available" : "empty",
+        connectors,
+        fetchedAt: now,
+      };
+    } else if (input.outcome === "method_not_found" || input.outcome === "refused") {
+      this.messagingState = {
+        probed: true,
+        status: "unsupported",
+        connectors: [],
+        degradation: {
+          reason: input.outcome === "refused" ? "refused" : "method_not_found",
+          missingMethods: ["messaging.status"],
+        },
+        fetchedAt: now,
+      };
+    } else if (input.outcome === "older") {
+      this.messagingState = {
+        probed: true,
+        status: "unknown",
+        connectors: [],
+        degradation: { reason: "older" },
+        fetchedAt: now,
+      };
+    } else {
+      this.messagingState = {
+        probed: true,
+        status: "error",
+        connectors: [],
+        errorCode: sanitizeSafeErrorCode(input.errorCode, "MESSAGING_FETCH_FAILED"),
+        fetchedAt: now,
+      };
+    }
+
+    this.generation += 1;
+    this.snapshot = this.buildSnapshot();
+    return this.snapshot;
+  }
+
+  applyCronState(input: ApplyCronStateInput): CapabilitySnapshot {
+    if (!this.isValidEpochAndGeneration(input)) {
+      return this.snapshot;
+    }
+
+    this.recordDomainMethodOutcome("cron", "cron.status", input.outcome);
+    const now = new Date().toISOString();
+
+    if (input.outcome === "ok") {
+      const projected = projectCronPayload(input.rawPayload, { canCancel: false, canRecover: false });
+      this.cronState = {
+        probed: true,
+        status: projected.jobs.length > 0 ? "available" : "empty",
+        rawPayload: input.rawPayload,
+        ...(projected.recentRunSummary ? { recentRunSummary: projected.recentRunSummary } : {}),
+        fetchedAt: now,
+      };
+    } else if (input.outcome === "method_not_found" || input.outcome === "refused") {
+      this.cronState = {
+        probed: true,
+        status: "unsupported",
+        degradation: {
+          reason: input.outcome === "refused" ? "refused" : "method_not_found",
+          missingMethods: ["cron.status"],
+        },
+        fetchedAt: now,
+      };
+    } else if (input.outcome === "older") {
+      this.cronState = {
+        probed: true,
+        status: "unknown",
+        degradation: { reason: "older" },
+        fetchedAt: now,
+      };
+    } else {
+      this.cronState = {
+        probed: true,
+        status: "error",
+        errorCode: sanitizeSafeErrorCode(input.errorCode, "CRON_FETCH_FAILED"),
+        fetchedAt: now,
       };
     }
 
@@ -2224,8 +2800,131 @@ export class CapabilityRegistry {
       entries,
       methodTiers: { ...this.methodTiers },
       extensions: this.buildExtensionInventoryView(),
+      memory: this.buildMemoryContextView(),
+      messaging: this.buildMessagingStatusView(),
+      cron: this.buildCronStateView(),
       ...(this.invalidatedReason ? { invalidatedReason: this.invalidatedReason } : {}),
       updatedAt: new Date().toISOString(),
+    };
+  }
+
+  private buildMemoryContextView(): MemoryContextView {
+    let status = this.memoryState.status;
+    if (!status) {
+      const breakdownStatus = this.deriveUnprobedExtensionStatus("session.context_breakdown");
+      status =
+        breakdownStatus === "unsupported"
+          ? this.deriveUnprobedExtensionStatus("session.info")
+          : breakdownStatus;
+    }
+    return {
+      status,
+      readOnly: true,
+      ...(this.memoryState.sourceMethod ? { sourceMethod: this.memoryState.sourceMethod } : {}),
+      ...(this.memoryState.sessionId ? { sessionId: this.memoryState.sessionId } : {}),
+      ...(this.memoryState.totalTokens !== undefined
+        ? { totalTokens: this.memoryState.totalTokens }
+        : {}),
+      ...(this.memoryState.maxTokens !== undefined
+        ? { maxTokens: this.memoryState.maxTokens }
+        : {}),
+      sections: this.memoryState.sections,
+      notes: this.memoryState.notes,
+      ...(this.memoryState.errorCode ? { errorCode: this.memoryState.errorCode } : {}),
+      ...(this.memoryState.degradation ? { degradation: this.memoryState.degradation } : {}),
+      cliActions: [
+        buildCliAction(
+          "memory-inspect-cli",
+          getCopy("extensions.copyCliAction"),
+          "hermes memory status",
+        ),
+      ],
+      docsUrl: OFFICIAL_MEMORY_DOCS_URL,
+      fetchedAt: this.memoryState.fetchedAt,
+    };
+  }
+
+  private buildMessagingStatusView(): MessagingStatusView {
+    const status =
+      this.messagingState.status ?? this.deriveUnprobedExtensionStatus("messaging.status");
+    return {
+      status,
+      readOnly: true,
+      connectors: this.messagingState.connectors,
+      ...(this.messagingState.errorCode ? { errorCode: this.messagingState.errorCode } : {}),
+      ...(this.messagingState.degradation
+        ? { degradation: this.messagingState.degradation }
+        : {}),
+      cliActions: [
+        buildCliAction(
+          "messaging-status-cli",
+          getCopy("extensions.copyCliAction"),
+          "hermes messaging status",
+        ),
+      ],
+      docsUrl: OFFICIAL_MESSAGING_DOCS_URL,
+      fetchedAt: this.messagingState.fetchedAt,
+    };
+  }
+
+  private buildCronStateView(): CronStateView {
+    const status = this.cronState.status ?? this.deriveUnprobedExtensionStatus("cron.status");
+    const isMethodUsable = (method: string): boolean => {
+      if (!this.connected) return false;
+      const forward = resolveExplicitMethodAlias(method);
+      const reverse = EXPLICIT_REVERSE_ALIASES[method];
+      if (
+        this.notFoundMethods.has(method) ||
+        (forward !== null && this.notFoundMethods.has(forward)) ||
+        (reverse !== undefined && this.notFoundMethods.has(reverse))
+      ) {
+        return false;
+      }
+      return this.getMethodTier(method) === "served";
+    };
+
+    const canStatus =
+      this.connected &&
+      status !== "unsupported" &&
+      this.getMethodTier("cron.status") !== "refused" &&
+      !this.notFoundMethods.has("cron.status") &&
+      (this.getMethodTier("cron.status") === "served" ||
+        status === "available" ||
+        status === "empty");
+    const canSubmit = canStatus && isMethodUsable("cron.submit");
+    const canCancel = canStatus && isMethodUsable("cron.cancel");
+    const canRecover = canStatus && isMethodUsable("cron.recover");
+    const mode: CronStateView["mode"] = !canStatus
+      ? "unavailable"
+      : canSubmit
+        ? "interactive"
+        : "read_only";
+    const projected =
+      this.cronState.status === "available" || this.cronState.status === "empty"
+        ? projectCronPayload(this.cronState.rawPayload, { canCancel, canRecover })
+        : { jobs: [] };
+
+    return {
+      status,
+      mode,
+      routinesFoldedIntoCron: true,
+      supportedActions: {
+        canStatus,
+        canSubmit,
+        canCancel,
+        canRecover,
+      },
+      jobs: projected.jobs,
+      ...(this.cronState.recentRunSummary
+        ? { recentRunSummary: this.cronState.recentRunSummary }
+        : {}),
+      ...(this.cronState.errorCode ? { errorCode: this.cronState.errorCode } : {}),
+      ...(this.cronState.degradation ? { degradation: this.cronState.degradation } : {}),
+      cliActions: [
+        buildCliAction("cron-list-cli", getCopy("extensions.copyCliAction"), "hermes cron list"),
+      ],
+      docsUrl: OFFICIAL_CRON_DOCS_URL,
+      fetchedAt: this.cronState.fetchedAt,
     };
   }
 }

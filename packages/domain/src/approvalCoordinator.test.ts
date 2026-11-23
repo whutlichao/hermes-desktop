@@ -878,4 +878,76 @@ describe("ApprovalAndRecoveryCoordinator — Slice 4: multi-client first-wins, s
     const settled3 = await p3;
     expect(settled3.status).toBe("settled");
   });
+
+  it("propagates positive-evidence ExternalAttribution onto ApprovalView and defaults missing source to unknown (Ticket #44)", () => {
+    const coord = makeCoordinator();
+    coord.setActiveScope({ connectionId: "local", profileId: "default", sessionId: "sess-1" });
+
+    const externalView = coord.receive({
+      gateway: {
+        approvalId: "apr-attr-mcp",
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "sess-1",
+        turnId: "turn-1",
+        executionGeneration: 1,
+        command: "npx mcp-fs write /tmp/demo.txt",
+        description: "Write via external MCP server",
+        choices: ["once", "deny"],
+        providerKind: "mcp",
+        mcpServer: "filesystem",
+      },
+      main: {
+        connectionLabel: "This device",
+        connectionKind: "local",
+        hostDisplay: "127.0.0.1",
+        profileDisplayName: "Default",
+        sessionTitle: "S1",
+        cwd: "/repo",
+        ownerGeneration: 1,
+        authorityEpoch: 1,
+        connectionOnline: true,
+      },
+    });
+    expect(externalView.attribution).toEqual({
+      origin: "external",
+      provider: {
+        kind: "mcp",
+        id: "filesystem",
+        label: "MCP · filesystem",
+      },
+      sourceLabel: "外部提供 · MCP · filesystem",
+      accessibleLabel: "外部提供 · MCP · filesystem",
+    });
+
+    const unknownView = coord.receive({
+      gateway: {
+        approvalId: "apr-attr-none",
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "sess-1",
+        turnId: "turn-2",
+        executionGeneration: 1,
+        command: "ls -la",
+        description: "No explicit attribution metadata",
+        choices: ["once", "deny"],
+      },
+      main: {
+        connectionLabel: "This device",
+        connectionKind: "local",
+        hostDisplay: "127.0.0.1",
+        profileDisplayName: "Default",
+        sessionTitle: "S1",
+        cwd: "/repo",
+        ownerGeneration: 1,
+        authorityEpoch: 1,
+        connectionOnline: true,
+      },
+    });
+    expect(unknownView.attribution).toEqual({
+      origin: "unknown",
+      sourceLabel: "来源未知",
+      accessibleLabel: "来源未知",
+    });
+  });
 });

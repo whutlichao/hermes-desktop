@@ -8,9 +8,13 @@ import type {
   ApprovalTopicSnapshot,
   ApprovalView,
   BridgeScope,
+  CapabilityOrigin,
+  CapabilityProviderKind,
   ConnectionKind,
   ErrorCode,
+  ExternalAttribution,
 } from "@hermes/contracts";
+import { resolveExternalAttribution } from "./capabilityRegistry";
 
 export interface ApprovalBinding {
   readonly connectionId: string;
@@ -39,6 +43,15 @@ export interface GatewayApprovalPayload {
   expiresAt?: string | null;
   persistentGrant?: Partial<ApprovalPersistentGrantInfo> | null;
   riskCategories?: readonly string[];
+  origin?: CapabilityOrigin | string | null;
+  source?: string | null;
+  providerKind?: CapabilityProviderKind | null;
+  providerId?: string | null;
+  mcpServer?: string | null;
+  pluginName?: string | null;
+  skillName?: string | null;
+  toolset?: string | null;
+  gatewayId?: string | null;
 }
 
 export interface MainApprovalContext {
@@ -113,6 +126,7 @@ interface InternalApprovalRecord {
   inFlight: boolean;
   settledChoice?: ApprovalChoice;
   statusReason?: string;
+  attribution: ExternalAttribution;
   updatedAt: string;
 }
 
@@ -787,6 +801,17 @@ export class ApprovalAndRecoveryCoordinator {
       description,
       input.gateway.riskCategories,
     );
+    const attribution = resolveExternalAttribution({
+      origin: input.gateway.origin,
+      source: input.gateway.source,
+      providerKind: input.gateway.providerKind,
+      providerId: input.gateway.providerId,
+      mcpServer: input.gateway.mcpServer,
+      pluginName: input.gateway.pluginName,
+      skillName: input.gateway.skillName,
+      toolset: input.gateway.toolset,
+      gatewayId: input.gateway.gatewayId,
+    });
 
     const missingContextFields = validateCompleteness({
       command,
@@ -831,6 +856,7 @@ export class ApprovalAndRecoveryCoordinator {
       existing.expiresAt = expiresAt;
       existing.missingContextFields = missingContextFields;
       existing.persistentGrant = persistentGrant;
+      existing.attribution = attribution;
       existing.state = nextState;
       existing.updatedAt = nowIso;
       return existing;
@@ -858,6 +884,7 @@ export class ApprovalAndRecoveryCoordinator {
       missingContextFields,
       persistentGrant,
       inFlight: false,
+      attribution,
       updatedAt: nowIso,
     };
     this.recordsByKey.set(approvalKey, created);
@@ -957,6 +984,7 @@ export class ApprovalAndRecoveryCoordinator {
       canDeny,
       canInspect: true,
       canDismiss: rec.state === "orphaned",
+      attribution: rec.attribution,
       updatedAt: rec.updatedAt,
     });
   }

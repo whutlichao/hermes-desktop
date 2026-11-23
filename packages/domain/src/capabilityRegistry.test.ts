@@ -10,12 +10,16 @@ import {
   CAPABILITY_DOMAIN_CATALOG,
   CapabilityRegistry,
   EXPLICIT_METHOD_ALIASES,
+  OFFICIAL_CRON_DOCS_URL,
+  OFFICIAL_MEMORY_DOCS_URL,
+  OFFICIAL_MESSAGING_DOCS_URL,
   SurfaceFocusReturnStack,
   auditCapabilityIntegrity,
   buildSessionCliDeepLinks,
   filterRenderableSessionCapabilities,
   isRefusedGatewayMethod,
   projectSettingsSectionFields,
+  resolveCapabilityDomainAlias,
   resolveExplicitMethodAlias,
   resolveExternalAttribution,
   resolveMethodWithAlias,
@@ -847,5 +851,232 @@ describe("CapabilityRegistry 21-domain matrix, explicit aliases & invariants (S0
     expect(afterInvalidate.extensions.tools.items).toEqual([]);
     expect(afterInvalidate.extensions.mcp.items).toEqual([]);
     expect(afterInvalidate.extensions.scope.connectionId).toBe("remote-1");
+  });
+
+  it("projects read-only Memory context breakdown with zero edit/delete/toggle/MemoryGraph controls and -32601 degradation (Ticket #44)", () => {
+    expect(OFFICIAL_MEMORY_DOCS_URL).toMatch(/^https:\/\//);
+
+    const registry = new CapabilityRegistry();
+    expect(registry.getSnapshot().memory.status).toBe("unknown");
+    expect(registry.getSnapshot().memory.readOnly).toBe(true);
+
+    registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 2,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "v1.5.0",
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: ["prompt.submit", "session.context_breakdown", "session.info"],
+      },
+    });
+
+    const withMemory = registry.applyMemoryState({
+      expectedOwnerGeneration: 2,
+      expectedAuthorityEpoch: 1,
+      outcome: "ok",
+      sourceMethod: "session.context_breakdown",
+      sessionId: "sess-1",
+      rawPayload: {
+        total_tokens: 18400,
+        max_tokens: 128000,
+        sections: [
+          { id: "system", label: "System Prompt", tokens: 3200, entry_count: 1 },
+          {
+            id: "memory_notes",
+            label: "Memory Snapshot",
+            tokens: 4100,
+            entry_count: 6,
+            summary: "Safe summary without /Users/alice/secret or Bearer sk-abcdef123456",
+          },
+        ],
+        notes: ["Loaded from /Users/alice/.hermes/memories", "Active memory budget healthy"],
+      },
+    });
+
+    expect(withMemory.memory.status).toBe("available");
+    expect(withMemory.memory.readOnly).toBe(true);
+    expect(withMemory.memory.sourceMethod).toBe("session.context_breakdown");
+    expect(withMemory.memory.totalTokens).toBe(18400);
+    expect(withMemory.memory.maxTokens).toBe(128000);
+    expect(withMemory.memory.sections).toHaveLength(2);
+    // Secret / local path leakage stripped cleanly; Memory Graph NEVER fabricated
+    const serialized = JSON.stringify(withMemory.memory);
+    expect(serialized).not.toContain("/Users/alice");
+    expect(serialized).not.toContain("sk-abcdef123456");
+    expect(serialized).not.toContain("memory_graph");
+
+    // -32601 degrades honestly without disconnecting or fabricating controls
+    const unsupportedMemory = registry.applyMemoryState({
+      expectedOwnerGeneration: 2,
+      expectedAuthorityEpoch: 1,
+      outcome: "method_not_found",
+      sourceMethod: "session.context_breakdown",
+    });
+    expect(unsupportedMemory.memory.status).toBe("unsupported");
+    expect(unsupportedMemory.memory.degradation?.reason).toBe("method_not_found");
+    expect(unsupportedMemory.memory.sections).toEqual([]);
+    expect(unsupportedMemory.domains.find((d) => d.domain === "memory")?.runtimeStatus).toBe(
+      "unavailable",
+    );
+
+    // Scope/generation invalidation clears stale memory context
+    const invalidated = registry.invalidate({
+      reason: "disconnected",
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 3,
+      authorityEpoch: 1,
+    });
+    expect(invalidated.memory.status).toBe("unknown");
+    expect(invalidated.memory.sections).toEqual([]);
+  });
+
+  it("projects read-only Messaging connector status + Attribution + deep links with zero OAuth/connect buttons (Ticket #44)", () => {
+    expect(OFFICIAL_MESSAGING_DOCS_URL).toMatch(/^https:\/\//);
+
+    const registry = new CapabilityRegistry();
+    registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 1,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "v1.5.0",
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: ["prompt.submit", "messaging.status"],
+      },
+    });
+
+    const withMessaging = registry.applyMessagingState({
+      expectedOwnerGeneration: 1,
+      expectedAuthorityEpoch: 1,
+      outcome: "ok",
+      rawPayload: {
+        connectors: [
+          {
+            id: "slack-ops",
+            platform: "Slack",
+            status: "connected",
+            gateway_id: "slack-bridge",
+            detail: "Channel #ops synced",
+          },
+          {
+            id: "discord-unverified",
+            platform: "Discord",
+            status: "disconnected",
+          },
+        ],
+      },
+    });
+
+    expect(withMessaging.messaging.status).toBe("available");
+    expect(withMessaging.messaging.readOnly).toBe(true);
+    expect(withMessaging.messaging.connectors).toHaveLength(2);
+    expect(withMessaging.messaging.connectors[0]?.attribution.sourceLabel).toBe(
+      "外部提供 · Gateway · slack-bridge",
+    );
+    expect(withMessaging.messaging.connectors[1]?.attribution.origin).toBe("unknown");
+    expect(withMessaging.messaging.connectors[1]?.attribution.sourceLabel).toBe("来源未知");
+    // Must NEVER expose OAuth client credentials or connect action hints
+    expect(JSON.stringify(withMessaging.messaging)).not.toMatch(/连接账号|oauth|client_secret/i);
+
+    const unsupported = registry.applyMessagingState({
+      expectedOwnerGeneration: 1,
+      expectedAuthorityEpoch: 1,
+      outcome: "method_not_found",
+    });
+    expect(unsupported.messaging.status).toBe("unsupported");
+    expect(unsupported.messaging.connectors).toEqual([]);
+  });
+
+  it("folds Routines into Cron via explicit aliases and enforces -32601 read-only degradation without fake submit CTA (Ticket #44)", () => {
+    expect(OFFICIAL_CRON_DOCS_URL).toMatch(/^https:\/\//);
+    expect(resolveExplicitMethodAlias("routines.status")).toBe("cron.status");
+    expect(resolveExplicitMethodAlias("routines.submit")).toBe("cron.submit");
+    expect(resolveExplicitMethodAlias("routines.cancel")).toBe("cron.cancel");
+    expect(resolveExplicitMethodAlias("routines.recover")).toBe("cron.recover");
+    expect(resolveCapabilityDomainAlias("routines")).toBe("cron");
+    expect(resolveCapabilityDomainAlias("cron")).toBe("cron");
+
+    const registry = new CapabilityRegistry();
+    registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 2,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "v1.5.0",
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: ["prompt.submit", "cron.status", "cron.submit", "cron.cancel", "cron.recover"],
+      },
+    });
+
+    const interactive = registry.applyCronState({
+      expectedOwnerGeneration: 2,
+      expectedAuthorityEpoch: 1,
+      outcome: "ok",
+      rawPayload: {
+        recent_run_summary: "每日巡检于 09:00 成功完成",
+        jobs: [
+          {
+            id: "cron-daily",
+            name: "每日健康检查",
+            schedule: "0 9 * * *",
+            status: "failed",
+            last_run_at: "2026-11-23T09:00:00Z",
+            error: "RPC_TIMEOUT",
+          },
+          {
+            id: "cron-hourly",
+            name: "构建缓存清理",
+            schedule: "0 * * * *",
+            status: "scheduled",
+            source: "bundled",
+          },
+        ],
+      },
+    });
+    expect(interactive.cron.status).toBe("available");
+    expect(interactive.cron.routinesFoldedIntoCron).toBe(true);
+    expect(interactive.cron.mode).toBe("interactive");
+    expect(interactive.cron.supportedActions).toEqual({
+      canStatus: true,
+      canSubmit: true,
+      canCancel: true,
+      canRecover: true,
+    });
+    expect(interactive.cron.jobs[0]?.canRecover).toBe(true);
+    expect(interactive.cron.jobs[1]?.canCancel).toBe(true);
+
+    // If cron.submit hits -32601 -> MUST drop to read_only with canSubmit=false (zero fake "新建任务" button!)
+    registry.markMethodNotFound({
+      method: "cron.submit",
+      expectedOwnerGeneration: 2,
+      expectedAuthorityEpoch: 1,
+    });
+    const afterSubmitNotFound = registry.applyCronState({
+      expectedOwnerGeneration: 2,
+      expectedAuthorityEpoch: 1,
+      outcome: "ok",
+      rawPayload: {
+        jobs: [{ id: "cron-hourly", name: "构建缓存清理", schedule: "0 * * * *", status: "scheduled" }],
+      },
+    });
+    expect(afterSubmitNotFound.cron.supportedActions.canSubmit).toBe(false);
+    expect(afterSubmitNotFound.cron.supportedActions.canStatus).toBe(true);
+    expect(afterSubmitNotFound.cron.mode).toBe("read_only");
+
+    // If cron.status itself returns -32601 -> unavailable
+    const unavailable = registry.applyCronState({
+      expectedOwnerGeneration: 2,
+      expectedAuthorityEpoch: 1,
+      outcome: "method_not_found",
+    });
+    expect(unavailable.cron.status).toBe("unsupported");
+    expect(unavailable.cron.mode).toBe("unavailable");
+    expect(unavailable.cron.supportedActions.canStatus).toBe(false);
+    expect(unavailable.cron.supportedActions.canSubmit).toBe(false);
   });
 });

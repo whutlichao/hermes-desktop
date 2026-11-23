@@ -21,6 +21,9 @@ export const CAPABILITY_HANDLER_IDS = [
   "workspace.openGit",
   "workspace.openAgents",
   "workspace.openCheckpoints",
+  "surface.openMemoryInspect",
+  "surface.openCronInspect",
+  "surface.openMessagingInspect",
 ] as const;
 
 export type CapabilityHandlerId = (typeof CAPABILITY_HANDLER_IDS)[number];
@@ -42,6 +45,9 @@ export interface CapabilityHandlerDependencies {
   openShortcuts: () => void;
   openScopePopover: () => void;
   probeDomain: (domain: CapabilityDomainId) => void | Promise<void>;
+  openMemoryInspect: () => void;
+  openCronInspect: () => void;
+  openMessagingInspect: () => void;
 }
 
 export function createCapabilityHandlers(
@@ -94,6 +100,15 @@ export function createCapabilityHandlers(
     },
     "workspace.openCheckpoints": () => {
       deps.openWorkspaceTab("checkpoints");
+    },
+    "surface.openMemoryInspect": () => {
+      deps.openMemoryInspect();
+    },
+    "surface.openCronInspect": () => {
+      deps.openCronInspect();
+    },
+    "surface.openMessagingInspect": () => {
+      deps.openMessagingInspect();
     },
   };
 }
