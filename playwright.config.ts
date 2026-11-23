@@ -1,5 +1,8 @@
 import { defineConfig } from "@playwright/test";
 
+const webPort = Number(process.env.HERMES_WEB_PORT || 4173);
+const baseURL = `http://127.0.0.1:${webPort}`;
+
 export default defineConfig({
   timeout: 30_000,
   retries: 0,
@@ -11,7 +14,7 @@ export default defineConfig({
       testMatch: /shell\.spec\.ts/,
       use: {
         browserName: "chromium",
-        baseURL: "http://127.0.0.1:4173",
+        baseURL,
       },
     },
     {
@@ -20,14 +23,14 @@ export default defineConfig({
       testMatch: /a11y\.spec\.ts/,
       use: {
         browserName: "chromium",
-        baseURL: "http://127.0.0.1:4173",
+        baseURL,
       },
     },
   ],
   webServer: {
     command: "pnpm --filter @hermes/desktop dev:web",
-    url: "http://127.0.0.1:4173",
-    reuseExistingServer: !process.env.CI,
+    url: baseURL,
+    reuseExistingServer: !process.env.CI && !process.env.HERMES_WEB_PORT,
     timeout: 30_000,
   },
 });

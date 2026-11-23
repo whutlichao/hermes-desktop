@@ -6,6 +6,7 @@ import { readDesktopPackageMeta, resolveBuildGitMeta } from "../../scripts/build
 const repoRoot = path.resolve(__dirname, "../..");
 const gitMeta = resolveBuildGitMeta({ repoRoot, buildMode: "dev", allowUnknownSha: true });
 const pkgMeta = readDesktopPackageMeta(__dirname);
+const webPort = Number(process.env.HERMES_WEB_PORT || 4173);
 
 export default defineConfig({
   root: path.resolve(__dirname, "src/renderer"),
@@ -28,12 +29,12 @@ export default defineConfig({
   },
   server: {
     host: "127.0.0.1",
-    port: 4173,
+    port: webPort,
     strictPort: true,
   },
   preview: {
     host: "127.0.0.1",
-    port: 4173,
+    port: webPort,
     strictPort: true,
   },
   build: {
