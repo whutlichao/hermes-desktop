@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   canonicalSshTarget,
+  createEmptyRegistryDocument,
   diffRegistries,
   normalizeRegistryDocument,
   normalizeSemanticUrl,
@@ -416,6 +417,59 @@ describe("registry domain model: rebaseRegistry & diffRegistries", () => {
     // Zero secret bytes in diff
     expect(JSON.stringify(materialDiff)).not.toContain("tok-1");
     expect(JSON.stringify(materialDiff)).not.toContain("tok-2");
+  });
+
+  it("preserves redacted SSH keyPath and remoteHermesPath on label-only update without exposing them in snapshots", () => {
+    const base = createEmptyRegistryDocument();
+    const addRes = validateClientAddConnection(base, {
+      kind: "ssh",
+      label: "GPU Lab",
+      host: "gpu.example.com",
+      user: "researcher",
+      port: 2222,
+      keyPath: "/Users/alice/.ssh/id_gpu_ed25519",
+      remoteHermesPath: "/opt/hermes/bin/hermes",
+      remoteProfile: "train",
+      passphrase: "never-stored-passphrase",
+    });
+    expect(addRes.ok).toBe(true);
+    if (!addRes.ok) return;
+
+    expect(addRes.connection.keyPath).toBe("/Users/alice/.ssh/id_gpu_ed25519");
+    expect(addRes.connection.remoteHermesPath).toBe("/opt/hermes/bin/hermes");
+    expect("passphrase" in addRes.connection).toBe(false);
+
+    const docWithSsh = {
+      ...base,
+      connections: [...base.connections, addRes.connection],
+    };
+    const normBefore = normalizeRegistryDocument(docWithSsh);
+    const snapBefore = projectRegistrySnapshot(normBefore);
+    const snapJson = JSON.stringify(snapBefore);
+    expect(snapJson).not.toContain("id_gpu_ed25519");
+    expect(snapJson).not.toContain("/opt/hermes/bin/hermes");
+    expect(snapJson).not.toContain("never-stored-passphrase");
+
+    // Label-only update omits keyPath & remoteHermesPath (redacted fields not round-tripped from UI)
+    const updateRes = validateClientUpdateConnection(docWithSsh, addRes.connection.id, {
+      kind: "ssh",
+      label: "GPU Lab Primary",
+      host: "gpu.example.com",
+      user: "researcher",
+      port: 2222,
+      remoteProfile: "train",
+    });
+    expect(updateRes.ok).toBe(true);
+    if (!updateRes.ok) return;
+
+    expect(updateRes.connection.keyPath).toBe("/Users/alice/.ssh/id_gpu_ed25519");
+    expect(updateRes.connection.remoteHermesPath).toBe("/opt/hermes/bin/hermes");
+    const normAfter = normalizeRegistryDocument({
+      ...docWithSsh,
+      connections: [base.connections[0], updateRes.connection],
+    });
+    const diff = diffRegistries(normBefore, normAfter);
+    expect(diff.dialMaterialChanged).toBe(false);
   });
 });
 

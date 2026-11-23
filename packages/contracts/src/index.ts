@@ -29,6 +29,7 @@ export const HOST_COMMANDS = [
   "connections.update",
   "connections.remove",
   "connections.test",
+  "connections.confirmHostKey",
   "connections.retry",
   "connections.setPrimary",
   "connections.setLaunchMode",
@@ -797,6 +798,8 @@ export interface ConnectionMutationInput {
   keyPath?: string;
   remoteHermesPath?: string;
   remoteProfile?: string;
+  passphrase?: string;
+  preferLegacyAttach?: boolean;
   org?: string;
   name?: string;
 }
@@ -850,6 +853,54 @@ export type AuthStartResult = AuthStateSnapshot;
 export interface AuthCancelResult {
   cancelled: boolean;
   snapshot: AuthStateSnapshot;
+}
+
+export type SshTransportMode = "tickets_serve" | "attach_only";
+
+export type SshFailureCode =
+  | "host_key_unknown"
+  | "host_key_changed"
+  | "ssh_auth_failed"
+  | "ssh_unreachable"
+  | "ssh_timeout"
+  | "remote_hermes_not_found"
+  | "protocol_unsupported"
+  | "ticket_unavailable"
+  | "windows_session0_attach_only"
+  | "tunnel_failed";
+
+export type SshSafeActionId =
+  | "edit_target"
+  | "retry"
+  | "legacy_attach"
+  | "confirm_host_key";
+
+export interface SshHostKeyChallenge {
+  hostDisplay: string;
+  keyType: string;
+  fingerprint: string;
+}
+
+export interface ConnectionTestResult {
+  ok: boolean;
+  kind: ConnectionKind;
+  status: "ready" | "blocked" | "failed";
+  sshMode?: SshTransportMode;
+  legacyNotice?: boolean;
+  windowsServiceSession?: boolean;
+  hostKeyChallenge?: SshHostKeyChallenge;
+  failureCode?: SshFailureCode | ErrorCode;
+  message?: string;
+  actions: SshSafeActionId[];
+  sshTargetDisplay?: string;
+}
+
+export interface SshHostKeyConfirmResult {
+  confirmed: boolean;
+  cancelled: boolean;
+  hardBlocked: boolean;
+  sshTargetDisplay?: string;
+  message?: string;
 }
 
 export interface ConnectionMutationResponse {

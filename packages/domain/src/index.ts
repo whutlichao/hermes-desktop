@@ -8,3 +8,4 @@ export * from "./gatewayProtocol";
 export * from "./capabilityRegistry";
 export * from "./activeChatResolver";
 export * from "./remoteGateway";
+export * from "./ssh";

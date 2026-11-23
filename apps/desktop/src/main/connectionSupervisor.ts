@@ -13,8 +13,11 @@ import type {
   LocalTypedFailure,
   ProfileSummary,
   PromptEventPayload,
+  RegistryDiff,
+  RegistrySnapshotView,
   SessionSummary,
   SessionTranscriptSnapshot,
+  SshFailureCode,
   SupportedChatActions,
   ToolExecutionRow,
   TranscriptMessage,
@@ -49,6 +52,7 @@ import {
   resolveRemoteCredentials,
   type RemoteAuthManager,
 } from "./remoteGateway";
+import type { SshDialMaterial, SshTargetConfig, SshTransportManager } from "./sshTransport";
 
 export interface SupervisorConnectResult {
   ok: boolean;
@@ -63,15 +67,19 @@ export interface ConnectionSupervisorOptions {
   registryStore?: RegistryStore;
   authManager?: RemoteAuthManager;
   remoteTls?: GatewayClientTlsOptions;
+  sshTransport?: SshTransportManager;
 }
+
+type DialMaterial = LocalDialMaterial | SshDialMaterial;
 
 interface GatewayTransportEntry {
   key: string;
   connectionId: string;
+  kind: "local" | "remote" | "ssh";
   defaultProfileId: string;
   transportMode: "shared-host-scope" | "per-profile";
   client: GatewayClient;
-  dial?: LocalDialMaterial;
+  dial?: DialMaterial;
   ownerGeneration: number;
   authorityEpoch: number;
   gatewayVersionOrSha: string;
@@ -115,6 +123,24 @@ function mapLocalFailureToErrorCode(failure: LocalTypedFailure | undefined): Err
     case "authorization":
       return "auth_failed";
     case "hermes_not_found":
+      return "not_found";
+    default:
+      return "unreachable";
+  }
+}
+
+function mapSshFailureToErrorCode(code: SshFailureCode): ErrorCode {
+  switch (code) {
+    case "ssh_auth_failed":
+      return "auth_failed";
+    case "ssh_timeout":
+      return "timeout";
+    case "protocol_unsupported":
+      return "protocol_unsupported";
+    case "host_key_unknown":
+    case "host_key_changed":
+      return "permission_denied";
+    case "remote_hermes_not_found":
       return "not_found";
     default:
       return "unreachable";
@@ -184,19 +210,25 @@ function mapRawMessage(raw: Record<string, unknown>, sessionId: string): Transcr
   const turnId = asString(raw.turn_id ?? raw.turnId) || undefined;
   const toolRowsRaw = Array.isArray(raw.tool_rows ?? raw.toolRows)
     ? ((raw.tool_rows ?? raw.toolRows) as Array<Record<string, unknown>>)
-    : null;
-  const toolRows: ToolExecutionRow[] | undefined = toolRowsRaw
-    ? toolRowsRaw.map((row, idx) => ({
-        toolCallId: asString(row.tool_call_id ?? row.toolCallId ?? row.id, `${messageId}-tool-${idx}`),
-        name: asString(row.name ?? row.tool, "tool"),
-        status:
-          row.status === "running" || row.status === "failed" || row.status === "cancelled"
-            ? row.status
-            : "completed",
-        summary: typeof row.summary === "string" ? row.summary : undefined,
-        durationMs: typeof row.duration_ms === "number" ? row.duration_ms : undefined,
-      }))
-    : undefined;
+    : [];
+  const toolRows: ToolExecutionRow[] | undefined =
+    toolRowsRaw.length > 0
+      ? toolRowsRaw.map((row, idx) => ({
+          toolCallId: asString(
+            row.tool_call_id ?? row.toolCallId ?? row.id,
+            `${messageId}-tool-${idx}`,
+          ),
+          name: asString(row.name ?? row.tool, "tool"),
+          status:
+            row.status === "running" ||
+            row.status === "failed" ||
+            row.status === "cancelled"
+              ? row.status
+              : "completed",
+          summary: typeof row.summary === "string" ? row.summary : undefined,
+          durationMs: typeof row.duration_ms === "number" ? row.duration_ms : undefined,
+        }))
+      : undefined;
   return {
     messageId,
     sessionId,
@@ -224,6 +256,7 @@ export class ConnectionSupervisor {
   private readonly registryStore?: RegistryStore;
   private readonly authManager?: RemoteAuthManager;
   private readonly remoteTls?: GatewayClientTlsOptions;
+  private readonly sshTransport?: SshTransportManager;
   private readonly unsubRegistry?: () => void;
 
   private revision = 1;
@@ -234,6 +267,7 @@ export class ConnectionSupervisor {
 
   private localHealth: ConnectionHealthSummary;
   private readonly remoteHealth = new Map<string, ConnectionHealthSummary>();
+  private readonly sshHealthById = new Map<string, ConnectionHealthSummary>();
   private readonly profilesByConnection = new Map<string, ProfileSummary[]>();
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
   private readonly transcripts = new Map<string, SessionTranscriptSnapshot>();
@@ -252,6 +286,7 @@ export class ConnectionSupervisor {
     this.registryStore = options?.registryStore;
     this.authManager = options?.authManager;
     this.remoteTls = options?.remoteTls;
+    this.sshTransport = options?.sshTransport;
     this.localHealth = {
       connectionId: "local",
       label: this.getLocalLabel(),
@@ -274,7 +309,9 @@ export class ConnectionSupervisor {
     }
 
     if (this.registryStore) {
-      this.syncRegistryEntries(this.registryStore.snapshot());
+      const initialSnap = this.registryStore.snapshot();
+      this.syncRegistryEntries(initialSnap);
+      this.syncHealthPlaceholdersFromRegistry(initialSnap);
       this.unsubRegistry = this.registryStore.subscribe((ev) => {
         this.handleRegistryEvent(ev);
       });
@@ -393,6 +430,7 @@ export class ConnectionSupervisor {
     }
 
     this.syncRegistryEntries(ev.snapshot);
+    this.syncHealthPlaceholdersFromRegistry(ev.snapshot);
     this.emitFleet();
   }
 
@@ -414,6 +452,9 @@ export class ConnectionSupervisor {
     }
     for (const remote of this.remoteHealth.values()) {
       connections.push({ ...remote });
+    }
+    for (const sshHealth of this.sshHealthById.values()) {
+      connections.push({ ...sshHealth });
     }
 
     return {
@@ -442,7 +483,7 @@ export class ConnectionSupervisor {
       if (sub.topic !== topic) continue;
       if (!sub.snapshotSent) continue;
       if (matcher && !matcher(sub)) continue;
-      sub.seq += 1;
+      sub.seq = kind === "snapshot" ? 0 : sub.seq + 1;
       try {
         sub.listener({
           topic,
@@ -525,13 +566,17 @@ export class ConnectionSupervisor {
   private getConnectionHealth(connectionId: string): ConnectionHealthSummary | null {
     if (connectionId === "local") return this.getLocalHealth();
     const remote = this.remoteHealth.get(connectionId);
-    return remote ? { ...remote } : null;
+    if (remote) return { ...remote };
+    const ssh = this.sshHealthById.get(connectionId);
+    return ssh ? { ...ssh } : null;
   }
 
   private emitFleet(connectionId?: string): void {
     const snapshot = this.getFleetSnapshot();
     this.emitTopic("fleet", null, "patch", snapshot);
-    const ids = connectionId ? [connectionId] : ["local", ...this.remoteHealth.keys()];
+    const ids = connectionId
+      ? [connectionId]
+      : ["local", ...this.remoteHealth.keys(), ...this.sshHealthById.keys()];
     for (const id of ids) {
       const health = this.getConnectionHealth(id);
       if (!health) continue;
@@ -545,7 +590,7 @@ export class ConnectionSupervisor {
     }
   }
 
-  private emitProfiles(connectionId: string): void {
+  private emitProfiles(connectionId = "local"): void {
     const list = this.profilesByConnection.get(connectionId) ?? [];
     this.emitTopic(
       "profiles",
@@ -596,18 +641,25 @@ export class ConnectionSupervisor {
   }
 
   private getTransport(connectionId: string, profileId: string): GatewayTransportEntry | null {
+    const shared = this.transports.get(`${connectionId}::shared`);
+    if (shared && !shared.disposed && shared.client.isOpen()) {
+      return shared;
+    }
+    const perProfile = this.transports.get(`${connectionId}::profile:${profileId}`);
+    if (perProfile && !perProfile.disposed && perProfile.client.isOpen()) {
+      return perProfile;
+    }
     if (connectionId === "local") {
-      const shared = this.transports.get("shared");
-      if (shared && !shared.disposed && shared.client.isOpen()) {
-        return shared;
+      const legacyShared = this.transports.get("shared");
+      if (legacyShared && !legacyShared.disposed && legacyShared.client.isOpen()) {
+        return legacyShared;
       }
-      const perProfile = this.transports.get(`profile:${profileId}`);
-      if (perProfile && !perProfile.disposed && perProfile.client.isOpen()) {
-        return perProfile;
+      const legacyPerProfile = this.transports.get(`profile:${profileId}`);
+      if (legacyPerProfile && !legacyPerProfile.disposed && legacyPerProfile.client.isOpen()) {
+        return legacyPerProfile;
       }
       return null;
     }
-
     const remoteEntry = this.transports.get(`remote:${connectionId}`);
     if (remoteEntry && !remoteEntry.disposed && remoteEntry.client.isOpen()) {
       return remoteEntry;
@@ -615,40 +667,201 @@ export class ConnectionSupervisor {
     return null;
   }
 
+  private isSshConnection(connectionId: string): boolean {
+    if (this.sshHealthById.has(connectionId)) return true;
+    if (this.getSshTargetForConnection(connectionId)) return true;
+    const snap = this.registryStore?.snapshot();
+    return Boolean(snap?.connections.some((c) => c.id === connectionId && c.kind === "ssh"));
+  }
+
   private async ensureTransport(
     connectionId: string,
     profileId: string,
-    options?: { forceReconnect?: boolean; activate?: boolean },
+    options?: { forceReconnect?: boolean; activate?: boolean; activateScope?: boolean },
   ): Promise<SupervisorConnectResult> {
-    if (connectionId === "local") {
-      return this.ensureProfileTransport(profileId, options);
+    if (connectionId === "local" || this.isSshConnection(connectionId)) {
+      return this.ensureScopeTransport(connectionId, profileId, {
+        forceReconnect: options?.forceReconnect,
+        activate: options?.activate ?? options?.activateScope,
+        activateScope: options?.activateScope ?? options?.activate,
+      });
     }
     return this.connectRemote(connectionId, {
       profileId,
       forceReconnect: options?.forceReconnect,
-      activate: options?.activate,
+      activate: options?.activate ?? options?.activateScope,
     });
   }
 
-  private async ensureProfileTransport(
+  private getSshTargetForConnection(connectionId: string): {
+    target: SshTargetConfig;
+    label: string;
+    sshTargetDisplay: string;
+    defaultProfile: string;
+  } | null {
+    if (!this.registryStore) return null;
+    const rawDoc = this.registryStore.getDocument();
+    const rawConn = rawDoc.connections.find((c) => c.id === connectionId);
+    const snap = this.registryStore.snapshot();
+    const dispConn = snap.connections.find((c) => c.id === connectionId);
+    if (!rawConn || rawConn.kind !== "ssh" || !rawConn.host || (dispConn && !dispConn.dialable)) {
+      return null;
+    }
+    return {
+      label: rawConn.label,
+      sshTargetDisplay: dispConn?.sshTargetDisplay ?? rawConn.host,
+      defaultProfile: rawConn.remoteProfile?.trim() || "default",
+      target: {
+        connectionId: rawConn.id,
+        host: rawConn.host,
+        ...(rawConn.user ? { user: rawConn.user } : {}),
+        ...(rawConn.port ? { port: rawConn.port } : {}),
+        ...(rawConn.keyPath ? { keyPath: rawConn.keyPath } : {}),
+        ...(rawConn.remoteHermesPath ? { remoteHermesPath: rawConn.remoteHermesPath } : {}),
+        ...(rawConn.remoteProfile ? { remoteProfile: rawConn.remoteProfile } : {}),
+      },
+    };
+  }
+
+  private syncHealthPlaceholdersFromRegistry(snapshot: RegistrySnapshotView): void {
+    const validSshIds = new Set<string>();
+    for (const conn of snapshot.connections) {
+      if (conn.kind !== "ssh" || !conn.dialable) continue;
+      validSshIds.add(conn.id);
+      const existing = this.sshHealthById.get(conn.id);
+      if (existing) {
+        this.sshHealthById.set(conn.id, {
+          ...existing,
+          label: conn.label,
+          originDisplay: conn.sshTargetDisplay ?? conn.sshHost ?? existing.originDisplay,
+        });
+      } else {
+        this.sshHealthById.set(conn.id, {
+          connectionId: conn.id,
+          label: conn.label,
+          kind: "ssh",
+          originDisplay: conn.sshTargetDisplay ?? conn.sshHost ?? conn.id,
+          actual: "idle",
+          degraded: false,
+          latencyMs: null,
+          nextRetryAt: null,
+        });
+      }
+    }
+    for (const id of [...this.sshHealthById.keys()]) {
+      if (!validSshIds.has(id)) {
+        this.sshHealthById.delete(id);
+      }
+    }
+  }
+
+  async handleRegistrySnapshot(snapshot: RegistrySnapshotView, diff?: RegistryDiff): Promise<void> {
+    this.syncHealthPlaceholdersFromRegistry(snapshot);
+    if (diff) {
+      for (const change of diff.changes) {
+        if (change.connectionId === "local") continue;
+        if (change.kind === "connection_removed") {
+          await this.removeConnection(change.connectionId);
+          continue;
+        }
+        if (change.kind === "connection_updated") {
+          const updated = snapshot.connections.find((c) => c.id === change.connectionId);
+          if (updated?.kind === "ssh") {
+            if (!change.dialMaterialChanged) {
+              this.emitFleet(change.connectionId);
+            } else {
+              await this.connectSsh(change.connectionId, { forceReconnect: true });
+            }
+          }
+          continue;
+        }
+        if (change.kind === "connection_added") {
+          const added = snapshot.connections.find((c) => c.id === change.connectionId);
+          if (added?.kind === "ssh" && added.dialable) {
+            await this.connectSsh(change.connectionId, { activateScope: false });
+          }
+        }
+      }
+    }
+    this.emitFleet();
+  }
+
+  async removeConnection(connectionId: string): Promise<void> {
+    if (connectionId === "local") return;
+    for (const [key, entry] of [...this.transports.entries()]) {
+      if (entry.connectionId === connectionId) {
+        this.disposeTransportEntry(key, entry);
+      }
+    }
+    await this.sshTransport?.disposeConnection(connectionId);
+    this.sshTransport?.clearSessionPassphrase(connectionId);
+    this.sshHealthById.delete(connectionId);
+    this.remoteHealth.delete(connectionId);
+    this.profilesByConnection.delete(connectionId);
+    for (const key of [...this.sessionsByScope.keys()]) {
+      if (key.startsWith(`${connectionId}::`)) {
+        this.sessionsByScope.delete(key);
+      }
+    }
+    for (const key of [...this.transcripts.keys()]) {
+      if (key.startsWith(`${connectionId}::`)) {
+        this.transcripts.delete(key);
+      }
+    }
+    if (this.activeScope?.connectionId === connectionId) {
+      const localProfiles = this.profilesByConnection.get("local") ?? [];
+      if (this.localHealth.actual === "ready" || localProfiles.length > 0) {
+        const pid = localProfiles[0]?.profileId ?? "default";
+        const localSessions = this.sessionsByScope.get(scopeKey("local", pid)) ?? [];
+        const sid = localSessions[0]?.sessionId ?? null;
+        this.activeScope = {
+          connectionId: "local",
+          profileId: pid,
+          ...(sid ? { sessionId: sid } : {}),
+        };
+        this.activeSessionId = sid;
+        this.chatSessionStateStore?.recordActiveChat({
+          connectionId: "local",
+          profileId: pid,
+          ...(sid ? { sessionId: sid } : {}),
+        });
+      } else {
+        this.activeScope = null;
+        this.activeSessionId = null;
+        this.chatSessionStateStore?.recordActiveChat(null);
+      }
+      this.syncChatStateWithSnapshot();
+    }
+    this.emitFleet();
+  }
+
+  private async ensureScopeTransport(
+    connectionId: string,
     profileId: string,
-    options?: { forceReconnect?: boolean; activate?: boolean },
+    options?: { forceReconnect?: boolean; activate?: boolean; activateScope?: boolean },
   ): Promise<SupervisorConnectResult> {
     if (!options?.forceReconnect) {
-      const existing = this.getTransport("local", profileId);
+      const existing = this.getTransport(connectionId, profileId);
       if (existing) {
         await this.refreshSessionsForProfile(existing, profileId);
         return { ok: true, fleet: this.getFleetSnapshot() };
       }
     }
 
-    const inflightKey = options?.forceReconnect ? `local:retry:${profileId}` : `local:${profileId}`;
+    const inflightKey = options?.forceReconnect
+      ? `retry:${connectionId}::${profileId}`
+      : `${connectionId}::${profileId}`;
     const inflight = this.connectingByKey.get(inflightKey);
     if (inflight) {
       return inflight;
     }
 
-    const promise = this.connectLocalInternal(profileId, options).finally(() => {
+    const runner =
+      connectionId === "local"
+        ? this.connectLocalInternal(profileId, options)
+        : this.connectSshInternal(connectionId, profileId, options);
+
+    const promise = runner.finally(() => {
       this.connectingByKey.delete(inflightKey);
     });
     this.connectingByKey.set(inflightKey, promise);
@@ -659,7 +872,24 @@ export class ConnectionSupervisor {
     profileId = "default",
     options?: { forceReconnect?: boolean; activate?: boolean },
   ): Promise<SupervisorConnectResult> {
-    return this.ensureProfileTransport(profileId, options);
+    return this.ensureScopeTransport("local", profileId, options);
+  }
+
+  async connectSsh(
+    connectionId: string,
+    options?: { profileId?: string; forceReconnect?: boolean; activateScope?: boolean },
+  ): Promise<SupervisorConnectResult> {
+    const info = this.getSshTargetForConnection(connectionId);
+    const profileId = options?.profileId ?? info?.defaultProfile ?? "default";
+    return this.ensureScopeTransport(connectionId, profileId, options);
+  }
+
+  private setHealth(connectionId: string, next: ConnectionHealthSummary): void {
+    if (connectionId === "local") {
+      this.localHealth = next;
+    } else {
+      this.sshHealthById.set(connectionId, next);
+    }
   }
 
   async connectRemote(
@@ -893,6 +1123,7 @@ export class ConnectionSupervisor {
     const entry: GatewayTransportEntry = {
       key: transportKey,
       connectionId,
+      kind: "remote",
       defaultProfileId: targetProfileId,
       transportMode: "per-profile",
       client,
@@ -1002,7 +1233,7 @@ export class ConnectionSupervisor {
 
   private async connectLocalInternal(
     profileId: string,
-    options?: { forceReconnect?: boolean; activate?: boolean },
+    options?: { forceReconnect?: boolean; activate?: boolean; activateScope?: boolean },
   ): Promise<SupervisorConnectResult> {
     if (this.disposed) {
       return { ok: false, fleet: this.getFleetSnapshot() };
@@ -1014,6 +1245,7 @@ export class ConnectionSupervisor {
           entry.connectionId === "local" &&
           (entry.transportMode === "shared-host-scope" ||
             k === `profile:${profileId}` ||
+            k === `local::profile:${profileId}` ||
             !entry.client.isOpen())
         ) {
           this.disposeTransportEntry(k, entry);
@@ -1055,7 +1287,10 @@ export class ConnectionSupervisor {
     }
 
     const dial = dialResult.dial;
-    const transportKey = dial.transportMode === "shared-host-scope" ? "shared" : `profile:${dial.profileId}`;
+    const transportKey =
+      dial.transportMode === "shared-host-scope"
+        ? "local::shared"
+        : `local::profile:${dial.profileId}`;
 
     let ticket = dial.consumeTicket();
     if (!ticket) {
@@ -1092,6 +1327,150 @@ export class ConnectionSupervisor {
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
+    return this.finishGatewayHandshake({
+      connectionId: "local",
+      kind: "local",
+      label: this.getLocalLabel(),
+      originDisplay: "127.0.0.1",
+      transportKey,
+      dial,
+      ticket,
+      startedAt,
+      activateScope: options?.activateScope ?? options?.activate,
+    });
+  }
+
+  private async connectSshInternal(
+    connectionId: string,
+    profileId: string,
+    options?: { forceReconnect?: boolean; activateScope?: boolean },
+  ): Promise<SupervisorConnectResult> {
+    if (this.disposed || !this.sshTransport) {
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    const info = this.getSshTargetForConnection(connectionId);
+    if (!info) {
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    if (options?.forceReconnect) {
+      for (const [k, entry] of [...this.transports.entries()]) {
+        if (entry.connectionId === connectionId) {
+          this.disposeTransportEntry(k, entry);
+        }
+      }
+      await this.sshTransport.disposeConnection(connectionId);
+    }
+
+    this.setHealth(connectionId, {
+      connectionId,
+      label: info.label,
+      kind: "ssh",
+      originDisplay: info.sshTargetDisplay,
+      actual: "connecting",
+      degraded: false,
+      latencyMs: null,
+      nextRetryAt: null,
+    });
+    this.emitFleet(connectionId);
+
+    const startedAt = Date.now();
+    const dialResult = await this.sshTransport.prepareDial(info.target, profileId);
+    if (!dialResult.ok) {
+      this.setHealth(connectionId, {
+        connectionId,
+        label: info.label,
+        kind: "ssh",
+        originDisplay: info.sshTargetDisplay,
+        actual: dialResult.status === "blocked" ? "blocked" : "reconnecting",
+        degraded: true,
+        latencyMs: null,
+        nextRetryAt: null,
+        errorCode: mapSshFailureToErrorCode(dialResult.failureCode),
+        message: dialResult.message,
+      });
+      this.emitFleet(connectionId);
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    const dial = dialResult.dial;
+    const transportKey =
+      dial.transportMode === "shared-host-scope"
+        ? `${connectionId}::shared`
+        : `${connectionId}::profile:${dial.profileId}`;
+
+    let ticket = dial.consumeTicket();
+    if (!ticket) {
+      const minted = await this.sshTransport.mintReconnectTicket(
+        connectionId,
+        info.target,
+        dial.profileId,
+        dial.instanceId,
+      );
+      if (!minted.ok) {
+        this.setHealth(connectionId, {
+          connectionId,
+          label: info.label,
+          kind: "ssh",
+          originDisplay: info.sshTargetDisplay,
+          actual: "blocked",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: mapSshFailureToErrorCode(minted.failureCode),
+          message: minted.message,
+        });
+        this.emitFleet(connectionId);
+        return { ok: false, fleet: this.getFleetSnapshot() };
+      }
+      dial.wsUrl = minted.wsUrl;
+      ticket = minted.consumeTicket();
+    }
+
+    if (!ticket) {
+      this.setHealth(connectionId, {
+        connectionId,
+        label: info.label,
+        kind: "ssh",
+        originDisplay: info.sshTargetDisplay,
+        actual: "blocked",
+        degraded: true,
+        latencyMs: null,
+        nextRetryAt: null,
+        errorCode: "auth_failed",
+      });
+      this.emitFleet(connectionId);
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    return this.finishGatewayHandshake({
+      connectionId,
+      kind: "ssh",
+      label: info.label,
+      originDisplay: info.sshTargetDisplay,
+      transportKey,
+      dial,
+      ticket,
+      startedAt,
+      activateScope: options?.activateScope,
+    });
+  }
+
+  private async finishGatewayHandshake(params: {
+    connectionId: string;
+    kind: "local" | "ssh";
+    label: string;
+    originDisplay: string;
+    transportKey: string;
+    dial: DialMaterial;
+    ticket: string;
+    startedAt: number;
+    activateScope?: boolean;
+  }): Promise<SupervisorConnectResult> {
+    const { connectionId, kind, label, originDisplay, transportKey, dial, startedAt } = params;
+    let ticket: string | null = params.ticket;
+
     let client: GatewayClient;
     try {
       client = await GatewayClient.connect({
@@ -1102,15 +1481,18 @@ export class ConnectionSupervisor {
       });
     } catch (err) {
       const errCode: ErrorCode = err instanceof GatewayTransportError ? err.code : "unreachable";
-      this.localHealth = {
-        ...this.localHealth,
-        label: this.getLocalLabel(),
+      this.setHealth(connectionId, {
+        connectionId,
+        label: connectionId === "local" ? this.getLocalLabel() : label,
+        kind,
+        originDisplay,
         actual: errCode === "timeout" ? "reconnecting" : "blocked",
         degraded: true,
         latencyMs: null,
+        nextRetryAt: null,
         errorCode: errCode,
-      };
-      this.emitFleet("local");
+      });
+      this.emitFleet(connectionId);
       return { ok: false, fleet: this.getFleetSnapshot() };
     } finally {
       ticket = null;
@@ -1122,14 +1504,18 @@ export class ConnectionSupervisor {
     } catch (err) {
       if (!isJsonRpcMethodNotFound(err)) {
         client.close();
-        this.localHealth = {
-          ...this.localHealth,
-          label: this.getLocalLabel(),
+        this.setHealth(connectionId, {
+          connectionId,
+          label: connectionId === "local" ? this.getLocalLabel() : label,
+          kind,
+          originDisplay,
           actual: "blocked",
           degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
           errorCode: "protocol_unsupported",
-        };
-        this.emitFleet("local");
+        });
+        this.emitFleet(connectionId);
         return { ok: false, fleet: this.getFleetSnapshot() };
       }
     }
@@ -1174,7 +1560,8 @@ export class ConnectionSupervisor {
 
     const entry: GatewayTransportEntry = {
       key: transportKey,
-      connectionId: "local",
+      connectionId,
+      kind,
       defaultProfileId: dial.profileId,
       transportMode: dial.transportMode,
       client,
@@ -1193,27 +1580,37 @@ export class ConnectionSupervisor {
       unsubClose: () => {},
     };
 
-    entry.unsubNotification = client.onNotification((method, params) => {
-      this.handleGatewayNotification(entry, method, params);
+    entry.unsubNotification = client.onNotification((method, notifParams) => {
+      this.handleGatewayNotification(entry, method, notifParams);
     });
+
     entry.unsubClose = client.onClose((reason) => {
       if (this.disposed || entry.disposed || reason === "client_closed") return;
       this.disposeTransportEntry(transportKey, entry);
-      const hasLocalTransports = [...this.transports.values()].some(
-        (t) => t.connectionId === "local" && !t.disposed,
+      const hasRemaining = [...this.transports.values()].some(
+        (t) => t.connectionId === connectionId && !t.disposed && t.client.isOpen(),
       );
-      if (!hasLocalTransports) {
-        this.localHealth = {
-          ...this.localHealth,
-          label: this.getLocalLabel(),
+      if (!hasRemaining) {
+        this.setHealth(connectionId, {
+          connectionId,
+          label: connectionId === "local" ? this.getLocalLabel() : label,
+          kind,
+          originDisplay,
           actual: "reconnecting",
           degraded: true,
           latencyMs: null,
+          nextRetryAt: null,
           errorCode: "unreachable",
-        };
-        this.capabilityRegistry.invalidate({ reason: "transport_closed" });
-        this.emitCapabilities();
-        this.emitFleet("local");
+        });
+        if (connectionId === "local" || this.activeScope?.connectionId === connectionId) {
+          this.capabilityRegistry.invalidate({ reason: "transport_closed" });
+          this.emitCapabilities();
+        }
+        this.emitFleet(connectionId);
+      }
+
+      if (kind === "ssh" && this.sshTransport && entry.dial) {
+        void this.reconnectSshAfterDrop(connectionId, entry.dial.profileId, entry.dial.instanceId);
       }
     });
 
@@ -1223,101 +1620,210 @@ export class ConnectionSupervisor {
     }
     this.transports.set(transportKey, entry);
 
-    this.capabilityRegistry.applyConnectHandshake({
-      connectionId: "local",
-      profileId: dial.profileId,
-      ownerGeneration,
-      authorityEpoch,
-      gatewayVersionOrSha,
-      describeResult: describeRes,
-      serverRequestsSupported: capabilitiesReported,
-    });
-    this.emitCapabilities();
-    this.scheduleCoreProbes(entry, dial.profileId);
+    if (
+      connectionId === "local" ||
+      params.activateScope ||
+      !this.activeScope ||
+      this.activeScope.connectionId === connectionId
+    ) {
+      this.capabilityRegistry.applyConnectHandshake({
+        connectionId,
+        profileId: dial.profileId,
+        ownerGeneration,
+        authorityEpoch,
+        gatewayVersionOrSha,
+        describeResult: describeRes,
+        serverRequestsSupported: capabilitiesReported,
+      });
+      this.emitCapabilities();
+      this.scheduleCoreProbes(entry, dial.profileId);
+    }
 
     const latencyMs = Math.max(1, Date.now() - startedAt);
-    this.localHealth = {
-      ...this.localHealth,
-      label: this.getLocalLabel(),
+    this.setHealth(connectionId, {
+      connectionId,
+      label: connectionId === "local" ? this.getLocalLabel() : label,
+      kind,
+      originDisplay,
       actual: "ready",
       degraded: false,
       latencyMs,
-      errorCode: undefined,
-      message: undefined,
       nextRetryAt: null,
-    };
+    });
 
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
 
-    const savedState = this.chatSessionStateStore?.load();
-    const savedActive = savedState?.lastActiveChat ?? null;
-    const localProfiles = this.profilesByConnection.get("local") ?? [];
-    if (
-      savedActive &&
-      savedActive.connectionId === "local" &&
-      savedActive.profileId !== dial.profileId &&
-      localProfiles.some((p) => p.profileId === savedActive.profileId) &&
-      entry.transportMode === "shared-host-scope"
-    ) {
-      await this.refreshSessionsForProfile(entry, savedActive.profileId);
-    }
+    if (connectionId === "local") {
+      const savedState = this.chatSessionStateStore?.load();
+      const savedActive = savedState?.lastActiveChat ?? null;
+      const localProfiles = this.profilesByConnection.get("local") ?? [];
+      if (
+        savedActive &&
+        savedActive.connectionId === "local" &&
+        savedActive.profileId !== dial.profileId &&
+        localProfiles.some((p) => p.profileId === savedActive.profileId) &&
+        entry.transportMode === "shared-host-scope"
+      ) {
+        await this.refreshSessionsForProfile(entry, savedActive.profileId);
+      }
 
-    const remoteIsCurrentlyActive =
-      this.activeScope &&
-      this.activeScope.connectionId !== "local" &&
-      this.getConnectionHealth(this.activeScope.connectionId)?.actual === "ready" &&
-      !options?.activate;
+      const remoteIsCurrentlyActive =
+        this.activeScope &&
+        this.activeScope.connectionId !== "local" &&
+        this.getConnectionHealth(this.activeScope.connectionId)?.actual === "ready" &&
+        !params.activateScope;
 
-    if (!remoteIsCurrentlyActive) {
-      if (this.chatSessionStateStore) {
-        const hasSessionForDialedScope =
-          savedActive &&
-          savedActive.connectionId === "local" &&
-          savedActive.profileId === dial.profileId &&
-          Boolean(savedActive.sessionId);
-        if (!savedActive || (!hasSessionForDialedScope && !savedActive.sessionId && sessions.length > 0)) {
-          const initialSessionId = sessions[0]?.sessionId ?? null;
+      if (!remoteIsCurrentlyActive) {
+        if (this.chatSessionStateStore) {
+          const hasSessionForDialedScope =
+            savedActive &&
+            savedActive.connectionId === "local" &&
+            savedActive.profileId === dial.profileId &&
+            Boolean(savedActive.sessionId);
+          if (!savedActive || (!hasSessionForDialedScope && !savedActive.sessionId && sessions.length > 0)) {
+            const initialSessionId = sessions[0]?.sessionId ?? null;
+            this.chatSessionStateStore.recordActiveChat({
+              connectionId: "local",
+              profileId: dial.profileId,
+              ...(initialSessionId ? { sessionId: initialSessionId } : {}),
+            });
+          }
+          this.syncChatStateWithSnapshot();
+        } else {
+          const shouldActivate =
+            !this.activeScope ||
+            Boolean(params.activateScope) ||
+            (this.activeScope.connectionId === "local" && !this.activeSessionId);
+          if (shouldActivate) {
+            const initialSessionId = sessions[0]?.sessionId ?? null;
+            this.activeScope = {
+              connectionId: "local",
+              profileId: dial.profileId,
+              ...(initialSessionId ? { sessionId: initialSessionId } : {}),
+            };
+            this.activeSessionId = initialSessionId;
+          }
+        }
+
+        const projection = this.getChatStateProjection();
+        if (
+          (!this.chatSessionStateStore || projection.activeStatus === "ready") &&
+          this.activeSessionId &&
+          this.activeScope?.connectionId === "local" &&
+          this.activeScope?.profileId
+        ) {
+          const targetEntry = this.getTransport("local", this.activeScope.profileId) ?? entry;
+          await this.loadTranscriptSnapshot(targetEntry, this.activeScope.profileId, this.activeSessionId);
+        }
+      }
+    } else {
+      const shouldActivate = Boolean(params.activateScope) || !this.activeScope;
+      if (shouldActivate) {
+        const initialSessionId = sessions[0]?.sessionId ?? null;
+        this.activeScope = {
+          connectionId,
+          profileId: dial.profileId,
+          ...(initialSessionId ? { sessionId: initialSessionId } : {}),
+        };
+        this.activeSessionId = initialSessionId;
+        if (this.chatSessionStateStore) {
           this.chatSessionStateStore.recordActiveChat({
-            connectionId: "local",
+            connectionId,
             profileId: dial.profileId,
             ...(initialSessionId ? { sessionId: initialSessionId } : {}),
           });
-        }
-        this.syncChatStateWithSnapshot();
-      } else {
-        const shouldActivate =
-          !this.activeScope ||
-          options?.activate ||
-          (this.activeScope.connectionId === "local" && !this.activeSessionId);
-        if (shouldActivate) {
-          const initialSessionId = sessions[0]?.sessionId ?? null;
-          this.activeScope = {
-            connectionId: "local",
-            profileId: dial.profileId,
-            ...(initialSessionId ? { sessionId: initialSessionId } : {}),
-          };
-          this.activeSessionId = initialSessionId;
+          this.syncChatStateWithSnapshot();
         }
       }
-
-      const projection = this.getChatStateProjection();
       if (
-        (!this.chatSessionStateStore || projection.activeStatus === "ready") &&
         this.activeSessionId &&
-        this.activeScope?.connectionId === "local" &&
-        this.activeScope?.profileId
+        this.activeScope?.connectionId === connectionId &&
+        this.activeScope?.profileId === dial.profileId
       ) {
-        const targetEntry = this.getTransport("local", this.activeScope.profileId) ?? entry;
-        await this.loadTranscriptSnapshot(targetEntry, this.activeScope.profileId, this.activeSessionId);
+        await this.loadTranscriptSnapshot(entry, dial.profileId, this.activeSessionId);
       }
     }
 
-    this.emitFleet("local");
+    this.emitFleet(connectionId);
     return {
       ok: true,
       fleet: this.getFleetSnapshot(),
     };
+  }
+
+  private async reconnectSshAfterDrop(
+    connectionId: string,
+    profileId: string,
+    instanceId: string,
+  ): Promise<void> {
+    if (this.disposed || !this.sshTransport) return;
+    const info = this.getSshTargetForConnection(connectionId);
+    if (!info) return;
+
+    const inflightKey = `ssh-drop:${connectionId}::${profileId}`;
+    if (this.connectingByKey.has(inflightKey)) return;
+
+    const runner = (async (): Promise<SupervisorConnectResult> => {
+      const startedAt = Date.now();
+      const minted = await this.sshTransport!.mintReconnectTicket(
+        connectionId,
+        info.target,
+        profileId,
+        instanceId,
+      );
+      if (!minted.ok) {
+        this.setHealth(connectionId, {
+          connectionId,
+          label: info.label,
+          kind: "ssh",
+          originDisplay: info.sshTargetDisplay,
+          actual: "reconnecting",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: mapSshFailureToErrorCode(minted.failureCode),
+          message: minted.message,
+        });
+        this.emitFleet(connectionId);
+        return { ok: false, fleet: this.getFleetSnapshot() };
+      }
+
+      const ticket = minted.consumeTicket();
+      if (!ticket) {
+        return { ok: false, fleet: this.getFleetSnapshot() };
+      }
+
+      const dial: SshDialMaterial = {
+        connectionId,
+        profileId,
+        instanceId,
+        authorityEpoch: 1,
+        wsUrl: minted.wsUrl,
+        wsProtocol: "hermes-gateway-v1",
+        ticketProtocolPrefix: "hermes-gateway-ticket.",
+        transportMode: "shared-host-scope",
+        endpointCapabilities: ["session-authority-v1"],
+        expiresAt: minted.expiresAt,
+        consumeTicket: () => null,
+      };
+      const transportKey = `${connectionId}::shared`;
+      return this.finishGatewayHandshake({
+        connectionId,
+        kind: "ssh",
+        label: info.label,
+        originDisplay: info.sshTargetDisplay,
+        transportKey,
+        dial,
+        ticket,
+        startedAt,
+      });
+    })().finally(() => {
+      this.connectingByKey.delete(inflightKey);
+    });
+
+    this.connectingByKey.set(inflightKey, runner);
+    await runner;
   }
 
   private disposeTransportEntry(key: string, entry: GatewayTransportEntry): void {
@@ -1405,19 +1911,21 @@ export class ConnectionSupervisor {
       return Array.isArray(res?.sessions) ? res.sessions : [];
     };
 
-    try {
-      rawList = await callList("session.list");
-    } catch (err) {
-      if (isJsonRpcMethodNotFound(err)) {
-        try {
-          rawList = await callList("sessions.list");
-        } catch (err2) {
-          if (isJsonRpcMethodNotFound(err2)) {
-            entry.capabilities.sessionList = false;
+    if (entry.capabilities.sessionList) {
+      try {
+        rawList = await callList("session.list");
+      } catch (err) {
+        if (isRpcAuthError(err) && connectionId !== "local") {
+          this.markConnectionAuthRequired(connectionId);
+        } else {
+          try {
+            rawList = await callList("sessions.list");
+          } catch (err2) {
+            if (isJsonRpcMethodNotFound(err2)) {
+              entry.capabilities.sessionList = false;
+            }
           }
         }
-      } else if (isRpcAuthError(err) && connectionId !== "local") {
-        this.markConnectionAuthRequired(connectionId);
       }
     }
 
@@ -1883,9 +2391,9 @@ export class ConnectionSupervisor {
     }
 
     if (method === "activity" || method === "tool.execution" || method === "tool.call") {
-      const rawTool = (params.tool_row && typeof params.tool_row === "object"
-        ? params.tool_row
-        : params) as Record<string, unknown>;
+      const rawTool = (
+        params.tool_row && typeof params.tool_row === "object" ? params.tool_row : params
+      ) as Record<string, unknown>;
       const toolRow: ToolExecutionRow = {
         toolCallId: asString(
           rawTool.tool_call_id ?? rawTool.toolCallId ?? rawTool.id,
@@ -2009,12 +2517,17 @@ export class ConnectionSupervisor {
     ) {
       return this.activeScope.profileId.trim();
     }
+    if (connectionId && connectionId !== "local") {
+      const sshInfo = this.getSshTargetForConnection(connectionId);
+      if (sshInfo?.defaultProfile) return sshInfo.defaultProfile;
+    }
     return "default";
   }
 
   private resolveTargetSessionId(
     payload: Record<string, unknown>,
     scope: BridgeScope | null,
+    connectionId?: string,
   ): string | null {
     if (typeof payload.sessionId === "string" && payload.sessionId.trim()) {
       return payload.sessionId.trim();
@@ -2022,7 +2535,10 @@ export class ConnectionSupervisor {
     if (scope?.sessionId && scope.sessionId.trim()) {
       return scope.sessionId.trim();
     }
-    return this.activeSessionId;
+    if (!connectionId || this.activeScope?.connectionId === connectionId) {
+      return this.activeSessionId;
+    }
+    return null;
   }
 
   private requireTransport(connectionId: string, profileId: string): GatewayTransportEntry {
@@ -2238,15 +2754,21 @@ export class ConnectionSupervisor {
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       if (connectionId !== "local") {
-        const res = await this.connectRemote(connectionId, {
-          profileId,
-          forceReconnect: true,
-          activate: true,
-        });
+        const res = this.isSshConnection(connectionId)
+          ? await this.connectSsh(connectionId, {
+              profileId,
+              forceReconnect: true,
+              activateScope: true,
+            })
+          : await this.connectRemote(connectionId, {
+              profileId,
+              forceReconnect: true,
+              activate: true,
+            });
         return {
           ok: res.ok,
           fleet: res.fleet,
-          failure: null,
+          failure: res.failure ?? null,
         };
       }
       const res = await this.connectLocal(profileId, { forceReconnect: true, activate: true });
@@ -2265,7 +2787,7 @@ export class ConnectionSupervisor {
       const entry = this.getTransport(connectionId, profileId);
       if (!entry) {
         return {
-          profiles: scope?.connectionId
+          profiles: scope?.connectionId || typeof payload.connectionId === "string"
             ? [...(this.profilesByConnection.get(connectionId) ?? [])]
             : this.getAllProfiles(),
         };
@@ -2484,7 +3006,7 @@ export class ConnectionSupervisor {
     "sessions.resume": async (payload, scope) => {
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
-      const sessionId = this.resolveTargetSessionId(payload, scope);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       if (!sessionId) {
         throw makeBridgeError("invalid_request", "缺少目标 Session");
       }
@@ -2501,7 +3023,7 @@ export class ConnectionSupervisor {
     "prompts.send": async (payload, scope) => {
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
-      const sessionId = this.resolveTargetSessionId(payload, scope);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
         throw makeBridgeError("invalid_request", "请输入对话内容后再发送");
@@ -2588,7 +3110,7 @@ export class ConnectionSupervisor {
     "prompts.stop": async (payload, scope) => {
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
-      const sessionId = this.resolveTargetSessionId(payload, scope);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       const existing = sessionId
         ? this.transcripts.get(transcriptKey(connectionId, profileId, sessionId))
         : null;
@@ -2674,7 +3196,7 @@ export class ConnectionSupervisor {
     "prompts.steer": async (payload, scope) => {
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
-      const sessionId = this.resolveTargetSessionId(payload, scope);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       const turnId = typeof payload.turnId === "string" ? payload.turnId : "";
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
@@ -2771,6 +3293,7 @@ export class ConnectionSupervisor {
     }
     this.transports.clear();
     this.subscribers.clear();
+    await this.sshTransport?.disposeAll();
   }
 }
 

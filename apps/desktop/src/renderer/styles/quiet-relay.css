@@ -1309,6 +1309,13 @@ button {
   border-color: var(--ink);
 }
 
+.cap-empty-note,
+.gateway-form-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .modal-scrim.is-drawer {
   justify-content: flex-end;
   align-items: stretch;
@@ -1416,12 +1423,6 @@ button {
   background: var(--paper-deep);
   font-size: 12px;
   color: var(--ink);
-}
-
-.cap-empty-note {
-  margin: 0;
-  font-size: 12px;
-  color: var(--muted);
 }
 
 .cap-groups {
@@ -1781,4 +1782,57 @@ button {
   margin: 4px 0 0;
   font-size: 12px;
   color: var(--accent-text);
+}
+
+.ssh-test-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--paper-raised);
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.ssh-test-box.is-failed {
+  border-color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.ssh-test-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ssh-test-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.host-key-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.host-key-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.host-key-fp {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  word-break: break-all;
 }

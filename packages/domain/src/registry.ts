@@ -934,8 +934,16 @@ function buildConnectionFromInput(
     ) {
       conn.port = input.port;
     }
-    if (input.keyPath?.trim()) conn.keyPath = input.keyPath.trim();
-    if (input.remoteHermesPath?.trim()) conn.remoteHermesPath = input.remoteHermesPath.trim();
+    if (input.keyPath !== undefined) {
+      if (input.keyPath.trim()) conn.keyPath = input.keyPath.trim();
+    } else if (existing?.keyPath) {
+      conn.keyPath = existing.keyPath;
+    }
+    if (input.remoteHermesPath !== undefined) {
+      if (input.remoteHermesPath.trim()) conn.remoteHermesPath = input.remoteHermesPath.trim();
+    } else if (existing?.remoteHermesPath) {
+      conn.remoteHermesPath = existing.remoteHermesPath;
+    }
     if (input.remoteProfile?.trim()) conn.remoteProfile = input.remoteProfile.trim();
     if (input.token !== undefined && input.token.length > 0) {
       conn.token = { encoding: "plain", value: input.token };

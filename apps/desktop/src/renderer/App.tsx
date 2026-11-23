@@ -87,13 +87,23 @@ export default function App() {
   }, [state.activeScope?.connectionId, state.connections]);
 
   const hasReadyConnection = Boolean(activeConnection && activeConnection.actual === "ready");
+  const activeScopeConnId = state.activeScope?.connectionId;
+  const activeScopeProfileId = state.activeScope?.profileId;
+  const activeScopeSessionId = state.activeScope?.sessionId;
+  const fallbackConnId = activeConnection?.connectionId;
   const effectiveScope: BridgeScope | null = useMemo(() => {
-    if (state.activeScope) return state.activeScope;
-    if (activeConnection) {
-      return { connectionId: activeConnection.connectionId, profileId: "default" };
+    if (activeScopeConnId) {
+      return {
+        connectionId: activeScopeConnId,
+        ...(activeScopeProfileId ? { profileId: activeScopeProfileId } : {}),
+        ...(activeScopeSessionId ? { sessionId: activeScopeSessionId } : {}),
+      };
+    }
+    if (fallbackConnId) {
+      return { connectionId: fallbackConnId, profileId: "default" };
     }
     return null;
-  }, [activeConnection, state.activeScope]);
+  }, [activeScopeConnId, activeScopeProfileId, activeScopeSessionId, fallbackConnId]);
 
   const scopedProfiles = useMemo(
     () => filterProfilesForConnection(state.profiles, effectiveScope?.connectionId),
@@ -362,7 +372,7 @@ export default function App() {
   const handleAppCommandRef = useRef(handleAppCommand);
   handleAppCommandRef.current = handleAppCommand;
 
-  // HostBridge bootstrap: hello -> chatState.get + local.inspect + fleet/chat.state/registry subscriptions + commands
+  // HostBridge bootstrap: hello -> chatState.get + local.inspect + fleet/chat.state/registry/capabilities subscriptions + commands
   useEffect(() => {
     let active = true;
     void host.request("bridge.hello", {}).then((res) => {
@@ -1185,19 +1195,25 @@ export default function App() {
                           .join(" ")}
                         onClick={() => {
                           void host
-                            .request<FleetSnapshot>("scopes.switch", {
-                              connectionId: conn.connectionId,
-                            })
+                            .request<{ fleet?: FleetSnapshot } & Partial<FleetSnapshot>>(
+                              "scopes.switch",
+                              {
+                                connectionId: conn.connectionId,
+                              },
+                            )
                             .then((res) => {
                               if (res.ok) {
-                                dispatch({
-                                  type: "APPLY_FLEET_SNAPSHOT",
-                                  connections: res.value.connections,
-                                  profiles: res.value.profiles,
-                                  sessions: res.value.sessions,
-                                  activeScope: res.value.activeScope,
-                                  activeSessionId: res.value.activeSessionId,
-                                });
+                                const fleet = res.value.fleet ?? (res.value as FleetSnapshot);
+                                if (fleet?.connections) {
+                                  dispatch({
+                                    type: "APPLY_FLEET_SNAPSHOT",
+                                    connections: fleet.connections,
+                                    profiles: fleet.profiles,
+                                    sessions: fleet.sessions,
+                                    activeScope: fleet.activeScope,
+                                    activeSessionId: fleet.activeSessionId,
+                                  });
+                                }
                                 dispatch({
                                   type: "ANNOUNCE",
                                   message: getCopy("scope.switchNotice"),
@@ -1210,7 +1226,7 @@ export default function App() {
                         <span>
                           <strong>{conn.label}</strong>
                           <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
-                            {conn.originDisplay} ({conn.kind})
+                            {conn.kind} · {conn.originDisplay}
                           </span>
                         </span>
                         {isCurrent && <span className="gateway-badge is-primary">Active</span>}

@@ -60,6 +60,11 @@ const SENSITIVE_KEYS = new Set([
   "cookiejar",
   "keypath",
   "key_path",
+  "remotehermespath",
+  "remote_hermes_path",
+  "knownhostspath",
+  "known_hosts_path",
+  "askpass",
 ]);
 
 const ERROR_CATALOG: Record<ErrorCode, { message: string; retryable: boolean }> = {

@@ -508,6 +508,13 @@ export class RegistryStore {
     this.emit({ snapshot: this.snapshot(), diff, reason: "mutation" });
   }
 
+  getDocument(): RegistryDocument {
+    return {
+      ...this.lastNormalized.doc,
+      connections: this.lastNormalized.doc.connections.map((c) => ({ ...c })),
+    };
+  }
+
   snapshot(): RegistrySnapshotView {
     return projectRegistrySnapshot(this.lastNormalized, {
       oauthTokenIds: this.lastOAuthIds,
