@@ -618,6 +618,9 @@ test.describe("Electron hardened smoke", () => {
     try {
       const page1 = await app1.firstWindow();
       await page1.waitForLoadState("domcontentloaded");
+      // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
+      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      await page1.setViewportSize({ width: 1440, height: 900 });
       await expect(page1.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
 
       const sess2Btn = page1.locator("nav.sidebar").getByRole("button", { name: /Session Two/ });
@@ -785,6 +788,9 @@ test.describe("Electron hardened smoke", () => {
     try {
       const page = await electronApp.firstWindow();
       await page.waitForLoadState("domcontentloaded");
+      // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
+      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      await page.setViewportSize({ width: 1440, height: 900 });
 
       await page.getByRole("button", { name: "打开 Settings" }).click();
       const settings = page.getByRole("dialog", { name: "Settings" });
