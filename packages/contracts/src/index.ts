@@ -174,6 +174,8 @@ export interface HermesHost {
 
 export type ConnectionKind = "local" | "remote" | "ssh" | "cloud";
 
+export type ConnectionDesiredState = "enabled" | "disabled" | "suspended";
+
 export type ConnectionActualState =
   | "idle"
   | "connecting"
@@ -183,17 +185,45 @@ export type ConnectionActualState =
   | "blocked"
   | "stopping";
 
+export type GatewayAggregateState =
+  | "ready"
+  | "degraded"
+  | "auth_required"
+  | "blocked"
+  | "reconnecting"
+  | "connecting"
+  | "idle"
+  | "suspended";
+
+export interface ConnectionLinkSummary {
+  connectionId: string;
+  profileId: string;
+  desired: ConnectionDesiredState;
+  actual: ConnectionActualState;
+  degraded: boolean;
+  pinned: boolean;
+  latencyMs: number | null;
+  nextRetryAt: number | null;
+  attempt?: number;
+  errorCode?: ErrorCode;
+  unavailableCode?: LocalFailureCode;
+  message?: string;
+}
+
 export interface ConnectionHealthSummary {
   connectionId: string;
   label: string;
   kind: ConnectionKind;
   originDisplay: string;
+  desired?: ConnectionDesiredState;
   actual: ConnectionActualState;
+  aggregateState?: GatewayAggregateState;
   degraded: boolean;
   latencyMs: number | null;
   nextRetryAt: number | null;
   errorCode?: ErrorCode;
   message?: string;
+  profileExceptionCount?: number;
 }
 
 export interface ProfileSummary {
@@ -202,8 +232,24 @@ export interface ProfileSummary {
   displayName: string;
   handle: string;
   isDefault: boolean;
+  desired?: ConnectionDesiredState;
   actual?: ConnectionActualState;
+  degraded?: boolean;
+  pinned?: boolean;
+  isException?: boolean;
   unavailableCode?: LocalFailureCode;
+  errorCode?: ErrorCode;
+  message?: string;
+}
+
+export type BackgroundNotificationKind = "approval_pending" | "turn_completed";
+
+export interface SafeBackgroundNotification {
+  kind: BackgroundNotificationKind;
+  title: string;
+  body: string;
+  scope: BridgeScope;
+  focusCommand: { type: "focus_scope"; scope: BridgeScope };
 }
 
 export interface SessionSummary {

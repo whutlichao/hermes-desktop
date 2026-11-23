@@ -868,15 +868,31 @@ export function GatewaysSettings({
                             : "is-warn",
                       ].join(" ")}
                     >
-                      {liveHealth.actual === "ready"
-                        ? getCopy("route.statusReady")
-                        : liveHealth.actual === "connecting"
-                          ? getCopy("route.statusConnecting")
-                          : liveHealth.actual === "reconnecting"
-                            ? getCopy("route.statusReconnecting")
-                            : liveHealth.actual === "auth_required"
-                              ? getCopy("route.statusAuthRequired")
-                              : getCopy("route.statusBlocked")}
+                      {liveHealth.aggregateState === "suspended" ||
+                      liveHealth.desired === "suspended"
+                        ? getCopy("status.suspended")
+                        : liveHealth.actual === "ready"
+                          ? getCopy("route.statusReady")
+                          : liveHealth.actual === "connecting"
+                            ? getCopy("route.statusConnecting")
+                            : liveHealth.actual === "reconnecting"
+                              ? getCopy("route.statusReconnecting")
+                              : liveHealth.actual === "auth_required"
+                                ? getCopy("route.statusAuthRequired")
+                                : liveHealth.actual === "idle"
+                                  ? getCopy("status.idle")
+                                  : liveHealth.actual === "stopping"
+                                    ? getCopy("status.stopping")
+                                    : getCopy("route.statusBlocked")}
+                    </span>
+                  )}
+                  {liveHealth &&
+                    (liveHealth.degraded || liveHealth.aggregateState === "degraded") && (
+                      <span className="status-pill is-warn">{getCopy("status.degraded")}</span>
+                    )}
+                  {(liveHealth?.profileExceptionCount ?? 0) > 0 && (
+                    <span className="gateway-badge is-warning">
+                      {liveHealth?.profileExceptionCount} {getCopy("status.profileExceptions")}
                     </span>
                   )}
                   {!conn.dialable && (
@@ -901,9 +917,23 @@ export function GatewaysSettings({
                         : getCopy("gateways.noTokenLabel")}
                     </span>
                   )}
-                  {liveHealth?.message && liveHealth.actual !== "ready" && (
-                    <span>{liveHealth.message}</span>
+                  {liveHealth && (
+                    <span>
+                      {typeof liveHealth.latencyMs === "number"
+                        ? `${liveHealth.latencyMs}ms`
+                        : getCopy("status.latencyUnknown")}
+                    </span>
                   )}
+                  {typeof liveHealth?.nextRetryAt === "number" && (
+                    <span>
+                      {getCopy("status.nextRetryIn")}{" "}
+                      {Math.max(1, Math.ceil((liveHealth.nextRetryAt - Date.now()) / 1000))}s
+                    </span>
+                  )}
+                  {liveHealth?.message &&
+                    (liveHealth.actual !== "ready" || liveHealth.degraded) && (
+                      <span>{liveHealth.message}</span>
+                    )}
                 </div>
                 {hasTokenSyncWarning && (
                   <p className="gateway-row-warning">{getCopy("gateways.tokenSyncFailedActionHint")}</p>
@@ -929,15 +959,17 @@ export function GatewaysSettings({
                 >
                   {getCopy("gateways.renameAction")}
                 </button>
-                {conn.kind === "ssh" && conn.dialable && (
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() => void handleRetryConnection(conn.id)}
-                  >
-                    {getCopy("gateways.retryConnectionAction")}
-                  </button>
-                )}
+                {conn.dialable &&
+                  (conn.kind === "ssh" ||
+                    (liveHealth && (liveHealth.actual !== "ready" || liveHealth.degraded))) && (
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() => void handleRetryConnection(conn.id)}
+                    >
+                      {getCopy("gateways.retryConnectionAction")}
+                    </button>
+                  )}
                 {!conn.isPrimary && conn.dialable && (
                   <button
                     type="button"
