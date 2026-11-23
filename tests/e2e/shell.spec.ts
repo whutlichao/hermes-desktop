@@ -262,4 +262,19 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await expect(settings).toContainText("本地开发构建，不检查更新");
     await expect(settings.getByRole("button", { name: /检查更新|Update/i })).toHaveCount(0);
   });
+
+  test("Scope popover renders honest empty state and supports Esc dismissal", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const scopeBtn = page.locator(".route-strip").getByRole("button", { name: "未连接" });
+    await scopeBtn.click();
+    const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+    await expect(scopeDialog).toBeVisible();
+    await expect(scopeDialog).toContainText("当前无可用 Connection 或 Profile。");
+
+    await page.keyboard.press("Escape");
+    await expect(scopeDialog).toBeHidden();
+    await expect(scopeBtn).toBeFocused();
+  });
 });

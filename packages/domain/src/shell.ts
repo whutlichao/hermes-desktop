@@ -1,14 +1,17 @@
 import type {
   AppInfo,
+  BridgeEvent,
   BridgeScope,
   ConnectionHealthSummary,
   LocalInspectResult,
   ProfileSummary,
   SanitizedDiagnosticsPayload,
   SessionSummary,
+  SessionTranscriptSnapshot,
   WorkspaceMode,
   WorkspaceTab,
 } from "@hermes/contracts";
+import { reduceTranscriptEvent } from "./gatewayProtocol";
 
 export type ViewportMode = "rail" | "popover";
 
@@ -29,6 +32,9 @@ export interface ShellState {
   sessions: SessionSummary[];
   activeScope: BridgeScope | null;
   activeSessionId: string | null;
+  transcript: SessionTranscriptSnapshot | null;
+  stopError: string | null;
+  chatBusy: boolean;
   localInspection: LocalInspectResult | null;
   diagnosticsReport: SanitizedDiagnosticsPayload | null;
   workspace: {
@@ -49,6 +55,10 @@ export type ShellAction =
       activeScope: BridgeScope | null;
       activeSessionId: string | null;
     }
+  | { type: "APPLY_TRANSCRIPT_EVENT"; event: BridgeEvent }
+  | { type: "CLEAR_TRANSCRIPT" }
+  | { type: "SET_STOP_ERROR"; message: string | null }
+  | { type: "SET_CHAT_BUSY"; busy: boolean }
   | { type: "APPLY_LOCAL_INSPECTION"; inspection: LocalInspectResult }
   | { type: "APPLY_DIAGNOSTICS_REPORT"; report: SanitizedDiagnosticsPayload }
   | { type: "OPEN_SURFACE"; surface: OverlaySurface }
@@ -71,6 +81,9 @@ export function createInitialShellState(): ShellState {
     sessions: [],
     activeScope: null,
     activeSessionId: null,
+    transcript: null,
+    stopError: null,
+    chatBusy: false,
     localInspection: null,
     diagnosticsReport: null,
     workspace: {
@@ -102,6 +115,27 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         sessions: action.sessions,
         activeScope: action.activeScope,
         activeSessionId: action.activeSessionId,
+      };
+    case "APPLY_TRANSCRIPT_EVENT":
+      return {
+        ...state,
+        transcript: reduceTranscriptEvent(state.transcript, action.event),
+      };
+    case "CLEAR_TRANSCRIPT":
+      return {
+        ...state,
+        transcript: null,
+        stopError: null,
+      };
+    case "SET_STOP_ERROR":
+      return {
+        ...state,
+        stopError: action.message,
+      };
+    case "SET_CHAT_BUSY":
+      return {
+        ...state,
+        chatBusy: action.busy,
       };
     case "APPLY_LOCAL_INSPECTION":
       return {

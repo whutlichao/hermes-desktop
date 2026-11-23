@@ -1,7 +1,82 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { _electron as electron, expect, test } from "@playwright/test";
+import { startFakeGatewayServer } from "../helpers/fakeGatewayServer";
 import { createTestSandbox } from "../helpers/sandbox";
+
+function writeElectronFakeCli(options: {
+  cliPath: string;
+  counterFile: string;
+  wsUrl: string;
+  withHostScope?: boolean;
+}) {
+  const caps = options.withHostScope
+    ? ["session-authority-v1", "host-scope-interactive"]
+    : ["session-authority-v1"];
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const profileIdx = args.indexOf("--profile");
+const profileId = profileIdx >= 0 && args[profileIdx + 1] ? args[profileIdx + 1] : "default";
+const rest = profileIdx >= 0 ? args.slice(profileIdx + 2) : args;
+
+if (rest[0] === "--version") {
+  console.log("Hermes Agent v0.23.3");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "--help") {
+  console.log("{run,ensure,attach,tickets,restart}");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "ensure" && rest[2] === "--help") {
+  console.log("--json --timeout");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "attach" && rest[2] === "--help") {
+  console.log("--json --recover");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "tickets") {
+  console.log(JSON.stringify({ protocol: 1, purposes: ["interactive", "native-http"] }));
+  process.exit(0);
+}
+if (rest[0] === "gateway" && (rest[1] === "ensure" || rest[1] === "attach")) {
+  let ticketFields = {};
+  if (rest[1] === "attach") {
+    let n = 0;
+    try {
+      n = Number(fs.readFileSync(${JSON.stringify(options.counterFile)}, "utf8")) || 0;
+    } catch {}
+    n += 1;
+    fs.writeFileSync(${JSON.stringify(options.counterFile)}, String(n), "utf8");
+    ticketFields = { ticket: "tkt_elec_" + n, expires_in_seconds: 30 };
+  }
+  const payload = {
+    state: "ready",
+    attachable: true,
+    install_code_sha: "sha_e2e",
+    client_code_sha: "sha_e2e",
+    ...ticketFields,
+    endpoint: {
+      profile_id: profileId,
+      instance_id: "inst-elec-1",
+      authority_epoch: 1,
+      runtime_protocol: 1,
+      capabilities: ${JSON.stringify(caps)},
+      code_sha: "sha_e2e",
+      ws_url: ${JSON.stringify(options.wsUrl)},
+      ws_protocol: "hermes-gateway-v1",
+      ticket_protocol_prefix: "hermes-gateway-ticket."
+    }
+  };
+  console.log(JSON.stringify(payload));
+  process.exit(0);
+}
+process.exit(1);
+`;
+  fs.writeFileSync(options.cliPath, script, { encoding: "utf8", mode: 0o755 });
+}
 
 test.describe("Electron hardened smoke", () => {
   test("launches real BrowserWindow with sandbox, contextIsolation, frozen window.hermesHost, no Node globals, and real empty state", async () => {
@@ -208,6 +283,264 @@ test.describe("Electron hardened smoke", () => {
       passed = true;
     } finally {
       await electronApp.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("connects Local gateway via control socket ticket, scopes profiles/sessions, streams reply/tools, and handles Stop failure honestly", async () => {
+    const sandbox = createTestSandbox("hc-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2", "tkt_elec_3"]);
+    let udsCounter = 0;
+    let stopShouldFail = true;
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "work", display_name: "Work", handle: "work", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-def-1", title: "Local Intro", preview: "ready" },
+        { profile_id: "work", session_id: "sess-work-1", title: "Work Review", preview: "ops" },
+      ],
+      onRpc: async (method, params, ctx) => {
+        if (method === "prompt.submit") {
+          const sid = String(params.session_id);
+          const turnId = "turn-elec-1";
+          const assistantMsgId = "msg-elec-a1";
+          ctx.replyResult({
+            accepted: true,
+            session_id: sid,
+            turn_id: turnId,
+            user_message_id: "msg-elec-u1",
+            assistant_message_id: assistantMsgId,
+          });
+          setTimeout(() => {
+            ctx.sendNotification("prompt.delta", {
+              session_id: sid,
+              turn_id: turnId,
+              message_id: assistantMsgId,
+              delta: "好的，核心片段如下：\n```ts\nconst answer = 42;\n```",
+            });
+            ctx.sendNotification("activity", {
+              session_id: sid,
+              turn_id: turnId,
+              message_id: assistantMsgId,
+              tool_call_id: "tc-elec-1",
+              name: "read_file",
+              status: "completed",
+              summary: "README.md",
+            });
+          }, 25);
+          return true;
+        }
+        if (method === "prompt.cancel") {
+          if (stopShouldFail) {
+            ctx.replyError(-32000, "Stop ACK timeout");
+            return true;
+          }
+          ctx.replyResult({ stopped: true, session_id: params.session_id, turn_id: params.turn_id });
+          ctx.sendNotification("prompt.stopped", {
+            session_id: params.session_id,
+            turn_id: params.turn_id,
+            message_id: "msg-elec-a1",
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+    const udsServer = net.createServer((socket) => {
+      let buf = "";
+      socket.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        const nl = buf.indexOf("\n");
+        if (nl === -1) return;
+        const req = JSON.parse(buf.slice(0, nl)) as Record<string, unknown>;
+        buf = buf.slice(nl + 1);
+        if (req.op === "resolve-profile") {
+          socket.write(
+            JSON.stringify({
+              status: "ok",
+              state: "ready",
+              attachable: true,
+              purposes: ["interactive"],
+              endpoint: {
+                profile_id: req.profile_id ?? "default",
+                instance_id: "inst-elec-1",
+                authority_epoch: 1,
+                runtime_protocol: 1,
+                capabilities: ["session-authority-v1", "host-scope-interactive"],
+                code_sha: "sha_e2e",
+                ws_url: gw.wsUrl,
+              },
+            }) + "\n",
+          );
+        } else if (req.op === "session-ticket") {
+          udsCounter += 1;
+          socket.write(
+            JSON.stringify({ status: "ok", ticket: `tkt_elec_${udsCounter}`, expires_in_seconds: 30 }) + "\n",
+          );
+        }
+      });
+    });
+    await new Promise<void>((resolve) => udsServer.listen(sockPath, resolve));
+    fs.chmodSync(sockPath, 0o600);
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+      withHostScope: true,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+
+      // Wait for real Local connection over UDS ticket + WS
+      const routeStrip = page.locator(".route-strip");
+      await expect(routeStrip).toContainText("This device");
+      await expect(routeStrip).toContainText("Default", { timeout: 15_000 });
+      await expect(routeStrip).toContainText("已连接", { timeout: 15_000 });
+
+      // Session rail is scoped strictly to (local, default)
+      const sidebar = page.locator("nav.sidebar");
+      await expect(sidebar).toContainText("Local Intro");
+      await expect(sidebar).not.toContainText("Work Review");
+
+      // Switch Profile -> Work swaps visible sessions without opening another WS
+      await routeStrip.getByRole("button", { name: /已连接/ }).click();
+      const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+      await scopeDialog.getByRole("button", { name: /Work/ }).click();
+      await expect(routeStrip).toContainText("Work");
+      await expect(sidebar).toContainText("Work Review");
+      await expect(sidebar).not.toContainText("Local Intro");
+      expect(gw.connections).toHaveLength(1);
+      expect(gw.connections[0].headers.origin).toBeUndefined();
+
+      // Switch back to Default & send first prompt
+      await routeStrip.getByRole("button", { name: /已连接/ }).click();
+      await page.getByRole("dialog", { name: "选择 Scope" }).getByRole("button", { name: /Default/ }).click();
+      await expect(sidebar).toContainText("Local Intro");
+
+      await page.locator("#composer-input").fill("帮我看下 README");
+      await page.getByRole("button", { name: "发送消息" }).click();
+
+      const thread = page.locator(".transcript-list");
+      await expect(thread).toContainText("帮我看下 README");
+      await expect(thread).toContainText("const answer = 42;");
+      await expect(thread).toContainText("read_file");
+      await expect(thread).toContainText("README.md");
+
+      // Stop fails on first attempt -> alert shown AND Stop button remains visible (not faking stopped!)
+      const stopBtn = page.getByRole("button", { name: "停止 Turn" });
+      await expect(stopBtn).toBeVisible();
+      await stopBtn.click();
+      await expect(page.locator(".chat-alert")).toContainText("停止 Turn 失败");
+      await expect(stopBtn).toBeVisible();
+
+      // Second Stop ACKs cleanly -> stopped badge shown
+      stopShouldFail = false;
+      await stopBtn.click();
+      await expect(thread).toContainText("已停止");
+      await expect(stopBtn).toHaveCount(0);
+
+      // Verify zero ticket / wsUrl leak in DOM or diagnostics.export
+      const bodyText = await page.locator("body").innerText();
+      expect(bodyText).not.toContain("tkt_elec_");
+      expect(bodyText).not.toContain(gw.wsUrl);
+      const diagJson = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: { request: (cmd: string, p?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return JSON.stringify(await w.hermesHost.request("diagnostics.export", {}));
+      });
+      expect(diagJson).not.toContain("tkt_elec_");
+      expect(diagJson).not.toContain(gw.wsUrl);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      udsServer.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("hides composer when gateway omits prompt.submit capability", async () => {
+    const sandbox = createTestSandbox("hr-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2"]);
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-ro-1", title: "Readonly Session", preview: "view only" },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+      withHostScope: false,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+      await expect(page.locator(".chat-unavailable-card")).toContainText("当前 Gateway 暂不支持 Chat");
+      await expect(page.locator("form.composer-shell")).toHaveCount(0);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
       sandbox.cleanup(passed);
     }
   });

@@ -127,10 +127,10 @@ export function LocalRepairCard({
             <button
               type="button"
               disabled={busy}
-              className="button button-secondary"
+              className="button button-primary"
               onClick={() => onAction("retry")}
             >
-              {getCopy("local.action.retry")}
+              {getCopy("local.action.connectLocal")}
             </button>
             <button
               type="button"

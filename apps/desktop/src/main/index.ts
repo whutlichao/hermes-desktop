@@ -4,14 +4,13 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } from "elect
 import {
   type AppCommand,
   type AppInfo,
-  type BridgeEvent,
   type BridgeScope,
-  type FleetSnapshot,
   type HostRequestEnvelope,
   type HostTopic,
 } from "@hermes/contracts";
 import { createBridgeDispatcher, formatAppInfoDisplay, validateHostTopic } from "@hermes/domain";
 import { createMainAppInfo, type EmbeddedBuildMeta } from "./appInfo";
+import { LocalConnectionSupervisor } from "./connectionSupervisor";
 import { LocalBackendManager, createNodeLocalBackendPorts } from "./localBackendManager";
 import {
   buildAppMenuSpec,
@@ -105,14 +104,6 @@ function isTrustedSenderFrame(frame: Electron.WebFrameMain | null): boolean {
   return url.startsWith("file://");
 }
 
-const emptyFleetSnapshot: FleetSnapshot = {
-  connections: [],
-  profiles: [],
-  sessions: [],
-  activeScope: null,
-  activeSessionId: null,
-};
-
 const defaultDevHermesHome = path.join(devRepoRoot, ".dev", "hermes-home");
 const hermesHomeKind: "sandbox" | "real" | "temp" = sandbox.isRealHomeAllowed
   ? "real"
@@ -120,29 +111,40 @@ const hermesHomeKind: "sandbox" | "real" | "temp" = sandbox.isRealHomeAllowed
     ? "sandbox"
     : "temp";
 
-const localBackendManager = new LocalBackendManager(
-  createNodeLocalBackendPorts({
-    userDataDir: sandbox.userDataDir,
-    hermesHomeDir: sandbox.hermesHomeDir,
-    hermesHomeKind,
-    appVersion: app.getVersion(),
-    buildMode: app.isPackaged ? "packaged" : "dev",
-    pickCliFile: async () => {
-      const targetWin = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
-      const openOptions: Electron.OpenDialogOptions = {
-        title: "选择 hermes CLI 可执行文件",
-        properties: ["openFile"],
-      };
-      const result = targetWin
-        ? await dialog.showOpenDialog(targetWin, openOptions)
-        : await dialog.showOpenDialog(openOptions);
-      if (result.canceled || result.filePaths.length === 0) {
-        return { cancelled: true };
-      }
-      return { cancelled: false, filePath: result.filePaths[0] };
-    },
-  }),
-);
+const localPorts = createNodeLocalBackendPorts({
+  userDataDir: sandbox.userDataDir,
+  hermesHomeDir: sandbox.hermesHomeDir,
+  hermesHomeKind,
+  appVersion: app.getVersion(),
+  buildMode: app.isPackaged ? "packaged" : "dev",
+  pickCliFile: async () => {
+    const targetWin = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+    const openOptions: Electron.OpenDialogOptions = {
+      title: "选择 hermes CLI 可执行文件",
+      properties: ["openFile"],
+    };
+    const result = targetWin
+      ? await dialog.showOpenDialog(targetWin, openOptions)
+      : await dialog.showOpenDialog(openOptions);
+    if (result.canceled || result.filePaths.length === 0) {
+      return { cancelled: true };
+    }
+    return { cancelled: false, filePath: result.filePaths[0] };
+  },
+});
+
+const localBackendManager = new LocalBackendManager(localPorts);
+const connectionSupervisor = new LocalConnectionSupervisor(localBackendManager, {
+  getLocalLabel: () =>
+    registryStore.snapshot().connections.find((conn) => conn.id === "local")?.label ?? "This device",
+});
+
+function shouldAutoDialLocalOnStartup(): boolean {
+  if (process.env.HERMES_LOCAL_AUTO_DIAL === "1") return true;
+  if (hermesHomeKind !== "temp") return true;
+  if (fs.existsSync(path.join(sandbox.userDataDir, "local-preferences.json"))) return true;
+  return localPorts.getControlSocketCandidates().some((sockPath) => fs.existsSync(sockPath));
+}
 
 const dispatcher = createBridgeDispatcher({
   "bridge.hello": async (): Promise<AppInfo> => {
@@ -151,10 +153,15 @@ const dispatcher = createBridgeDispatcher({
     return mainAppInfo;
   },
   ...registryBridge.handlers,
-  "profiles.list": async () => ({ profiles: emptyFleetSnapshot.profiles }),
-  "sessions.list": async () => ({ sessions: emptyFleetSnapshot.sessions }),
+  ...connectionSupervisor.handlers,
   "local.inspect": async () => localBackendManager.inspect(),
-  "local.selectCli": async () => localBackendManager.selectCli(),
+  "local.selectCli": async () => {
+    const res = await localBackendManager.selectCli();
+    if (!res.cancelled && res.inspection.actual === "ready") {
+      void connectionSupervisor.connectLocal("default", { forceReconnect: true });
+    }
+    return res;
+  },
   "local.diagnose": async () => localBackendManager.diagnose(),
   "diagnostics.export": async () => {
     const base = await localBackendManager.diagnose();
@@ -297,22 +304,28 @@ app.whenReady().then(async () => {
       const check = validateHostTopic(args?.topic);
       if (!check.valid) return;
 
-      if (args.topic === "fleet") {
-        const snapshotEvent: BridgeEvent<FleetSnapshot> = {
-          topic: "fleet",
-          scope: null,
-          kind: "snapshot",
-          seq: 0,
-          revision: 1,
-          payload: emptyFleetSnapshot,
-        };
-        event.sender.send("hermes:event", args.subscriptionId, snapshotEvent);
-      } else if (args.topic === "registry") {
-        const existing = activeSubscriptions.get(args.subscriptionId);
-        existing?.();
+      const existing = activeSubscriptions.get(args.subscriptionId);
+      existing?.();
+
+      if (args.topic === "registry") {
         const unsub = registryBridge.subscribeRegistry((registryEvent) => {
           if (!event.sender.isDestroyed()) {
             event.sender.send("hermes:event", args.subscriptionId, registryEvent);
+          }
+        });
+        activeSubscriptions.set(args.subscriptionId, unsub);
+      } else if (
+        args.topic === "fleet" ||
+        args.topic === "connection.health" ||
+        args.topic === "profiles" ||
+        args.topic === "sessions" ||
+        args.topic === "session.transcript" ||
+        args.topic === "prompt" ||
+        args.topic === "activity"
+      ) {
+        const unsub = connectionSupervisor.subscribe(args.topic, args.scope ?? null, (bridgeEvent) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send("hermes:event", args.subscriptionId, bridgeEvent);
           }
         });
         activeSubscriptions.set(args.subscriptionId, unsub);
@@ -331,6 +344,9 @@ app.whenReady().then(async () => {
   });
 
   mainWindow = createMainWindow();
+  if (shouldAutoDialLocalOnStartup()) {
+    void connectionSupervisor.connectLocal("default");
+  }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0 && !isQuitting) {
@@ -345,6 +361,7 @@ app.on("before-quit", () => {
     unsub();
   }
   activeSubscriptions.clear();
+  void connectionSupervisor.dispose();
   void registryStore.flush(2000).finally(() => {
     registryStore.close();
   });
