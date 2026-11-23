@@ -122,4 +122,41 @@ describe("MockHostBridge Ticket #28 chat/session parity", () => {
 
     unsub();
   });
+
+  it("supports read-only connections.test, OAuth start/cancel/grant, and token_sync_failed parity", async () => {
+    const mock = createMockHostBridge();
+    const authEvents: BridgeEvent[] = [];
+    const unsubAuth = mock.subscribe("auth.state", null, (ev) => authEvents.push(ev));
+
+    // Read-only test leaves registry untouched
+    const wsFail = await mock.request<{ ok: boolean; failedStage?: string }>("connections.test", {
+      kind: "remote",
+      url: "https://ws-fail.example.com",
+      authMode: "token",
+      token: "tok",
+    });
+    expect(wsFail.ok).toBe(true);
+    if (wsFail.ok) {
+      expect(wsFail.value.ok).toBe(false);
+      expect(wsFail.value.failedStage).toBe("ws");
+    }
+
+    // Cancel OAuth emits cancelled and writes zero connections
+    const startedWait = await mock.request<{ authSessionId: string }>("auth.start", {
+      kind: "remote",
+      url: "https://oauth-wait.example.com",
+    });
+    expect(startedWait.ok).toBe(true);
+    if (startedWait.ok) {
+      const cancelRes = await mock.request<{ cancelled: boolean }>("auth.cancel", {
+        authSessionId: startedWait.value.authSessionId,
+      });
+      expect(cancelRes.ok && cancelRes.value.cancelled).toBe(true);
+    }
+    const listAfterCancel = await mock.request<{ connections: unknown[] }>("connections.list", {});
+    expect(listAfterCancel.ok && listAfterCancel.value.connections).toHaveLength(1);
+    expect(authEvents.some((ev) => (ev.payload as { status?: string }).status === "cancelled")).toBe(true);
+
+    unsubAuth();
+  });
 });

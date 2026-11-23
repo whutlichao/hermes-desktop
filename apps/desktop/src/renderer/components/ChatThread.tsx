@@ -1,5 +1,6 @@
 import type { RefObject } from "react";
 import type {
+  ConnectionHealthSummary,
   LocalInspectResult,
   LocalSafeActionId,
   SessionTranscriptSnapshot,
@@ -11,6 +12,7 @@ import { MarkdownText } from "./MarkdownText";
 
 interface ChatThreadProps {
   hasReadyConnection: boolean;
+  activeConnection?: ConnectionHealthSummary | null;
   transcript: SessionTranscriptSnapshot | null;
   localInspection: LocalInspectResult | null;
   localBusy: boolean;
@@ -56,6 +58,7 @@ function getRoleLabel(role: "user" | "assistant" | "system"): string {
 
 export function ChatThread({
   hasReadyConnection,
+  activeConnection,
   transcript,
   localInspection,
   localBusy,
@@ -75,30 +78,49 @@ export function ChatThread({
   onOpenRemoteEscape,
 }: ChatThreadProps) {
   if (!hasReadyConnection) {
+    const isRemoteAuthRequired =
+      activeConnection?.kind === "remote" && activeConnection.actual === "auth_required";
     return (
       <div className="thread-column">
-        <section className="empty-relay-card" aria-labelledby="empty-relay-heading">
-          <h1 id="empty-relay-heading">{getCopy("empty.title")}</h1>
-          <p>{getCopy("empty.body")}</p>
-          <div className="empty-relay-actions">
-            <button type="button" className="button button-primary" onClick={onOpenSettings}>
-              {getCopy("empty.actionSettings")}
-            </button>
-            <button type="button" className="button button-secondary" onClick={onOpenPalette}>
-              {getCopy("empty.actionPalette")}
-            </button>
-            <button type="button" className="button button-secondary" onClick={onOpenShortcuts}>
-              {getCopy("empty.actionShortcuts")}
-            </button>
-          </div>
-        </section>
+        {isRemoteAuthRequired ? (
+          <section className="empty-relay-card" role="status" aria-labelledby="remote-auth-heading">
+            <h1 id="remote-auth-heading">{getCopy("remote.authRequiredTitle")}</h1>
+            <p>{getCopy("remote.authRequiredBody")}</p>
+            <div className="empty-relay-actions">
+              <button type="button" className="button button-primary" onClick={onOpenSettings}>
+                {getCopy("remote.authRequiredAction")}
+              </button>
+              <button type="button" className="button button-secondary" onClick={onOpenPalette}>
+                {getCopy("empty.actionPalette")}
+              </button>
+            </div>
+          </section>
+        ) : (
+          <>
+            <section className="empty-relay-card" aria-labelledby="empty-relay-heading">
+              <h1 id="empty-relay-heading">{getCopy("empty.title")}</h1>
+              <p>{getCopy("empty.body")}</p>
+              <div className="empty-relay-actions">
+                <button type="button" className="button button-primary" onClick={onOpenSettings}>
+                  {getCopy("empty.actionSettings")}
+                </button>
+                <button type="button" className="button button-secondary" onClick={onOpenPalette}>
+                  {getCopy("empty.actionPalette")}
+                </button>
+                <button type="button" className="button button-secondary" onClick={onOpenShortcuts}>
+                  {getCopy("empty.actionShortcuts")}
+                </button>
+              </div>
+            </section>
 
-        <LocalRepairCard
-          inspection={localInspection}
-          busy={localBusy}
-          onAction={onLocalAction}
-          onOpenRemoteEscape={onOpenRemoteEscape}
-        />
+            <LocalRepairCard
+              inspection={localInspection}
+              busy={localBusy}
+              onAction={onLocalAction}
+              onOpenRemoteEscape={onOpenRemoteEscape}
+            />
+          </>
+        )}
 
         <form
           className="composer-shell"

@@ -1,6 +1,9 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
+  AuthStartResult,
+  AuthStateSnapshot,
   ConnectionEntryDisplay,
+  ConnectionHealthSummary,
   ConnectionKind,
   ConnectionMutationResponse,
   DuplicateConflictSummary,
@@ -9,12 +12,16 @@ import type {
   RegistrySafeSummaryExport,
   RegistrySnapshotView,
   RemoteAuthMode,
+  RemoteTestActionId,
+  RemoteTestLegResult,
+  RemoteTestResult,
 } from "@hermes/contracts";
 import { getCopy, type CopyKey } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
 
 interface GatewaysSettingsProps {
   snapshot: RegistrySnapshotView | null;
+  fleetConnections?: ConnectionHealthSummary[];
   onSnapshotChange: (snapshot: RegistrySnapshotView) => void;
   onAnnounce: (message: string) => void;
 }
@@ -27,6 +34,10 @@ interface DraftFormState {
   url: string;
   authMode: RemoteAuthMode;
   token: string;
+  authSessionId: string | null;
+  originalUrl: string;
+  originalAuthMode: RemoteAuthMode;
+  editingHasToken: boolean;
   host: string;
   user: string;
   port: string;
@@ -41,6 +52,10 @@ const INITIAL_DRAFT: DraftFormState = {
   url: "",
   authMode: "token",
   token: "",
+  authSessionId: null,
+  originalUrl: "",
+  originalAuthMode: "token",
+  editingHasToken: false,
   host: "",
   user: "",
   port: "",
@@ -55,8 +70,43 @@ function safeCopyMessage(key: string): string {
   }
 }
 
+function draftTestFingerprint(draft: DraftFormState): string {
+  return [
+    draft.mode,
+    draft.editingId ?? "",
+    draft.kind,
+    draft.url.trim(),
+    draft.authMode,
+    draft.token,
+    draft.authSessionId ?? "",
+  ].join("|");
+}
+
+function legStatusText(leg: RemoteTestLegResult): string {
+  switch (leg.status) {
+    case "ok":
+      return getCopy("gateways.testLegOk");
+    case "failed":
+      return getCopy("gateways.testLegFailed");
+    case "skipped":
+      return getCopy("gateways.testLegSkipped");
+  }
+}
+
+function legStatusClass(leg: RemoteTestLegResult): string {
+  switch (leg.status) {
+    case "ok":
+      return "status-pill is-ready";
+    case "failed":
+      return "status-pill is-blocked";
+    case "skipped":
+      return "status-pill";
+  }
+}
+
 export function GatewaysSettings({
   snapshot,
+  fleetConnections,
   onSnapshotChange,
   onAnnounce,
 }: GatewaysSettingsProps) {
@@ -67,8 +117,43 @@ export function GatewaysSettings({
   const [safeExport, setSafeExport] = useState<RegistrySafeSummaryExport | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<RemoteTestResult | null>(null);
+  const [passedFingerprint, setPassedFingerprint] = useState<string | null>(null);
+  const [authState, setAuthState] = useState<AuthStateSnapshot | null>(null);
+  const [oauthBusy, setOauthBusy] = useState(false);
+
   const labelInputRef = useRef<HTMLInputElement>(null);
   const targetInputRef = useRef<HTMLInputElement>(null);
+  const tokenInputRef = useRef<HTMLInputElement>(null);
+  const authSelectRef = useRef<HTMLSelectElement>(null);
+  const onAnnounceRef = useRef(onAnnounce);
+  onAnnounceRef.current = onAnnounce;
+
+  useEffect(() => {
+    const unsub = host.subscribe("auth.state", null, (event) => {
+      const next = event.payload as AuthStateSnapshot | undefined;
+      if (!next || !next.authSessionId) return;
+      setAuthState(next);
+      if (next.status === "granted") {
+        if (next.connectionId) {
+          setWarnings((prev) =>
+            prev.filter(
+              (w) => !(w.code === "token_sync_failed" && w.connectionId === next.connectionId),
+            ),
+          );
+        }
+        if (next.messageKey) {
+          onAnnounceRef.current(safeCopyMessage(next.messageKey));
+        }
+      } else if (next.status === "cancelled" && next.messageKey) {
+        onAnnounceRef.current(safeCopyMessage(next.messageKey));
+      } else if (next.status === "failed" && next.messageKey) {
+        onAnnounceRef.current(safeCopyMessage(next.messageKey));
+      }
+    });
+    return () => unsub();
+  }, []);
 
   if (!snapshot) {
     return <p>{getCopy("settings.emptyGateways")}</p>;
@@ -76,9 +161,21 @@ export function GatewaysSettings({
 
   const isReadOnly = snapshot.readOnly;
 
+  const resetTestAndAuthState = () => {
+    setTestResult(null);
+    setPassedFingerprint(null);
+    setAuthState(null);
+  };
+
+  const invalidateTestState = () => {
+    setTestResult(null);
+    setPassedFingerprint(null);
+  };
+
   const openAddForm = () => {
     setConflict(null);
     setFormError(null);
+    resetTestAndAuthState();
     setDraft({
       ...INITIAL_DRAFT,
       mode: "add",
@@ -86,27 +183,40 @@ export function GatewaysSettings({
     });
   };
 
-  const openEditForm = (entry: ConnectionEntryDisplay) => {
+  const openEditForm = (entry: ConnectionEntryDisplay, focusToken = false) => {
     setConflict(null);
     setFormError(null);
+    resetTestAndAuthState();
+    const entryUrl = entry.originDisplay ?? "";
+    const entryAuthMode = entry.authMode ?? "token";
     setDraft({
       mode: "edit",
       editingId: entry.id,
       kind: entry.kind,
       label: entry.label,
-      url: entry.originDisplay ?? "",
-      authMode: entry.authMode ?? "token",
+      url: entryUrl,
+      authMode: entryAuthMode,
       token: "",
+      authSessionId: null,
+      originalUrl: entryUrl,
+      originalAuthMode: entryAuthMode,
+      editingHasToken: entry.hasToken,
       host: entry.sshHost ?? "",
       user: entry.sshUser ?? "",
       port: entry.sshPort && entry.sshPort !== 22 ? String(entry.sshPort) : "",
       remoteProfile: entry.remoteProfile ?? "",
     });
+    if (focusToken) {
+      queueMicrotask(() => {
+        tokenInputRef.current?.focus();
+      });
+    }
   };
 
   const closeForm = () => {
     setConflict(null);
     setFormError(null);
+    resetTestAndAuthState();
     setDraft(INITIAL_DRAFT);
   };
 
@@ -131,6 +241,7 @@ export function GatewaysSettings({
       setConflict(null);
       setFormError(null);
       if (clearFormOnCommit) {
+        resetTestAndAuthState();
         setDraft(INITIAL_DRAFT);
       }
       onAnnounce(getCopy("gateways.saveAction"));
@@ -140,6 +251,137 @@ export function GatewaysSettings({
       if (body.rejectedIssue) {
         onAnnounce(safeCopyMessage(body.rejectedIssue.messageKey));
       }
+    }
+  };
+
+  const handleStartOAuth = async (targetUrl: string, connectionId?: string) => {
+    if (oauthBusy || isReadOnly) return;
+    setOauthBusy(true);
+    setFormError(null);
+    try {
+      const res = await host.request<AuthStartResult>("auth.start", {
+        kind: "remote",
+        url: targetUrl,
+        ...(connectionId ? { connectionId } : {}),
+      });
+      if (!res.ok || !res.value) {
+        setAuthState({
+          authSessionId: "local-error",
+          ...(connectionId ? { connectionId } : {}),
+          originDisplay: targetUrl,
+          status: "failed",
+          errorCode: "invalid_request",
+          messageKey: "gateways.oauthFailed",
+          updatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      const nextSessionId = res.value.authSessionId;
+      if (!connectionId) {
+        setDraft((prev) => ({ ...prev, authSessionId: nextSessionId }));
+        invalidateTestState();
+      }
+      setAuthState((prev) =>
+        prev && prev.authSessionId === nextSessionId && prev.status !== "waiting"
+          ? prev
+          : {
+              authSessionId: nextSessionId,
+              ...(connectionId ? { connectionId } : {}),
+              originDisplay: res.value.originDisplay,
+              status: res.value.status,
+              messageKey: "gateways.oauthWaiting",
+              updatedAt: new Date().toISOString(),
+            },
+      );
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const handleCancelOAuth = async () => {
+    const targetSessionId = authState?.authSessionId ?? draft.authSessionId;
+    if (!targetSessionId) return;
+    const res = await host.request<{ cancelled: boolean }>("auth.cancel", {
+      authSessionId: targetSessionId,
+    });
+    if (res.ok) {
+      setDraft((prev) =>
+        prev.authSessionId === targetSessionId ? { ...prev, authSessionId: null } : prev,
+      );
+      setAuthState((prev) =>
+        prev && prev.authSessionId === targetSessionId
+          ? {
+              ...prev,
+              status: "cancelled",
+              messageKey: "gateways.oauthCancelled",
+              updatedAt: new Date().toISOString(),
+            }
+          : prev,
+      );
+    }
+  };
+
+  const handleTestConnection = async () => {
+    if (testing || submitting) return;
+    const fingerprint = draftTestFingerprint(draft);
+    setTesting(true);
+    setConflict(null);
+    setFormError(null);
+    try {
+      const res = await host.request<RemoteTestResult>("connections.test", {
+        kind: draft.kind,
+        url: draft.url,
+        authMode: draft.authMode,
+        ...(draft.token.length > 0 ? { token: draft.token } : {}),
+        ...(draft.authSessionId ? { authSessionId: draft.authSessionId } : {}),
+        ...(draft.mode === "edit" && draft.editingId ? { connectionId: draft.editingId } : {}),
+      });
+      if (!res.ok || !res.value) {
+        setTestResult({
+          ok: false,
+          kind: "remote",
+          originDisplay: draft.url,
+          authMode: draft.authMode,
+          httpLeg: { ok: false, status: "failed", messageKey: "remote.test.httpFailed" },
+          wsLeg: { ok: false, status: "skipped" },
+          failedStage: "http",
+          errorCode: "unreachable",
+          messageKey: "remote.test.httpFailed",
+          actions: ["edit_endpoint", "retry_test"],
+          checkedAt: new Date().toISOString(),
+        });
+        setPassedFingerprint(null);
+        return;
+      }
+
+      setTestResult(res.value);
+      setPassedFingerprint(res.value.ok ? fingerprint : null);
+      if (res.value.messageKey) {
+        onAnnounce(safeCopyMessage(res.value.messageKey));
+      }
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleTestAction = (action: RemoteTestActionId) => {
+    switch (action) {
+      case "edit_endpoint":
+        targetInputRef.current?.focus();
+        break;
+      case "edit_auth":
+        if (draft.authMode === "token") {
+          tokenInputRef.current?.focus();
+        } else {
+          authSelectRef.current?.focus();
+        }
+        break;
+      case "reauthorize_oauth":
+        void handleStartOAuth(draft.url, draft.editingId ?? undefined);
+        break;
+      case "retry_test":
+        void handleTestConnection();
+        break;
     }
   };
 
@@ -157,6 +399,9 @@ export function GatewaysSettings({
         payload.authMode = draft.authMode;
         if (draft.token.length > 0) {
           payload.token = draft.token;
+        }
+        if (draft.authSessionId) {
+          payload.authSessionId = draft.authSessionId;
         }
       } else if (draft.kind === "ssh") {
         payload.host = draft.host;
@@ -206,6 +451,14 @@ export function GatewaysSettings({
     handleMutationResponse(res, false);
   };
 
+  const handleReauthorizeRow = async (conn: ConnectionEntryDisplay) => {
+    if (conn.authMode === "oauth") {
+      await handleStartOAuth(conn.originDisplay ?? "", conn.id);
+    } else {
+      openEditForm(conn, true);
+    }
+  };
+
   const handleSetLaunchMode = async (launchMode: LaunchMode) => {
     const res = await host.request<ConnectionMutationResponse>("connections.setLaunchMode", {
       launchMode,
@@ -225,7 +478,28 @@ export function GatewaysSettings({
     }
   };
 
-  const allIssues = [...snapshot.issues, ...warnings];
+  const snapshotIssueKeys = new Set(
+    snapshot.issues.map((i) => `${i.code}::${i.connectionId ?? ""}`),
+  );
+  const allIssues = [
+    ...snapshot.issues,
+    ...warnings.filter((w) => !snapshotIssueKeys.has(`${w.code}::${w.connectionId ?? ""}`)),
+  ];
+  const isRemoteWizard = draft.kind === "remote" || draft.kind === "cloud";
+  const currentFingerprint = draftTestFingerprint(draft);
+  const isPureLabelRename =
+    isRemoteWizard &&
+    draft.mode === "edit" &&
+    draft.url.trim() === draft.originalUrl.trim() &&
+    draft.authMode === draft.originalAuthMode &&
+    draft.token === "" &&
+    !draft.authSessionId &&
+    draft.editingHasToken;
+  const testPassedForDraft = testResult?.ok === true && passedFingerprint === currentFingerprint;
+  const remoteSaveAllowed = !isRemoteWizard || isPureLabelRename || testPassedForDraft;
+
+  const rowReauthBanner =
+    authState && authState.connectionId && draft.editingId !== authState.connectionId ? authState : null;
 
   return (
     <div className="gateways-panel">
@@ -326,90 +600,136 @@ export function GatewaysSettings({
         </div>
       )}
 
-      <ul className="gateway-list">
-        {snapshot.connections.map((conn) => (
-          <li
-            key={conn.id}
-            data-connection-id={conn.id}
-            className={["gateway-row", !conn.dialable && "is-non-dialable"].filter(Boolean).join(" ")}
-          >
-            <div className="gateway-row-main">
-              <div className="gateway-row-title">
-                <strong>{conn.label}</strong>
-                <span className="gateway-kind-tag">{conn.kind}</span>
-                {conn.isLocal && <span className="gateway-badge">{getCopy("gateways.localBadge")}</span>}
-                {conn.isPrimary && (
-                  <span className="gateway-badge is-primary">{getCopy("gateways.primaryBadge")}</span>
-                )}
-                {conn.isLastUsed && (
-                  <span className="gateway-badge">{getCopy("gateways.lastUsedBadge")}</span>
-                )}
-                {conn.isNextLaunch && (
-                  <span className="gateway-badge is-next-launch">
-                    {getCopy("gateways.nextLaunchBadge")}
-                  </span>
-                )}
-                {!conn.dialable && (
-                  <span className="gateway-badge is-warning">
-                    {getCopy("gateways.duplicateExternalBadge")}
-                  </span>
-                )}
-              </div>
-              <div className="gateway-row-meta">
-                {conn.originDisplay && <span>{conn.originDisplay}</span>}
-                {conn.sshTargetDisplay && <span>{conn.sshTargetDisplay}</span>}
-                {!conn.isLocal && (
-                  <span>
-                    {conn.hasToken
-                      ? getCopy("gateways.hasTokenLabel")
-                      : getCopy("gateways.noTokenLabel")}
-                  </span>
-                )}
-              </div>
-            </div>
+      {rowReauthBanner && (
+        <div className="oauth-status-card" role="status">
+          <span>
+            {rowReauthBanner.messageKey
+              ? safeCopyMessage(rowReauthBanner.messageKey)
+              : rowReauthBanner.status}
+          </span>
+          {rowReauthBanner.status === "waiting" && (
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={() => void handleCancelOAuth()}
+            >
+              {getCopy("gateways.oauthCancelAction")}
+            </button>
+          )}
+        </div>
+      )}
 
-            <div className="gateway-row-actions">
-              <button
-                type="button"
-                className="button button-secondary"
-                disabled={isReadOnly}
-                onClick={() => openEditForm(conn)}
-              >
-                {getCopy("gateways.renameAction")}
-              </button>
-              {!conn.isPrimary && conn.dialable && (
+      <ul className="gateway-list">
+        {snapshot.connections.map((conn) => {
+          const hasTokenSyncWarning = allIssues.some(
+            (i) => i.code === "token_sync_failed" && i.connectionId === conn.id,
+          );
+          const fleetHealth = fleetConnections?.find((fc) => fc.connectionId === conn.id);
+          const needsReauth =
+            conn.kind === "remote" &&
+            (hasTokenSyncWarning || fleetHealth?.actual === "auth_required");
+          return (
+            <li
+              key={conn.id}
+              data-connection-id={conn.id}
+              className={["gateway-row", !conn.dialable && "is-non-dialable"].filter(Boolean).join(" ")}
+            >
+              <div className="gateway-row-main">
+                <div className="gateway-row-title">
+                  <strong>{conn.label}</strong>
+                  <span className="gateway-kind-tag">{conn.kind}</span>
+                  {conn.isLocal && <span className="gateway-badge">{getCopy("gateways.localBadge")}</span>}
+                  {conn.isPrimary && (
+                    <span className="gateway-badge is-primary">{getCopy("gateways.primaryBadge")}</span>
+                  )}
+                  {conn.isLastUsed && (
+                    <span className="gateway-badge">{getCopy("gateways.lastUsedBadge")}</span>
+                  )}
+                  {conn.isNextLaunch && (
+                    <span className="gateway-badge is-next-launch">
+                      {getCopy("gateways.nextLaunchBadge")}
+                    </span>
+                  )}
+                  {!conn.dialable && (
+                    <span className="gateway-badge is-warning">
+                      {getCopy("gateways.duplicateExternalBadge")}
+                    </span>
+                  )}
+                  {needsReauth && (
+                    <span className="gateway-badge is-warning">
+                      {getCopy("gateways.authRequiredBadge")}
+                    </span>
+                  )}
+                </div>
+                <div className="gateway-row-meta">
+                  {conn.originDisplay && <span>{conn.originDisplay}</span>}
+                  {conn.sshTargetDisplay && <span>{conn.sshTargetDisplay}</span>}
+                  {!conn.isLocal && (
+                    <span>
+                      {conn.hasToken
+                        ? getCopy("gateways.hasTokenLabel")
+                        : getCopy("gateways.noTokenLabel")}
+                    </span>
+                  )}
+                </div>
+                {hasTokenSyncWarning && (
+                  <p className="gateway-row-warning">{getCopy("gateways.tokenSyncFailedActionHint")}</p>
+                )}
+              </div>
+
+              <div className="gateway-row-actions">
+                {needsReauth && (
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    disabled={isReadOnly || oauthBusy}
+                    onClick={() => void handleReauthorizeRow(conn)}
+                  >
+                    {getCopy("gateways.reauthorizeAction")}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="button button-secondary"
                   disabled={isReadOnly}
-                  onClick={() => void handleSetPrimary(conn.id)}
+                  onClick={() => openEditForm(conn)}
                 >
-                  {getCopy("gateways.setPrimaryAction")}
+                  {getCopy("gateways.renameAction")}
                 </button>
-              )}
-              {!conn.isLastUsed && conn.dialable && (
-                <button
-                  type="button"
-                  className="button button-secondary"
-                  disabled={isReadOnly}
-                  onClick={() => void handleSetLastUsed(conn.id)}
-                >
-                  {getCopy("gateways.setLastUsedAction")}
-                </button>
-              )}
-              {!conn.isLocal && (
-                <button
-                  type="button"
-                  className="button button-secondary"
-                  disabled={isReadOnly}
-                  onClick={() => void handleRemove(conn.id)}
-                >
-                  {getCopy("gateways.removeAction")}
-                </button>
-              )}
-            </div>
-          </li>
-        ))}
+                {!conn.isPrimary && conn.dialable && (
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    disabled={isReadOnly}
+                    onClick={() => void handleSetPrimary(conn.id)}
+                  >
+                    {getCopy("gateways.setPrimaryAction")}
+                  </button>
+                )}
+                {!conn.isLastUsed && conn.dialable && (
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    disabled={isReadOnly}
+                    onClick={() => void handleSetLastUsed(conn.id)}
+                  >
+                    {getCopy("gateways.setLastUsedAction")}
+                  </button>
+                )}
+                {!conn.isLocal && (
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    disabled={isReadOnly}
+                    onClick={() => void handleRemove(conn.id)}
+                  >
+                    {getCopy("gateways.removeAction")}
+                  </button>
+                )}
+              </div>
+            </li>
+          );
+        })}
       </ul>
 
       {draft.mode !== "closed" && (
@@ -473,12 +793,14 @@ export function GatewaysSettings({
                 id="gw-kind-select"
                 className="form-input"
                 value={draft.kind}
-                onChange={(e) =>
+                onChange={(e) => {
+                  invalidateTestState();
                   setDraft((prev) => ({
                     ...prev,
                     kind: e.target.value as ConnectionKind,
-                  }))
-                }
+                    authSessionId: null,
+                  }));
+                }}
               >
                 <option value="remote">Remote HTTP(S)</option>
                 <option value="ssh">SSH</option>
@@ -499,54 +821,193 @@ export function GatewaysSettings({
             />
           </div>
 
-          {(draft.kind === "remote" || draft.kind === "cloud") && (
-            <>
-              <div className="form-field">
-                <label htmlFor="gw-url-input">{getCopy("gateways.fieldUrl")}</label>
-                <input
-                  ref={targetInputRef}
-                  id="gw-url-input"
-                  className="form-input"
-                  type="url"
-                  required
-                  placeholder="https://gateway.example.com"
-                  value={draft.url}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, url: e.target.value }))}
-                />
-              </div>
-
-              <div className="form-field">
-                <label htmlFor="gw-auth-select">{getCopy("gateways.fieldAuthMode")}</label>
-                <select
-                  id="gw-auth-select"
-                  className="form-input"
-                  value={draft.authMode}
-                  onChange={(e) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      authMode: e.target.value as RemoteAuthMode,
-                    }))
-                  }
-                >
-                  <option value="token">Token</option>
-                  <option value="oauth">OAuth</option>
-                </select>
-              </div>
-
-              {draft.authMode === "token" && (
+          {isRemoteWizard && (
+            <div className="remote-wizard-steps">
+              <section className="wizard-step-box" aria-label={getCopy("gateways.wizardStepEndpoint")}>
+                <div className="wizard-step-label">{getCopy("gateways.wizardStepEndpoint")}</div>
                 <div className="form-field">
-                  <label htmlFor="gw-token-input">{getCopy("gateways.fieldToken")}</label>
+                  <label htmlFor="gw-url-input">{getCopy("gateways.fieldUrl")}</label>
                   <input
-                    id="gw-token-input"
+                    ref={targetInputRef}
+                    id="gw-url-input"
                     className="form-input"
-                    type="password"
-                    autoComplete="off"
-                    value={draft.token}
-                    onChange={(e) => setDraft((prev) => ({ ...prev, token: e.target.value }))}
+                    type="text"
+                    inputMode="url"
+                    required
+                    placeholder="https://gateway.example.com"
+                    value={draft.url}
+                    onChange={(e) => {
+                      invalidateTestState();
+                      setDraft((prev) => ({
+                        ...prev,
+                        url: e.target.value,
+                        authSessionId: null,
+                      }));
+                    }}
                   />
                 </div>
-              )}
-            </>
+              </section>
+
+              <section className="wizard-step-box" aria-label={getCopy("gateways.wizardStepAuth")}>
+                <div className="wizard-step-label">{getCopy("gateways.wizardStepAuth")}</div>
+                <div className="form-field">
+                  <label htmlFor="gw-auth-select">{getCopy("gateways.fieldAuthMode")}</label>
+                  <select
+                    ref={authSelectRef}
+                    id="gw-auth-select"
+                    className="form-input"
+                    value={draft.authMode}
+                    onChange={(e) => {
+                      invalidateTestState();
+                      setAuthState(null);
+                      setDraft((prev) => ({
+                        ...prev,
+                        authMode: e.target.value as RemoteAuthMode,
+                        token: "",
+                        authSessionId: null,
+                      }));
+                    }}
+                  >
+                    <option value="token">{getCopy("gateways.authModeToken")}</option>
+                    <option value="oauth">{getCopy("gateways.authModeOAuth")}</option>
+                  </select>
+                </div>
+
+                {draft.authMode === "token" && (
+                  <div className="form-field">
+                    <label htmlFor="gw-token-input">{getCopy("gateways.fieldToken")}</label>
+                    <input
+                      ref={tokenInputRef}
+                      id="gw-token-input"
+                      className="form-input"
+                      type="password"
+                      autoComplete="off"
+                      value={draft.token}
+                      onChange={(e) => {
+                        invalidateTestState();
+                        setDraft((prev) => ({ ...prev, token: e.target.value }));
+                      }}
+                    />
+                    {draft.mode === "edit" && draft.editingHasToken && (
+                      <p className="field-hint">{getCopy("gateways.fieldTokenMainOnly")}</p>
+                    )}
+                  </div>
+                )}
+
+                {draft.authMode === "oauth" && (
+                  <div className="oauth-step-controls">
+                    <div className="gateway-form-actions">
+                      {authState?.status !== "waiting" ? (
+                        <button
+                          type="button"
+                          className="button button-secondary"
+                          disabled={oauthBusy || !draft.url.trim()}
+                          onClick={() =>
+                            void handleStartOAuth(draft.url, draft.editingId ?? undefined)
+                          }
+                        >
+                          {getCopy("gateways.oauthStartAction")}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="button button-secondary"
+                          onClick={() => void handleCancelOAuth()}
+                        >
+                          {getCopy("gateways.oauthCancelAction")}
+                        </button>
+                      )}
+                    </div>
+                    {draft.mode === "edit" && draft.editingHasToken && !authState && (
+                      <p className="field-hint">{getCopy("gateways.hasTokenLabel")}</p>
+                    )}
+                    {authState && (
+                      <div className="oauth-status-card" role="status">
+                        <span>
+                          {authState.messageKey
+                            ? safeCopyMessage(authState.messageKey)
+                            : authState.status}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              <section className="wizard-step-box" aria-label={getCopy("gateways.wizardStepTest")}>
+                <div className="wizard-step-label">{getCopy("gateways.wizardStepTest")}</div>
+                <div className="gateway-form-actions">
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    disabled={testing || submitting || !draft.url.trim()}
+                    onClick={() => void handleTestConnection()}
+                  >
+                    {getCopy(
+                      testing ? "gateways.testingConnectionAction" : "gateways.testConnectionAction",
+                    )}
+                  </button>
+                </div>
+
+                {testResult && (
+                  <div
+                    className={["remote-test-card", testResult.ok ? "is-pass" : "is-fail"].join(" ")}
+                    role={testResult.ok ? "status" : "alert"}
+                  >
+                    <div className="remote-test-header">
+                      <strong>{getCopy("gateways.testResultTitle")}</strong>
+                      {testResult.originDisplay && (
+                        <span className="issue-meta">{testResult.originDisplay}</span>
+                      )}
+                    </div>
+                    <div className="remote-test-legs">
+                      <div className="remote-test-leg-row">
+                        <span>{getCopy("gateways.testLegHttpLabel")}</span>
+                        <span className={legStatusClass(testResult.httpLeg)}>
+                          {legStatusText(testResult.httpLeg)}
+                          {testResult.httpLeg.statusCode ? ` (${testResult.httpLeg.statusCode})` : ""}
+                          {testResult.httpLeg.latencyMs !== undefined
+                            ? ` · ${testResult.httpLeg.latencyMs}ms`
+                            : ""}
+                        </span>
+                      </div>
+                      <div className="remote-test-leg-row">
+                        <span>{getCopy("gateways.testLegWsLabel")}</span>
+                        <span className={legStatusClass(testResult.wsLeg)}>
+                          {legStatusText(testResult.wsLeg)}
+                          {testResult.wsLeg.latencyMs !== undefined
+                            ? ` · ${testResult.wsLeg.latencyMs}ms`
+                            : ""}
+                        </span>
+                      </div>
+                    </div>
+                    {testResult.messageKey && (
+                      <p className="remote-test-message">{safeCopyMessage(testResult.messageKey)}</p>
+                    )}
+                    {testResult.actions.length > 0 && (
+                      <div className="gateway-form-actions">
+                        {testResult.actions.map((action) => (
+                          <button
+                            key={action}
+                            type="button"
+                            className="button button-secondary"
+                            onClick={() => handleTestAction(action)}
+                          >
+                            {action === "edit_endpoint"
+                              ? getCopy("gateways.conflictEditTargetAction")
+                              : action === "edit_auth"
+                                ? getCopy("gateways.fieldAuthMode")
+                                : action === "reauthorize_oauth"
+                                  ? getCopy("gateways.reauthorizeAction")
+                                  : getCopy("gateways.testConnectionAction")}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+            </div>
           )}
 
           {draft.kind === "ssh" && (
@@ -596,8 +1057,20 @@ export function GatewaysSettings({
             </>
           )}
 
+          {isRemoteWizard && (
+            <div className="wizard-step-label">{getCopy("gateways.wizardStepSave")}</div>
+          )}
+
+          {isRemoteWizard && !remoteSaveAllowed && (
+            <p className="field-hint">{getCopy("gateways.saveRequiresTestHint")}</p>
+          )}
+
           <div className="gateway-form-actions">
-            <button type="submit" className="button button-primary" disabled={submitting}>
+            <button
+              type="submit"
+              className="button button-primary"
+              disabled={submitting || !remoteSaveAllowed}
+            >
               {getCopy("gateways.saveAction")}
             </button>
             <button type="button" className="button button-secondary" onClick={closeForm}>

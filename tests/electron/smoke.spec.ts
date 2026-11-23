@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { _electron as electron, expect, test } from "@playwright/test";
-import { startFakeGatewayServer } from "../helpers/fakeGatewayServer";
+import { startFakeGatewayServer, startFakeRemoteGatewayServer } from "../helpers/fakeGatewayServer";
 import { createTestSandbox } from "../helpers/sandbox";
 
 function writeElectronFakeCli(options: {
@@ -82,6 +82,11 @@ test.describe("Electron hardened smoke", () => {
   test("launches real BrowserWindow with sandbox, contextIsolation, frozen window.hermesHost, no Node globals, and real empty state", async () => {
     const sandbox = createTestSandbox("hermes-electron-smoke-");
     let passed = false;
+    const remoteGw = await startFakeRemoteGatewayServer({
+      protocol: "http",
+      validTokens: new Set(["elec-secret-tok-123"]),
+      useTicketEndpoint: true,
+    });
 
     const electronApp = await electron.launch({
       args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
@@ -172,14 +177,17 @@ test.describe("Electron hardened smoke", () => {
       await expect(page.locator("body")).not.toContainText("Homelab");
       await expect(page.locator("body")).not.toContainText("SIMULATED DATA");
 
-      // Verify Settings -> Gateways writes 0600 registry file into sandboxed HERMES_HOME without leaking secret across bridge
+      // Verify Settings -> Gateways runs real read-only Test before Save, writes 0600 registry file without leaking secret across bridge
       await page.getByRole("button", { name: "打开 Settings" }).click();
       const settings = page.getByRole("dialog", { name: "Settings" });
       await expect(settings).toBeVisible();
       await settings.getByRole("button", { name: "添加连接" }).click();
       await settings.getByLabel("设备名称").fill("Electron Remote");
-      await settings.getByLabel("Gateway 地址").fill("https://electron-gw.example.com");
+      await settings.getByLabel("Gateway 地址").fill(remoteGw.baseUrl);
       await settings.getByLabel("静态 Token（仅写入 Main）").fill("elec-secret-tok-123");
+      await expect(settings.getByRole("button", { name: "保存连接" })).toBeDisabled();
+      await settings.getByRole("button", { name: "测试连接" }).click();
+      await expect(settings.getByText("HTTP 与 WebSocket 双端测试通过，可以保存此 Remote 连接。")).toBeVisible();
       await settings.getByRole("button", { name: "保存连接" }).click();
       await expect(settings.locator('[data-connection-id="electron-remote"]')).toBeVisible();
       await expect(settings).not.toContainText("elec-secret-tok-123");
@@ -227,6 +235,7 @@ test.describe("Electron hardened smoke", () => {
       passed = true;
     } finally {
       await electronApp.close();
+      await remoteGw.close();
       sandbox.cleanup(passed);
     }
   });
@@ -541,6 +550,106 @@ test.describe("Electron hardened smoke", () => {
     } finally {
       await electronApp.close();
       await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("Remote HTTP+WS wizard runs read-only Test, preserves draft on failure, clears token on Save, connects Remote Scope, and sends prompt", async () => {
+    const sandbox = createTestSandbox("hr-remote-");
+    let passed = false;
+    const remoteGw = await startFakeRemoteGatewayServer({
+      protocol: "http",
+      validTokens: new Set(["remote-e2e-token-999"]),
+      useTicketEndpoint: true,
+      profiles: [
+        { profile_id: "default", display_name: "Prod Default", handle: "default", is_default: true },
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "remote-elec-sess-1",
+          title: "Remote Electron Session",
+          preview: "ready",
+        },
+      ],
+    });
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+
+      await page.getByRole("button", { name: "打开 Settings" }).click();
+      const settings = page.getByRole("dialog", { name: "Settings" });
+      await expect(settings).toBeVisible();
+      await settings.getByRole("button", { name: "添加连接" }).click();
+
+      // Failing Test (bad token) keeps Save disabled & preserves draft; 0 registry writes
+      await settings.getByLabel("设备名称").fill("Staging Remote");
+      await settings.getByLabel("Gateway 地址").fill(remoteGw.baseUrl);
+      await settings.getByLabel("静态 Token（仅写入 Main）").fill("wrong-token");
+      await settings.getByRole("button", { name: "测试连接" }).click();
+      await expect(settings.getByText("Remote 认证失败或凭据无效")).toBeVisible();
+      await expect(settings.getByRole("button", { name: "保存连接" })).toBeDisabled();
+      await expect(settings.getByLabel("设备名称")).toHaveValue("Staging Remote");
+      await expect(settings.getByLabel("Gateway 地址")).toHaveValue(remoteGw.baseUrl);
+      expect(fs.existsSync(path.join(sandbox.hermesHomeDir, "gateway-connections.json"))).toBe(false);
+
+      // Valid token passes Test -> enables Save -> commits & dials Remote WS -> re-scopes cleanly
+      await settings.getByLabel("静态 Token（仅写入 Main）").fill("remote-e2e-token-999");
+      await settings.getByRole("button", { name: "测试连接" }).click();
+      await expect(settings.getByText("HTTP 与 WebSocket 双端测试通过，可以保存此 Remote 连接。")).toBeVisible();
+      await settings.getByRole("button", { name: "保存连接" }).click();
+
+      const stagingRow = settings.locator('[data-connection-id="staging-remote"]');
+      await expect(stagingRow).toBeVisible();
+      await expect(stagingRow).toContainText("Main 已保存凭据（Main only）");
+      await expect(settings).not.toContainText("remote-e2e-token-999");
+
+      // Reopen edit shows blank token + Main only
+      await stagingRow.getByRole("button", { name: "编辑 / 改名" }).click();
+      await expect(settings.getByLabel("静态 Token（仅写入 Main）")).toHaveValue("");
+      await expect(settings).toContainText("Main 已保存凭据（Main only）");
+      await page.keyboard.press("Escape");
+
+      // Remote Scope becomes ready & loads Remote sessions + handles prompt.submit
+      const routeStrip = page.locator(".route-strip");
+      await expect(routeStrip).toContainText("Staging Remote", { timeout: 15_000 });
+      await expect(routeStrip).toContainText("已连接", { timeout: 15_000 });
+      await expect(page.locator("nav.sidebar")).toContainText("Remote Electron Session");
+
+      await page.locator("#composer-input").fill("check remote cluster");
+      await page.getByRole("button", { name: "发送消息" }).click();
+      await expect(page.locator(".transcript-list")).toContainText("check remote cluster");
+      expect(
+        remoteGw.rpcCalls.some(
+          (call) => call.method === "prompt.submit" && call.params.text === "check remote cluster",
+        ),
+      ).toBe(true);
+
+      // Verify zero secret token leak in DOM or diagnostics.export
+      const bodyText = await page.locator("body").innerText();
+      expect(bodyText).not.toContain("remote-e2e-token-999");
+      const diagJson = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: { request: (cmd: string, p?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return JSON.stringify(await w.hermesHost.request("diagnostics.export", {}));
+      });
+      expect(diagJson).not.toContain("remote-e2e-token-999");
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await remoteGw.close();
       sandbox.cleanup(passed);
     }
   });

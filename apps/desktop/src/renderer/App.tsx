@@ -53,6 +53,7 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
+  const [fleetResyncNonce, setFleetResyncNonce] = useState(0);
   const [transcriptResyncNonce, setTranscriptResyncNonce] = useState(0);
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -287,21 +288,6 @@ export default function App() {
       dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: res.value });
     });
 
-    const unsubFleet = host.subscribe("fleet", null, (event) => {
-      const accepted = trackerRef.current.accept(event);
-      if (accepted.status === "applied") {
-        const snapshot = event.payload as FleetSnapshot;
-        dispatch({
-          type: "APPLY_FLEET_SNAPSHOT",
-          connections: snapshot.connections,
-          profiles: snapshot.profiles,
-          sessions: snapshot.sessions,
-          activeScope: snapshot.activeScope,
-          activeSessionId: snapshot.activeSessionId,
-        });
-      }
-    });
-
     const unsubRegistry = host.subscribe("registry", null, (event) => {
       const accepted = registryTrackerRef.current.accept(event);
       if (accepted.status === "applied") {
@@ -315,11 +301,37 @@ export default function App() {
     const unsubCmd = host.onCommand(handleAppCommand);
     return () => {
       active = false;
-      unsubFleet();
       unsubRegistry();
       unsubCmd();
     };
   }, [handleAppCommand]);
+
+  // Subscribe to fleet snapshots/patches with sequence verification & resync recovery
+  useEffect(() => {
+    trackerRef.current.reset();
+    const unsubFleet = host.subscribe("fleet", null, (event) => {
+      const accepted = trackerRef.current.accept(event);
+      if (accepted.status === "resync_required") {
+        trackerRef.current.reset();
+        setFleetResyncNonce((n) => n + 1);
+        return;
+      }
+      if (accepted.status === "applied") {
+        const snapshot = event.payload as FleetSnapshot;
+        dispatch({
+          type: "APPLY_FLEET_SNAPSHOT",
+          connections: snapshot.connections,
+          profiles: snapshot.profiles,
+          sessions: snapshot.sessions,
+          activeScope: snapshot.activeScope,
+          activeSessionId: snapshot.activeSessionId,
+        });
+      }
+    });
+    return () => {
+      unsubFleet();
+    };
+  }, [fleetResyncNonce]);
 
   // Subscribe to active session transcript stream with sequence verification & resync recovery
   useEffect(() => {
@@ -541,6 +553,10 @@ export default function App() {
     }
   }, []);
 
+  const handleAnnounce = useCallback((message: string) => {
+    dispatch({ type: "ANNOUNCE", message });
+  }, []);
+
   const isMockMode = state.appInfo?.mode === "mock";
 
   return (
@@ -665,7 +681,11 @@ export default function App() {
                 <span
                   className={[
                     "status-dot",
-                    activeConnection ? `is-${activeConnection.actual}` : "",
+                    activeConnection
+                      ? activeConnection.actual === "auth_required"
+                        ? "is-blocked"
+                        : `is-${activeConnection.actual}`
+                      : "",
                   ]
                     .filter(Boolean)
                     .join(" ")}
@@ -679,7 +699,9 @@ export default function App() {
                         ? getCopy("route.statusConnecting")
                         : activeConnection.actual === "reconnecting"
                           ? getCopy("route.statusReconnecting")
-                          : getCopy("route.statusBlocked")
+                          : activeConnection.actual === "auth_required"
+                            ? getCopy("route.statusAuthRequired")
+                            : getCopy("route.statusBlocked")
                     : getCopy("route.statusUnconnected")}
                 </span>
               </button>
@@ -710,6 +732,7 @@ export default function App() {
             <div className="thread-viewport">
               <ChatThread
                 hasReadyConnection={hasReadyConnection}
+                activeConnection={activeConnection}
                 transcript={state.transcript}
                 localInspection={state.localInspection}
                 localBusy={localBusy}
@@ -851,8 +874,9 @@ export default function App() {
       >
         <GatewaysSettings
           snapshot={registrySnapshot}
+          fleetConnections={state.connections}
           onSnapshotChange={setRegistrySnapshot}
-          onAnnounce={(message) => dispatch({ type: "ANNOUNCE", message })}
+          onAnnounce={handleAnnounce}
         />
 
         <section className="settings-section" aria-label={getCopy("settings.aboutTitle")}>
@@ -941,6 +965,56 @@ export default function App() {
           <p>{getCopy("scope.empty")}</p>
         ) : (
           <div className="scope-popover-body">
+            {state.connections.length > 0 && (
+              <section className="settings-section" aria-label={getCopy("scope.connectionSection")}>
+                <h3 className="settings-section-title">{getCopy("scope.connectionSection")}</h3>
+                <div className="scope-list">
+                  {state.connections.map((conn) => {
+                    const isCurrent = conn.connectionId === effectiveScope?.connectionId;
+                    return (
+                      <button
+                        key={conn.connectionId}
+                        type="button"
+                        className={["palette-item", isCurrent && "is-active-scope"]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onClick={() => {
+                          void host
+                            .request<FleetSnapshot>("scopes.switch", {
+                              connectionId: conn.connectionId,
+                            })
+                            .then((res) => {
+                              if (res.ok) {
+                                dispatch({
+                                  type: "APPLY_FLEET_SNAPSHOT",
+                                  connections: res.value.connections,
+                                  profiles: res.value.profiles,
+                                  sessions: res.value.sessions,
+                                  activeScope: res.value.activeScope,
+                                  activeSessionId: res.value.activeSessionId,
+                                });
+                                dispatch({
+                                  type: "ANNOUNCE",
+                                  message: getCopy("scope.switchNotice"),
+                                });
+                              }
+                            });
+                          dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" });
+                        }}
+                      >
+                        <span>
+                          <strong>{conn.label}</strong>
+                          <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
+                            {conn.originDisplay} ({conn.kind})
+                          </span>
+                        </span>
+                        {isCurrent && <span className="gateway-badge is-primary">Active</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
             {scopedProfiles.length > 0 && (
               <section className="settings-section" aria-label={getCopy("scope.profileSection")}>
                 <h3 className="settings-section-title">{getCopy("scope.profileSection")}</h3>

@@ -18,19 +18,28 @@ import type {
 } from "@hermes/contracts";
 import {
   classifyRuntimeCapabilities,
+  getCopy,
   getLocalFailureCopy,
   isJsonRpcMethodNotFound,
   reduceTranscriptEvent,
   toSupportedChatActions,
+  validateRemoteEndpointUrl,
   type ClassifiedRuntimeCapabilities,
   type HostCommandHandler,
 } from "@hermes/domain";
 import {
   GatewayClient,
+  type GatewayClientTlsOptions,
   GatewayRpcError,
   GatewayTransportError,
 } from "./gatewayClient";
-import type { LocalBackendManager, LocalDialMaterial } from "./localBackendManager";
+import type { LocalBackendManager } from "./localBackendManager";
+import type { RegistryStore, RegistryStoreEvent } from "./registryStore";
+import {
+  mintRemoteWsTicketIfSupported,
+  resolveRemoteCredentials,
+  type RemoteAuthManager,
+} from "./remoteGateway";
 
 export interface SupervisorConnectResult {
   ok: boolean;
@@ -38,11 +47,19 @@ export interface SupervisorConnectResult {
   fleet: FleetSnapshot;
 }
 
+export interface ConnectionSupervisorOptions {
+  getLocalLabel?: () => string;
+  registryStore?: RegistryStore;
+  authManager?: RemoteAuthManager;
+  remoteTls?: GatewayClientTlsOptions;
+}
+
 interface GatewayTransportEntry {
   key: string;
+  connectionId: string;
+  defaultProfileId: string;
   transportMode: "shared-host-scope" | "per-profile";
   client: GatewayClient;
-  dial: LocalDialMaterial;
   capabilities: ClassifiedRuntimeCapabilities;
   supportedActions: SupportedChatActions;
   capabilitiesReported: boolean;
@@ -57,6 +74,7 @@ interface SubscriberRecord {
   topic: BridgeEvent["topic"];
   scope: BridgeScope | null;
   seq: number;
+  initialSent: boolean;
   listener: (event: BridgeEvent) => void;
 }
 
@@ -115,12 +133,14 @@ function mapRawSession(
 ): SessionSummary | null {
   const sessionId = asString(raw.session_id ?? raw.sessionId ?? raw.id).trim();
   if (!sessionId) return null;
-  const profileId = asString(raw.profile_id ?? raw.profileId, fallbackProfileId).trim() || fallbackProfileId;
+  const profileId =
+    asString(raw.profile_id ?? raw.profileId, fallbackProfileId).trim() || fallbackProfileId;
   const title = asString(raw.title ?? raw.name, "新对话") || "新对话";
   const preview = asString(raw.preview ?? raw.last_message ?? raw.lastMessage, "");
   const updatedAt = asString(raw.updated_at ?? raw.updatedAt, new Date().toISOString());
   const activeTurnIdRaw = raw.active_turn_id ?? raw.activeTurnId;
-  const activeTurnId = typeof activeTurnIdRaw === "string" && activeTurnIdRaw ? activeTurnIdRaw : null;
+  const activeTurnId =
+    typeof activeTurnIdRaw === "string" && activeTurnIdRaw ? activeTurnIdRaw : null;
   return {
     connectionId,
     profileId,
@@ -144,24 +164,22 @@ function mapRawMessage(raw: Record<string, unknown>, sessionId: string): Transcr
     rawRole === "user" || rawRole === "system" ? rawRole : "assistant";
   const text = asString(raw.text ?? raw.content, "");
   const createdAt = asString(raw.created_at ?? raw.createdAt, new Date().toISOString());
-  const turnIdRaw = raw.turn_id ?? raw.turnId;
-  const turnId = typeof turnIdRaw === "string" && turnIdRaw ? turnIdRaw : undefined;
+  const turnId = asString(raw.turn_id ?? raw.turnId) || undefined;
   const toolRowsRaw = Array.isArray(raw.tool_rows ?? raw.toolRows)
     ? ((raw.tool_rows ?? raw.toolRows) as Array<Record<string, unknown>>)
-    : [];
-  const toolRows: ToolExecutionRow[] | undefined =
-    toolRowsRaw.length > 0
-      ? toolRowsRaw.map((row, idx) => ({
-          toolCallId: asString(row.tool_call_id ?? row.toolCallId ?? row.id, `${messageId}-tool-${idx}`),
-          name: asString(row.name ?? row.tool, "tool"),
-          status:
-            row.status === "running" || row.status === "failed" || row.status === "cancelled"
-              ? row.status
-              : "completed",
-          summary: typeof row.summary === "string" ? row.summary : undefined,
-          durationMs: typeof row.duration_ms === "number" ? row.duration_ms : undefined,
-        }))
-      : undefined;
+    : null;
+  const toolRows: ToolExecutionRow[] | undefined = toolRowsRaw
+    ? toolRowsRaw.map((row, idx) => ({
+        toolCallId: asString(row.tool_call_id ?? row.toolCallId ?? row.id, `${messageId}-tool-${idx}`),
+        name: asString(row.name ?? row.tool, "tool"),
+        status:
+          row.status === "running" || row.status === "failed" || row.status === "cancelled"
+            ? row.status
+            : "completed",
+        summary: typeof row.summary === "string" ? row.summary : undefined,
+        durationMs: typeof row.duration_ms === "number" ? row.duration_ms : undefined,
+      }))
+    : undefined;
   return {
     messageId,
     sessionId,
@@ -175,16 +193,26 @@ function mapRawMessage(raw: Record<string, unknown>, sessionId: string): Transcr
   };
 }
 
-export class LocalConnectionSupervisor {
+function isRpcAuthError(err: unknown): boolean {
+  if (!(err instanceof GatewayRpcError)) return false;
+  return err.rpcCode === 401 || err.rpcCode === 403 || err.rpcCode === -32001;
+}
+
+export class ConnectionSupervisor {
   private readonly localBackend: LocalBackendManager;
   private readonly getLocalLabel: () => string;
+  private readonly registryStore?: RegistryStore;
+  private readonly authManager?: RemoteAuthManager;
+  private readonly remoteTls?: GatewayClientTlsOptions;
+  private readonly unsubRegistry?: () => void;
 
   private revision = 1;
   private subscriberSeq = 0;
   private disposed = false;
 
   private localHealth: ConnectionHealthSummary;
-  private profiles: ProfileSummary[] = [];
+  private readonly remoteHealth = new Map<string, ConnectionHealthSummary>();
+  private readonly profilesByConnection = new Map<string, ProfileSummary[]>();
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
   private readonly transcripts = new Map<string, SessionTranscriptSnapshot>();
   private readonly transports = new Map<string, GatewayTransportEntry>();
@@ -194,14 +222,12 @@ export class LocalConnectionSupervisor {
   private activeScope: BridgeScope | null = null;
   private activeSessionId: string | null = null;
 
-  constructor(
-    localBackend: LocalBackendManager,
-    options?: {
-      getLocalLabel?: () => string;
-    },
-  ) {
+  constructor(localBackend: LocalBackendManager, options?: ConnectionSupervisorOptions) {
     this.localBackend = localBackend;
     this.getLocalLabel = options?.getLocalLabel ?? (() => "This device");
+    this.registryStore = options?.registryStore;
+    this.authManager = options?.authManager;
+    this.remoteTls = options?.remoteTls;
     this.localHealth = {
       connectionId: "local",
       label: this.getLocalLabel(),
@@ -212,10 +238,111 @@ export class LocalConnectionSupervisor {
       latencyMs: null,
       nextRetryAt: null,
     };
+
+    if (this.registryStore) {
+      this.syncRegistryEntries(this.registryStore.snapshot());
+      this.unsubRegistry = this.registryStore.subscribe((ev) => {
+        this.handleRegistryEvent(ev);
+      });
+    }
   }
 
   getLocalHealth(): ConnectionHealthSummary {
     return { ...this.localHealth, label: this.getLocalLabel() };
+  }
+
+  private getAllProfiles(): ProfileSummary[] {
+    const out: ProfileSummary[] = [];
+    for (const list of this.profilesByConnection.values()) {
+      out.push(...list);
+    }
+    return out;
+  }
+
+  private syncRegistryEntries(snapshot: ReturnType<RegistryStore["snapshot"]>): void {
+    const dialableRemoteIds = new Set<string>();
+    for (const entry of snapshot.connections) {
+      if (entry.kind !== "remote" || !entry.dialable) continue;
+      dialableRemoteIds.add(entry.id);
+      const prev = this.remoteHealth.get(entry.id);
+      if (prev) {
+        this.remoteHealth.set(entry.id, {
+          ...prev,
+          label: entry.label,
+          originDisplay: entry.originDisplay ?? "",
+        });
+      } else {
+        this.remoteHealth.set(entry.id, {
+          connectionId: entry.id,
+          label: entry.label,
+          kind: "remote",
+          originDisplay: entry.originDisplay ?? "",
+          actual: "idle",
+          degraded: false,
+          latencyMs: null,
+          nextRetryAt: null,
+        });
+      }
+    }
+
+    for (const existingId of [...this.remoteHealth.keys()]) {
+      if (!dialableRemoteIds.has(existingId)) {
+        this.teardownRemoteConnection(existingId);
+      }
+    }
+  }
+
+  private teardownRemoteConnection(connectionId: string): void {
+    const key = `remote:${connectionId}`;
+    const transport = this.transports.get(key);
+    if (transport) {
+      this.disposeTransportEntry(key, transport);
+    }
+    this.remoteHealth.delete(connectionId);
+    this.profilesByConnection.delete(connectionId);
+    for (const sk of [...this.sessionsByScope.keys()]) {
+      if (sk.startsWith(`${connectionId}::`)) {
+        this.sessionsByScope.delete(sk);
+      }
+    }
+    for (const tk of [...this.transcripts.keys()]) {
+      if (tk.startsWith(`${connectionId}::`)) {
+        this.transcripts.delete(tk);
+      }
+    }
+    if (this.activeScope?.connectionId === connectionId) {
+      if (this.localHealth.actual === "ready") {
+        const localSessions = this.sessionsByScope.get(scopeKey("local", "default")) ?? [];
+        const firstLocalSid = localSessions[0]?.sessionId ?? null;
+        this.activeScope = {
+          connectionId: "local",
+          profileId: "default",
+          ...(firstLocalSid ? { sessionId: firstLocalSid } : {}),
+        };
+        this.activeSessionId = firstLocalSid;
+      } else {
+        this.activeScope = null;
+        this.activeSessionId = null;
+      }
+    }
+  }
+
+  private handleRegistryEvent(ev: RegistryStoreEvent): void {
+    if (this.disposed) return;
+    for (const change of ev.diff.changes) {
+      if (change.kind === "connection_removed") {
+        this.teardownRemoteConnection(change.connectionId);
+      } else if (change.kind === "connection_updated" && change.dialMaterialChanged) {
+        const key = `remote:${change.connectionId}`;
+        const existing = this.transports.get(key);
+        if (existing) {
+          this.disposeTransportEntry(key, existing);
+        }
+      }
+    }
+
+    this.syncRegistryEntries(ev.snapshot);
+    this.emitFleet();
   }
 
   getFleetSnapshot(): FleetSnapshot {
@@ -223,16 +350,24 @@ export class LocalConnectionSupervisor {
     for (const list of this.sessionsByScope.values()) {
       allSessions.push(...list);
     }
-    const connections =
-      this.localHealth.actual === "idle" &&
-      this.profiles.length === 0 &&
-      allSessions.length === 0 &&
-      !this.localHealth.errorCode
-        ? []
-        : [this.getLocalHealth()];
+    const localProfiles = this.profilesByConnection.get("local") ?? [];
+    const includeLocal =
+      this.localHealth.actual !== "idle" ||
+      localProfiles.length > 0 ||
+      allSessions.some((s) => s.connectionId === "local") ||
+      Boolean(this.localHealth.errorCode);
+
+    const connections: ConnectionHealthSummary[] = [];
+    if (includeLocal) {
+      connections.push(this.getLocalHealth());
+    }
+    for (const remote of this.remoteHealth.values()) {
+      connections.push({ ...remote });
+    }
+
     return {
       connections,
-      profiles: [...this.profiles],
+      profiles: this.getAllProfiles(),
       sessions: allSessions,
       activeScope: this.activeScope ? { ...this.activeScope } : null,
       activeSessionId: this.activeSessionId,
@@ -253,6 +388,7 @@ export class LocalConnectionSupervisor {
   ): void {
     const rev = this.nextRevision();
     for (const sub of this.subscribers.values()) {
+      if (!sub.initialSent) continue;
       if (sub.topic !== topic) continue;
       if (matcher && !matcher(sub)) continue;
       sub.seq += 1;
@@ -271,82 +407,123 @@ export class LocalConnectionSupervisor {
     }
   }
 
-  private emitFleet(): void {
-    const snapshot = this.getFleetSnapshot();
-    this.emitTopic("fleet", null, "snapshot", snapshot);
-    this.emitTopic(
-      "connection.health",
-      { connectionId: "local" },
-      "patch",
-      this.getLocalHealth(),
-      (sub) => !sub.scope || sub.scope.connectionId === "local",
-    );
+  private getConnectionHealth(connectionId: string): ConnectionHealthSummary | null {
+    if (connectionId === "local") return this.getLocalHealth();
+    const remote = this.remoteHealth.get(connectionId);
+    return remote ? { ...remote } : null;
   }
 
-  private emitProfiles(): void {
+  private emitFleet(connectionId?: string): void {
+    const snapshot = this.getFleetSnapshot();
+    this.emitTopic("fleet", null, "patch", snapshot);
+    const ids = connectionId ? [connectionId] : ["local", ...this.remoteHealth.keys()];
+    for (const id of ids) {
+      const health = this.getConnectionHealth(id);
+      if (!health) continue;
+      this.emitTopic(
+        "connection.health",
+        { connectionId: id },
+        "patch",
+        health,
+        (sub) => !sub.scope || sub.scope.connectionId === id,
+      );
+    }
+  }
+
+  private emitProfiles(connectionId: string): void {
+    const list = this.profilesByConnection.get(connectionId) ?? [];
     this.emitTopic(
       "profiles",
-      { connectionId: "local" },
-      "snapshot",
-      { profiles: [...this.profiles] },
-      (sub) => !sub.scope || sub.scope.connectionId === "local",
+      { connectionId },
+      "patch",
+      { profiles: [...list] },
+      (sub) => !sub.scope || sub.scope.connectionId === connectionId,
     );
   }
 
-  private emitSessions(profileId: string): void {
-    const list = this.sessionsByScope.get(scopeKey("local", profileId)) ?? [];
+  private emitSessions(connectionId: string, profileId: string): void {
+    const list = this.sessionsByScope.get(scopeKey(connectionId, profileId)) ?? [];
     this.emitTopic(
       "sessions",
-      { connectionId: "local", profileId },
-      "snapshot",
+      { connectionId, profileId },
+      "patch",
       { sessions: [...list] },
       (sub) =>
         !sub.scope ||
-        (sub.scope.connectionId === "local" && (!sub.scope.profileId || sub.scope.profileId === profileId)),
+        (sub.scope.connectionId === connectionId &&
+          (!sub.scope.profileId || sub.scope.profileId === profileId)),
     );
   }
 
-  private emitTranscriptPatch(profileId: string, sessionId: string, patch: TranscriptPatchPayload): void {
+  private emitTranscriptPatch(
+    connectionId: string,
+    profileId: string,
+    sessionId: string,
+    patch: TranscriptPatchPayload,
+  ): void {
     this.emitTopic(
       "session.transcript",
-      { connectionId: "local", profileId, sessionId },
+      { connectionId, profileId, sessionId },
       "patch",
       patch,
       (sub) =>
         Boolean(
           sub.scope &&
-            sub.scope.connectionId === "local" &&
+            sub.scope.connectionId === connectionId &&
             (sub.scope.profileId ?? "default") === profileId &&
             sub.scope.sessionId === sessionId,
         ),
     );
   }
 
-  private getTransportForProfile(profileId: string): GatewayTransportEntry | null {
-    const shared = this.transports.get("shared");
-    if (shared && !shared.disposed && shared.client.isOpen()) {
-      return shared;
+  private getTransport(connectionId: string, profileId: string): GatewayTransportEntry | null {
+    if (connectionId === "local") {
+      const shared = this.transports.get("shared");
+      if (shared && !shared.disposed && shared.client.isOpen()) {
+        return shared;
+      }
+      const perProfile = this.transports.get(`profile:${profileId}`);
+      if (perProfile && !perProfile.disposed && perProfile.client.isOpen()) {
+        return perProfile;
+      }
+      return null;
     }
-    const perProfile = this.transports.get(`profile:${profileId}`);
-    if (perProfile && !perProfile.disposed && perProfile.client.isOpen()) {
-      return perProfile;
+
+    const remoteEntry = this.transports.get(`remote:${connectionId}`);
+    if (remoteEntry && !remoteEntry.disposed && remoteEntry.client.isOpen()) {
+      return remoteEntry;
     }
     return null;
   }
 
+  private async ensureTransport(
+    connectionId: string,
+    profileId: string,
+    options?: { forceReconnect?: boolean; activate?: boolean },
+  ): Promise<SupervisorConnectResult> {
+    if (connectionId === "local") {
+      return this.ensureProfileTransport(profileId, options);
+    }
+    return this.connectRemote(connectionId, {
+      profileId,
+      forceReconnect: options?.forceReconnect,
+      activate: options?.activate,
+    });
+  }
+
   private async ensureProfileTransport(
     profileId: string,
-    options?: { forceReconnect?: boolean },
+    options?: { forceReconnect?: boolean; activate?: boolean },
   ): Promise<SupervisorConnectResult> {
     if (!options?.forceReconnect) {
-      const existing = this.getTransportForProfile(profileId);
+      const existing = this.getTransport("local", profileId);
       if (existing) {
         await this.refreshSessionsForProfile(existing, profileId);
         return { ok: true, fleet: this.getFleetSnapshot() };
       }
     }
 
-    const inflightKey = options?.forceReconnect ? `retry:${profileId}` : profileId;
+    const inflightKey = options?.forceReconnect ? `local:retry:${profileId}` : `local:${profileId}`;
     const inflight = this.connectingByKey.get(inflightKey);
     if (inflight) {
       return inflight;
@@ -361,23 +538,316 @@ export class LocalConnectionSupervisor {
 
   async connectLocal(
     profileId = "default",
-    options?: { forceReconnect?: boolean },
+    options?: { forceReconnect?: boolean; activate?: boolean },
   ): Promise<SupervisorConnectResult> {
     return this.ensureProfileTransport(profileId, options);
   }
 
+  async connectRemote(
+    connectionId: string,
+    options?: { profileId?: string; forceReconnect?: boolean; activate?: boolean },
+  ): Promise<SupervisorConnectResult> {
+    if (!this.registryStore) {
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    if (!options?.forceReconnect) {
+      const existing = this.getTransport(connectionId, options?.profileId ?? "default");
+      if (existing) {
+        const pid = options?.profileId ?? existing.defaultProfileId;
+        const sessions = await this.refreshSessionsForProfile(existing, pid);
+        if (options?.activate) {
+          const sid = sessions[0]?.sessionId ?? null;
+          this.activeScope = {
+            connectionId,
+            profileId: pid,
+            ...(sid ? { sessionId: sid } : {}),
+          };
+          this.activeSessionId = sid;
+          if (sid) {
+            await this.loadTranscriptSnapshot(existing, pid, sid);
+          }
+          this.emitFleet(connectionId);
+        }
+        return { ok: true, fleet: this.getFleetSnapshot() };
+      }
+    }
+
+    const inflightKey = options?.forceReconnect
+      ? `remote:retry:${connectionId}`
+      : `remote:${connectionId}`;
+    const inflight = this.connectingByKey.get(inflightKey);
+    if (inflight) {
+      return inflight;
+    }
+
+    const promise = this.connectRemoteInternal(connectionId, options).finally(() => {
+      this.connectingByKey.delete(inflightKey);
+    });
+    this.connectingByKey.set(inflightKey, promise);
+    return promise;
+  }
+
+  private async connectRemoteInternal(
+    connectionId: string,
+    options?: { profileId?: string; forceReconnect?: boolean; activate?: boolean },
+  ): Promise<SupervisorConnectResult> {
+    if (this.disposed || !this.registryStore) {
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    const snapshot = this.registryStore.snapshot();
+    const conn = snapshot.connections.find((c) => c.id === connectionId);
+    if (!conn || conn.kind !== "remote" || !conn.dialable || !conn.originDisplay) {
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    const endpointCheck = validateRemoteEndpointUrl(conn.originDisplay);
+    if (!endpointCheck.valid) {
+      this.remoteHealth.set(connectionId, {
+        connectionId,
+        label: conn.label,
+        kind: "remote",
+        originDisplay: conn.originDisplay,
+        actual: "blocked",
+        degraded: true,
+        latencyMs: null,
+        nextRetryAt: null,
+        errorCode: "invalid_request",
+        message: getCopy(endpointCheck.messageKey),
+      });
+      this.emitFleet(connectionId);
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    const transportKey = `remote:${connectionId}`;
+    if (options?.forceReconnect) {
+      const stale = this.transports.get(transportKey);
+      if (stale) this.disposeTransportEntry(transportKey, stale);
+    }
+
+    this.remoteHealth.set(connectionId, {
+      connectionId,
+      label: conn.label,
+      kind: "remote",
+      originDisplay: endpointCheck.originDisplay,
+      actual: "connecting",
+      degraded: false,
+      latencyMs: null,
+      nextRetryAt: null,
+    });
+    this.emitFleet(connectionId);
+
+    const startedAt = Date.now();
+    const creds = resolveRemoteCredentials({
+      origin: endpointCheck.normalizedUrl,
+      connectionId,
+      registryStore: this.registryStore,
+      authManager: this.authManager,
+    });
+
+    const ticketRes = await mintRemoteWsTicketIfSupported({
+      origin: endpointCheck.normalizedUrl,
+      headers: creds.headers,
+      timeoutMs: 8_000,
+      tls: this.remoteTls,
+    });
+
+    if (ticketRes.kind === "auth_required") {
+      this.remoteHealth.set(connectionId, {
+        connectionId,
+        label: conn.label,
+        kind: "remote",
+        originDisplay: endpointCheck.originDisplay,
+        actual: "auth_required",
+        degraded: true,
+        latencyMs: null,
+        nextRetryAt: null,
+        errorCode: "auth_required",
+        message: getCopy("remote.authRequiredBody"),
+      });
+      this.emitFleet(connectionId);
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    let client: GatewayClient;
+    try {
+      client = await GatewayClient.connect({
+        wsUrl: endpointCheck.wsUrl,
+        ...(ticketRes.kind === "ticket" ? { ticket: ticketRes.ticket } : {}),
+        headers: creds.headers,
+        tls: this.remoteTls,
+        connectTimeoutMs: 10_000,
+      });
+    } catch (err) {
+      const transportErr = err instanceof GatewayTransportError ? err : null;
+      const isAuth = transportErr?.code === "auth_failed";
+      const errCode: ErrorCode = isAuth
+        ? "auth_required"
+        : transportErr?.code ?? "unreachable";
+      this.remoteHealth.set(connectionId, {
+        connectionId,
+        label: conn.label,
+        kind: "remote",
+        originDisplay: endpointCheck.originDisplay,
+        actual: isAuth ? "auth_required" : errCode === "timeout" ? "reconnecting" : "blocked",
+        degraded: true,
+        latencyMs: null,
+        nextRetryAt: null,
+        errorCode: errCode,
+        ...(isAuth ? { message: getCopy("remote.authRequiredBody") } : {}),
+      });
+      this.emitFleet(connectionId);
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    let describeRes: Record<string, unknown> | undefined;
+    try {
+      describeRes = await client.call<Record<string, unknown>>("runtime.describe", {});
+    } catch (err) {
+      if (!isJsonRpcMethodNotFound(err)) {
+        client.close();
+        const isAuth = isRpcAuthError(err);
+        this.remoteHealth.set(connectionId, {
+          connectionId,
+          label: conn.label,
+          kind: "remote",
+          originDisplay: endpointCheck.originDisplay,
+          actual: isAuth ? "auth_required" : "blocked",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: isAuth ? "auth_required" : "protocol_unsupported",
+        });
+        this.emitFleet(connectionId);
+        return { ok: false, fleet: this.getFleetSnapshot() };
+      }
+    }
+
+    const capabilities = classifyRuntimeCapabilities(describeRes);
+    const supportedActions = toSupportedChatActions(capabilities);
+
+    let capabilitiesReported = false;
+    try {
+      await client.call("client.capabilities", { server_requests: true });
+      capabilitiesReported = true;
+    } catch {
+      // Non-fatal
+    }
+
+    let subscribedToGateway = false;
+    try {
+      await client.call("subscribe", {
+        topics: ["session.transcript", "prompt", "activity", "sessions", "profiles"],
+      });
+      subscribedToGateway = true;
+    } catch {
+      // Non-fatal
+    }
+
+    const targetProfileId = options?.profileId ?? conn.remoteProfile ?? "default";
+    const entry: GatewayTransportEntry = {
+      key: transportKey,
+      connectionId,
+      defaultProfileId: targetProfileId,
+      transportMode: "per-profile",
+      client,
+      capabilities,
+      supportedActions,
+      capabilitiesReported,
+      subscribedToGateway,
+      disposed: false,
+      unsubNotification: () => {},
+      unsubClose: () => {},
+    };
+
+    entry.unsubNotification = client.onNotification((method, params) => {
+      this.handleGatewayNotification(entry, method, params);
+    });
+    entry.unsubClose = client.onClose((reason) => {
+      if (this.disposed || entry.disposed || reason === "client_closed") return;
+      this.disposeTransportEntry(transportKey, entry);
+      const current = this.remoteHealth.get(connectionId);
+      if (current && current.actual !== "auth_required") {
+        this.remoteHealth.set(connectionId, {
+          ...current,
+          actual: "reconnecting",
+          degraded: true,
+          latencyMs: null,
+          errorCode: "unreachable",
+        });
+        this.emitFleet(connectionId);
+      }
+    });
+
+    const previous = this.transports.get(transportKey);
+    if (previous) {
+      this.disposeTransportEntry(transportKey, previous);
+    }
+    this.transports.set(transportKey, entry);
+
+    const latencyMs = Math.max(1, Date.now() - startedAt);
+    this.remoteHealth.set(connectionId, {
+      connectionId,
+      label: conn.label,
+      kind: "remote",
+      originDisplay: endpointCheck.originDisplay,
+      actual: "ready",
+      degraded: false,
+      latencyMs,
+      errorCode: undefined,
+      message: undefined,
+      nextRetryAt: null,
+    });
+
+    const profiles = await this.refreshProfiles(entry, targetProfileId);
+    const activeProfileId =
+      profiles.find((p) => p.profileId === targetProfileId)?.profileId ??
+      profiles[0]?.profileId ??
+      targetProfileId;
+    entry.defaultProfileId = activeProfileId;
+    const sessions = await this.refreshSessionsForProfile(entry, activeProfileId);
+
+    if (
+      options?.activate ||
+      !this.activeScope ||
+      this.activeScope.connectionId === connectionId
+    ) {
+      const initialSessionId = sessions[0]?.sessionId ?? null;
+      this.activeScope = {
+        connectionId,
+        profileId: activeProfileId,
+        ...(initialSessionId ? { sessionId: initialSessionId } : {}),
+      };
+      this.activeSessionId = initialSessionId;
+      if (initialSessionId) {
+        await this.loadTranscriptSnapshot(entry, activeProfileId, initialSessionId);
+      }
+    }
+
+    this.emitFleet(connectionId);
+    return {
+      ok: true,
+      fleet: this.getFleetSnapshot(),
+    };
+  }
+
   private async connectLocalInternal(
     profileId: string,
-    options?: { forceReconnect?: boolean },
+    options?: { forceReconnect?: boolean; activate?: boolean },
   ): Promise<SupervisorConnectResult> {
     if (this.disposed) {
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
     if (options?.forceReconnect) {
-      // Tear down dead or stale transport(s) cleanly before re-minting ticket
       for (const [k, entry] of this.transports.entries()) {
-        if (entry.transportMode === "shared-host-scope" || k === `profile:${profileId}` || !entry.client.isOpen()) {
+        if (
+          entry.connectionId === "local" &&
+          (entry.transportMode === "shared-host-scope" ||
+            k === `profile:${profileId}` ||
+            !entry.client.isOpen())
+        ) {
           this.disposeTransportEntry(k, entry);
         }
       }
@@ -392,7 +862,7 @@ export class LocalConnectionSupervisor {
       message: undefined,
       nextRetryAt: null,
     };
-    this.emitFleet();
+    this.emitFleet("local");
 
     const startedAt = Date.now();
     const dialResult = await this.localBackend.prepareDial({ profileId });
@@ -406,7 +876,7 @@ export class LocalConnectionSupervisor {
         errorCode: mapLocalFailureToErrorCode(dialResult.failure),
         message: getLocalFailureCopy(dialResult.failure.code).whatHappened,
       };
-      this.emitFleet();
+      this.emitFleet("local");
       return {
         ok: false,
         failure: dialResult.failure,
@@ -417,7 +887,6 @@ export class LocalConnectionSupervisor {
     const dial = dialResult.dial;
     const transportKey = dial.transportMode === "shared-host-scope" ? "shared" : `profile:${dial.profileId}`;
 
-    // Single-use ticket consumed immediately and never retained outside this dial call
     let ticket = dial.consumeTicket();
     if (!ticket) {
       const minted = await this.localBackend.mintReconnectTicket(dial);
@@ -431,7 +900,7 @@ export class LocalConnectionSupervisor {
           errorCode: mapLocalFailureToErrorCode(minted.failure),
           message: getLocalFailureCopy(minted.failure.code).whatHappened,
         };
-        this.emitFleet();
+        this.emitFleet("local");
         return {
           ok: false,
           failure: minted.failure,
@@ -449,7 +918,7 @@ export class LocalConnectionSupervisor {
         degraded: true,
         errorCode: "auth_failed",
       };
-      this.emitFleet();
+      this.emitFleet("local");
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
@@ -462,8 +931,7 @@ export class LocalConnectionSupervisor {
         connectTimeoutMs: 10_000,
       });
     } catch (err) {
-      const errCode: ErrorCode =
-        err instanceof GatewayTransportError ? err.code : "unreachable";
+      const errCode: ErrorCode = err instanceof GatewayTransportError ? err.code : "unreachable";
       this.localHealth = {
         ...this.localHealth,
         label: this.getLocalLabel(),
@@ -472,14 +940,12 @@ export class LocalConnectionSupervisor {
         latencyMs: null,
         errorCode: errCode,
       };
-      this.emitFleet();
+      this.emitFleet("local");
       return { ok: false, fleet: this.getFleetSnapshot() };
     } finally {
-      // Clear local reference immediately after handshake
       ticket = null;
     }
 
-    // Negotiate runtime capabilities & server_requests
     let describeRes: Record<string, unknown> | undefined;
     try {
       describeRes = await client.call<Record<string, unknown>>("runtime.describe", {});
@@ -493,7 +959,7 @@ export class LocalConnectionSupervisor {
           degraded: true,
           errorCode: "protocol_unsupported",
         };
-        this.emitFleet();
+        this.emitFleet("local");
         return { ok: false, fleet: this.getFleetSnapshot() };
       }
     }
@@ -505,10 +971,8 @@ export class LocalConnectionSupervisor {
     try {
       await client.call("client.capabilities", { server_requests: true });
       capabilitiesReported = true;
-    } catch (err) {
-      if (!isJsonRpcMethodNotFound(err)) {
-        // Non-fatal unless transport broke
-      }
+    } catch {
+      // Non-fatal
     }
 
     let subscribedToGateway = false;
@@ -518,14 +982,15 @@ export class LocalConnectionSupervisor {
       });
       subscribedToGateway = true;
     } catch {
-      // Gateway may push notifications automatically or omit subscribe RPC
+      // Non-fatal
     }
 
     const entry: GatewayTransportEntry = {
       key: transportKey,
+      connectionId: "local",
+      defaultProfileId: dial.profileId,
       transportMode: dial.transportMode,
       client,
-      dial,
       capabilities,
       supportedActions,
       capabilitiesReported,
@@ -541,7 +1006,10 @@ export class LocalConnectionSupervisor {
     entry.unsubClose = client.onClose((reason) => {
       if (this.disposed || entry.disposed || reason === "client_closed") return;
       this.disposeTransportEntry(transportKey, entry);
-      if (this.transports.size === 0) {
+      const hasLocalTransports = [...this.transports.values()].some(
+        (t) => t.connectionId === "local" && !t.disposed,
+      );
+      if (!hasLocalTransports) {
         this.localHealth = {
           ...this.localHealth,
           label: this.getLocalLabel(),
@@ -550,7 +1018,7 @@ export class LocalConnectionSupervisor {
           latencyMs: null,
           errorCode: "unreachable",
         };
-        this.emitFleet();
+        this.emitFleet("local");
       }
     });
 
@@ -575,8 +1043,11 @@ export class LocalConnectionSupervisor {
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
 
-    const currentScopeMatchesLocal = this.activeScope?.connectionId === "local";
-    if (!this.activeScope || !currentScopeMatchesLocal) {
+    const shouldActivate =
+      !this.activeScope ||
+      options?.activate ||
+      (this.activeScope.connectionId === "local" && !this.activeSessionId);
+    if (shouldActivate) {
       const initialSessionId = sessions[0]?.sessionId ?? null;
       this.activeScope = {
         connectionId: "local",
@@ -586,11 +1057,15 @@ export class LocalConnectionSupervisor {
       this.activeSessionId = initialSessionId;
     }
 
-    if (this.activeSessionId && this.activeScope?.profileId === dial.profileId) {
+    if (
+      this.activeSessionId &&
+      this.activeScope?.connectionId === "local" &&
+      this.activeScope?.profileId === dial.profileId
+    ) {
       await this.loadTranscriptSnapshot(entry, dial.profileId, this.activeSessionId);
     }
 
-    this.emitFleet();
+    this.emitFleet("local");
     return {
       ok: true,
       fleet: this.getFleetSnapshot(),
@@ -611,6 +1086,7 @@ export class LocalConnectionSupervisor {
     entry: GatewayTransportEntry,
     activeProfileId: string,
   ): Promise<ProfileSummary[]> {
+    const connectionId = entry.connectionId;
     let rawProfiles: Array<Record<string, unknown>> = [];
     if (entry.capabilities.profilesList) {
       try {
@@ -628,23 +1104,24 @@ export class LocalConnectionSupervisor {
       }
     }
 
+    const currentProfiles = this.profilesByConnection.get(connectionId) ?? [];
     if (rawProfiles.length === 0) {
-      const hasExisting = this.profiles.some((p) => p.profileId === activeProfileId);
+      const hasExisting = currentProfiles.some((p) => p.profileId === activeProfileId);
       if (!hasExisting) {
-        this.profiles = [
-          ...this.profiles,
+        this.profilesByConnection.set(connectionId, [
+          ...currentProfiles,
           {
-            connectionId: "local",
+            connectionId,
             profileId: activeProfileId,
             displayName: activeProfileId === "default" ? "Default" : activeProfileId,
             handle: activeProfileId,
             isDefault: activeProfileId === "default",
             actual: "ready",
           },
-        ];
+        ]);
       }
     } else {
-      const existingById = new Map(this.profiles.map((p) => [p.profileId, p]));
+      const existingById = new Map(currentProfiles.map((p) => [p.profileId, p]));
       for (const raw of rawProfiles) {
         const pid = asString(raw.profile_id ?? raw.profileId ?? raw.id).trim();
         if (!pid) continue;
@@ -652,7 +1129,7 @@ export class LocalConnectionSupervisor {
         const handle = asString(raw.handle, pid) || pid;
         const isDefault = Boolean(raw.is_default ?? raw.isDefault ?? pid === "default");
         existingById.set(pid, {
-          connectionId: "local",
+          connectionId,
           profileId: pid,
           displayName,
           handle,
@@ -660,17 +1137,18 @@ export class LocalConnectionSupervisor {
           actual: pid === activeProfileId ? "ready" : existingById.get(pid)?.actual ?? "idle",
         });
       }
-      this.profiles = [...existingById.values()];
+      this.profilesByConnection.set(connectionId, [...existingById.values()]);
     }
 
-    this.emitProfiles();
-    return [...this.profiles];
+    this.emitProfiles(connectionId);
+    return [...(this.profilesByConnection.get(connectionId) ?? [])];
   }
 
   private async refreshSessionsForProfile(
     entry: GatewayTransportEntry,
     profileId: string,
   ): Promise<SessionSummary[]> {
+    const connectionId = entry.connectionId;
     let rawList: Array<Record<string, unknown>> = [];
     const callList = async (method: string) => {
       const res = await entry.client.call<{ sessions?: Array<Record<string, unknown>> }>(method, {
@@ -690,16 +1168,46 @@ export class LocalConnectionSupervisor {
             entry.capabilities.sessionList = false;
           }
         }
+      } else if (isRpcAuthError(err) && connectionId !== "local") {
+        this.markConnectionAuthRequired(connectionId);
       }
     }
 
     const mapped = rawList
-      .map((item) => mapRawSession(item, "local", profileId))
+      .map((item) => mapRawSession(item, connectionId, profileId))
       .filter((item): item is SessionSummary => item !== null && item.profileId === profileId);
 
-    this.sessionsByScope.set(scopeKey("local", profileId), mapped);
-    this.emitSessions(profileId);
+    this.sessionsByScope.set(scopeKey(connectionId, profileId), mapped);
+    this.emitSessions(connectionId, profileId);
     return mapped;
+  }
+
+  private markConnectionAuthRequired(connectionId: string): void {
+    if (connectionId === "local") {
+      this.localHealth = {
+        ...this.localHealth,
+        actual: "auth_required",
+        degraded: true,
+        errorCode: "auth_required",
+      };
+    } else {
+      const cur = this.remoteHealth.get(connectionId);
+      if (cur) {
+        this.remoteHealth.set(connectionId, {
+          ...cur,
+          actual: "auth_required",
+          degraded: true,
+          latencyMs: null,
+          errorCode: "auth_required",
+          message: getCopy("remote.authRequiredBody"),
+        });
+      }
+    }
+    const remoteEntry = this.transports.get(`remote:${connectionId}`);
+    if (remoteEntry) {
+      this.disposeTransportEntry(`remote:${connectionId}`, remoteEntry);
+    }
+    this.emitFleet(connectionId);
   }
 
   private buildInitialTranscriptSnapshot(
@@ -709,7 +1217,7 @@ export class LocalConnectionSupervisor {
   ): SessionTranscriptSnapshot {
     const chatAvailable = entry.supportedActions.promptSubmit;
     return {
-      connectionId: "local",
+      connectionId: entry.connectionId,
       profileId,
       sessionId,
       messages: [],
@@ -726,7 +1234,8 @@ export class LocalConnectionSupervisor {
     profileId: string,
     sessionId: string,
   ): Promise<SessionTranscriptSnapshot> {
-    const key = transcriptKey("local", profileId, sessionId);
+    const connectionId = entry.connectionId;
+    const key = transcriptKey(connectionId, profileId, sessionId);
     const existing = this.transcripts.get(key);
     let rawResult: Record<string, unknown> | null = null;
 
@@ -764,7 +1273,6 @@ export class LocalConnectionSupervisor {
       .map((m) => mapRawMessage(m, sessionId))
       .filter((m): m is TranscriptMessage => m !== null);
 
-    // Preserve live in-flight messages / tokens / tool rows while incorporating persisted gateway messages
     const mergedById = new Map<string, TranscriptMessage>();
     for (const gm of gatewayMessages) {
       mergedById.set(gm.messageId, gm);
@@ -792,7 +1300,7 @@ export class LocalConnectionSupervisor {
 
     const merged: SessionTranscriptSnapshot = {
       ...base,
-      connectionId: "local",
+      connectionId,
       profileId,
       sessionId,
       messages: [...mergedById.values()],
@@ -807,13 +1315,13 @@ export class LocalConnectionSupervisor {
     this.transcripts.set(key, merged);
     this.emitTopic(
       "session.transcript",
-      { connectionId: "local", profileId, sessionId },
+      { connectionId, profileId, sessionId },
       "snapshot",
       merged,
       (sub) =>
         Boolean(
           sub.scope &&
-            sub.scope.connectionId === "local" &&
+            sub.scope.connectionId === connectionId &&
             (sub.scope.profileId ?? "default") === profileId &&
             sub.scope.sessionId === sessionId,
         ),
@@ -823,17 +1331,18 @@ export class LocalConnectionSupervisor {
 
   private applyPatchToTranscript(
     entry: GatewayTransportEntry | null,
+    connectionId: string,
     profileId: string,
     sessionId: string,
     patch: TranscriptPatchPayload,
   ): void {
-    const key = transcriptKey("local", profileId, sessionId);
+    const key = transcriptKey(connectionId, profileId, sessionId);
     const current =
       this.transcripts.get(key) ??
       (entry
         ? this.buildInitialTranscriptSnapshot(entry, profileId, sessionId)
         : {
-            connectionId: "local",
+            connectionId,
             profileId,
             sessionId,
             messages: [],
@@ -845,7 +1354,7 @@ export class LocalConnectionSupervisor {
 
     const next = reduceTranscriptEvent(current, {
       topic: "session.transcript",
-      scope: { connectionId: "local", profileId, sessionId },
+      scope: { connectionId, profileId, sessionId },
       kind: "patch",
       seq: 1,
       revision: this.revision,
@@ -854,7 +1363,7 @@ export class LocalConnectionSupervisor {
     if (next) {
       this.transcripts.set(key, next);
     }
-    this.emitTranscriptPatch(profileId, sessionId, patch);
+    this.emitTranscriptPatch(connectionId, profileId, sessionId, patch);
   }
 
   private downgradeSingleAction(
@@ -868,6 +1377,7 @@ export class LocalConnectionSupervisor {
     };
     const chatAvailable = entry.supportedActions.promptSubmit;
     for (const [key, snap] of this.transcripts.entries()) {
+      if (snap.connectionId !== entry.connectionId) continue;
       const updated: SessionTranscriptSnapshot = {
         ...snap,
         chatAvailable,
@@ -877,7 +1387,7 @@ export class LocalConnectionSupervisor {
           : { chatUnavailableReason: "capability_missing:prompt.submit" }),
       };
       this.transcripts.set(key, updated);
-      this.emitTranscriptPatch(snap.profileId, snap.sessionId, {
+      this.emitTranscriptPatch(snap.connectionId, snap.profileId, snap.sessionId, {
         type: "capabilities_update",
         sessionId: snap.sessionId,
         chatAvailable,
@@ -894,17 +1404,24 @@ export class LocalConnectionSupervisor {
     method: string,
     params: Record<string, unknown>,
   ): void {
-    const sessionId = asString(params.session_id ?? params.sessionId).trim();
-    const profileId = asString(params.profile_id ?? params.profileId, entry.dial.profileId).trim() || entry.dial.profileId;
-    const resolvedProfileId = this.findProfileIdForSession(sessionId) ?? profileId;
+    const connectionId = entry.connectionId;
+    if (method === "auth.required" || method === "auth_required") {
+      this.markConnectionAuthRequired(connectionId);
+      return;
+    }
 
+    const sessionId = asString(params.session_id ?? params.sessionId).trim();
+    const profileId =
+      asString(params.profile_id ?? params.profileId, entry.defaultProfileId).trim() ||
+      entry.defaultProfileId;
+    const resolvedProfileId = this.findProfileIdForSession(connectionId, sessionId) ?? profileId;
     if (!sessionId) return;
 
     if (method === "prompt.delta" || method === "prompt.token") {
       const messageId = asString(params.message_id ?? params.messageId, `assistant-${Date.now()}`);
       const turnId = asString(params.turn_id ?? params.turnId) || undefined;
       const delta = asString(params.delta ?? params.text, "");
-      this.applyPatchToTranscript(entry, resolvedProfileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
         type: "token_delta",
         sessionId,
         turnId,
@@ -912,7 +1429,7 @@ export class LocalConnectionSupervisor {
         delta,
       });
       const promptPayload: PromptEventPayload = {
-        connectionId: "local",
+        connectionId,
         profileId: resolvedProfileId,
         sessionId,
         turnId: turnId ?? "",
@@ -920,7 +1437,12 @@ export class LocalConnectionSupervisor {
         delta,
         messageId,
       };
-      this.emitTopic("prompt", { connectionId: "local", profileId: resolvedProfileId, sessionId }, "patch", promptPayload);
+      this.emitTopic(
+        "prompt",
+        { connectionId, profileId: resolvedProfileId, sessionId },
+        "patch",
+        promptPayload,
+      );
       return;
     }
 
@@ -929,7 +1451,10 @@ export class LocalConnectionSupervisor {
         ? params.tool_row
         : params) as Record<string, unknown>;
       const toolRow: ToolExecutionRow = {
-        toolCallId: asString(rawTool.tool_call_id ?? rawTool.toolCallId ?? rawTool.id, `tc-${Date.now()}`),
+        toolCallId: asString(
+          rawTool.tool_call_id ?? rawTool.toolCallId ?? rawTool.id,
+          `tc-${Date.now()}`,
+        ),
         name: asString(rawTool.name ?? rawTool.tool, "tool"),
         status:
           rawTool.status === "completed" ||
@@ -942,7 +1467,7 @@ export class LocalConnectionSupervisor {
       };
       const turnId = asString(params.turn_id ?? params.turnId) || undefined;
       const messageId = asString(params.message_id ?? params.messageId) || undefined;
-      this.applyPatchToTranscript(entry, resolvedProfileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
         type: "tool_row",
         sessionId,
         turnId,
@@ -950,17 +1475,27 @@ export class LocalConnectionSupervisor {
         toolRow,
       });
       const activityPayload: ActivityEventPayload = {
-        connectionId: "local",
+        connectionId,
         profileId: resolvedProfileId,
         sessionId,
         turnId,
         toolRow,
       };
-      this.emitTopic("activity", { connectionId: "local", profileId: resolvedProfileId, sessionId }, "patch", activityPayload);
+      this.emitTopic(
+        "activity",
+        { connectionId, profileId: resolvedProfileId, sessionId },
+        "patch",
+        activityPayload,
+      );
       return;
     }
 
-    if (method === "prompt.completed" || method === "prompt.done" || method === "prompt.stopped" || method === "prompt.error") {
+    if (
+      method === "prompt.completed" ||
+      method === "prompt.done" ||
+      method === "prompt.stopped" ||
+      method === "prompt.error"
+    ) {
       const turnId = asString(params.turn_id ?? params.turnId, "");
       const messageId = asString(params.message_id ?? params.messageId) || undefined;
       const status: TranscriptMessage["status"] =
@@ -969,7 +1504,7 @@ export class LocalConnectionSupervisor {
           : method === "prompt.error"
             ? "error"
             : "complete";
-      this.applyPatchToTranscript(entry, resolvedProfileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
         type: "turn_state",
         sessionId,
         activeTurnId: null,
@@ -983,8 +1518,8 @@ export class LocalConnectionSupervisor {
           : method === "prompt.error"
             ? "error"
             : "completed";
-      this.emitTopic("prompt", { connectionId: "local", profileId: resolvedProfileId, sessionId }, "patch", {
-        connectionId: "local",
+      this.emitTopic("prompt", { connectionId, profileId: resolvedProfileId, sessionId }, "patch", {
+        connectionId,
         profileId: resolvedProfileId,
         sessionId,
         turnId,
@@ -994,29 +1529,57 @@ export class LocalConnectionSupervisor {
     }
   }
 
-  private findProfileIdForSession(sessionId: string): string | null {
+  private findProfileIdForSession(connectionId: string, sessionId: string): string | null {
     if (!sessionId) return null;
-    for (const list of this.sessionsByScope.values()) {
+    for (const [k, list] of this.sessionsByScope.entries()) {
+      if (!k.startsWith(`${connectionId}::`)) continue;
       const hit = list.find((s) => s.sessionId === sessionId);
       if (hit) return hit.profileId;
     }
     return null;
   }
 
-  private resolveTargetProfile(payload: Record<string, unknown>, scope: BridgeScope | null): string {
+  private resolveTargetConnectionId(
+    payload: Record<string, unknown>,
+    scope: BridgeScope | null,
+  ): string {
+    if (typeof payload.connectionId === "string" && payload.connectionId.trim()) {
+      return payload.connectionId.trim();
+    }
+    if (scope?.connectionId && scope.connectionId.trim()) {
+      return scope.connectionId.trim();
+    }
+    if (this.activeScope?.connectionId && this.activeScope.connectionId.trim()) {
+      return this.activeScope.connectionId.trim();
+    }
+    return "local";
+  }
+
+  private resolveTargetProfile(
+    payload: Record<string, unknown>,
+    scope: BridgeScope | null,
+    connectionId?: string,
+  ): string {
     if (typeof payload.profileId === "string" && payload.profileId.trim()) {
       return payload.profileId.trim();
     }
     if (scope?.profileId && scope.profileId.trim()) {
       return scope.profileId.trim();
     }
-    if (this.activeScope?.profileId && this.activeScope.profileId.trim()) {
+    if (
+      this.activeScope?.profileId &&
+      this.activeScope.profileId.trim() &&
+      (!connectionId || this.activeScope.connectionId === connectionId)
+    ) {
       return this.activeScope.profileId.trim();
     }
     return "default";
   }
 
-  private resolveTargetSessionId(payload: Record<string, unknown>, scope: BridgeScope | null): string | null {
+  private resolveTargetSessionId(
+    payload: Record<string, unknown>,
+    scope: BridgeScope | null,
+  ): string | null {
     if (typeof payload.sessionId === "string" && payload.sessionId.trim()) {
       return payload.sessionId.trim();
     }
@@ -1026,10 +1589,14 @@ export class LocalConnectionSupervisor {
     return this.activeSessionId;
   }
 
-  private requireTransport(profileId: string): GatewayTransportEntry {
-    const entry = this.getTransportForProfile(profileId);
+  private requireTransport(connectionId: string, profileId: string): GatewayTransportEntry {
+    const entry = this.getTransport(connectionId, profileId);
     if (!entry) {
-      throw makeBridgeError("unreachable", "Local Gateway 尚未就绪");
+      const health = this.getConnectionHealth(connectionId);
+      if (health?.actual === "auth_required") {
+        throw makeBridgeError("auth_required", getCopy("remote.authRequiredBody"));
+      }
+      throw makeBridgeError("unreachable", "Gateway 尚未就绪");
     }
     return entry;
   }
@@ -1045,7 +1612,15 @@ export class LocalConnectionSupervisor {
       }
       throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供此能力");
     }
+    if (isRpcAuthError(err)) {
+      this.markConnectionAuthRequired(entry.connectionId);
+      throw makeBridgeError("auth_required", getCopy("remote.authRequiredBody"));
+    }
     if (err instanceof GatewayTransportError) {
+      if (err.code === "auth_failed") {
+        this.markConnectionAuthRequired(entry.connectionId);
+        throw makeBridgeError("auth_required", getCopy("remote.authRequiredBody"));
+      }
       throw makeBridgeError(err.code, "Gateway 连接中断或超时");
     }
     if (err instanceof GatewayRpcError) {
@@ -1066,34 +1641,68 @@ export class LocalConnectionSupervisor {
       topic,
       scope,
       seq: 0,
+      initialSent: false,
       listener,
     };
     this.subscribers.set(id, record);
 
     queueMicrotask(() => {
       if (!this.subscribers.has(id)) return;
+      record.initialSent = true;
       const rev = this.revision;
+      const cid = scope?.connectionId ?? this.activeScope?.connectionId ?? "local";
+      const pid = scope?.profileId ?? this.activeScope?.profileId ?? "default";
       if (topic === "fleet") {
-        listener({ topic, scope: null, kind: "snapshot", seq: 0, revision: rev, payload: this.getFleetSnapshot() });
+        listener({
+          topic,
+          scope: null,
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: this.getFleetSnapshot(),
+        });
       } else if (topic === "connection.health") {
-        listener({ topic, scope: { connectionId: "local" }, kind: "snapshot", seq: 0, revision: rev, payload: this.getLocalHealth() });
+        const health = this.getConnectionHealth(cid) ?? this.getLocalHealth();
+        listener({
+          topic,
+          scope: { connectionId: cid },
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: health,
+        });
       } else if (topic === "profiles") {
-        listener({ topic, scope: { connectionId: "local" }, kind: "snapshot", seq: 0, revision: rev, payload: { profiles: [...this.profiles] } });
+        const list = scope?.connectionId
+          ? (this.profilesByConnection.get(cid) ?? [])
+          : this.getAllProfiles();
+        listener({
+          topic,
+          scope: { connectionId: cid },
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: { profiles: list },
+        });
       } else if (topic === "sessions") {
-        const pid = scope?.profileId ?? this.activeScope?.profileId ?? "default";
-        const list = this.sessionsByScope.get(scopeKey("local", pid)) ?? [];
-        listener({ topic, scope: { connectionId: "local", profileId: pid }, kind: "snapshot", seq: 0, revision: rev, payload: { sessions: [...list] } });
+        const list = this.sessionsByScope.get(scopeKey(cid, pid)) ?? [];
+        listener({
+          topic,
+          scope: { connectionId: cid, profileId: pid },
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: { sessions: [...list] },
+        });
       } else if (topic === "session.transcript") {
-        const pid = scope?.profileId ?? this.activeScope?.profileId ?? "default";
         const sid = scope?.sessionId ?? this.activeSessionId;
-        const existing = sid ? this.transcripts.get(transcriptKey("local", pid, sid)) : null;
-        const transport = this.getTransportForProfile(pid);
+        const existing = sid ? this.transcripts.get(transcriptKey(cid, pid, sid)) : null;
+        const transport = this.getTransport(cid, pid);
         const snap: SessionTranscriptSnapshot =
           existing ??
           (transport && sid
             ? this.buildInitialTranscriptSnapshot(transport, pid, sid)
             : {
-                connectionId: "local",
+                connectionId: cid,
                 profileId: pid,
                 sessionId: sid ?? "",
                 messages: [],
@@ -1102,7 +1711,14 @@ export class LocalConnectionSupervisor {
                 chatAvailable: false,
                 supportedActions: defaultChatActions(),
               });
-        listener({ topic, scope: { connectionId: "local", profileId: pid, ...(sid ? { sessionId: sid } : {}) }, kind: "snapshot", seq: 0, revision: rev, payload: snap });
+        listener({
+          topic,
+          scope: { connectionId: cid, profileId: pid, ...(sid ? { sessionId: sid } : {}) },
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: snap,
+        });
       }
     });
 
@@ -1112,8 +1728,10 @@ export class LocalConnectionSupervisor {
   }
 
   readonly handlers: Record<
+    | "fleet.refresh"
     | "connections.retry"
     | "profiles.list"
+    | "scopes.switch"
     | "sessions.list"
     | "sessions.create"
     | "sessions.select"
@@ -1123,9 +1741,26 @@ export class LocalConnectionSupervisor {
     | "prompts.steer",
     HostCommandHandler
   > = {
+    "fleet.refresh": async () => {
+      return { fleet: this.getFleetSnapshot() };
+    },
+
     "connections.retry": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
-      const res = await this.connectLocal(profileId, { forceReconnect: true });
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      if (connectionId !== "local") {
+        const res = await this.connectRemote(connectionId, {
+          profileId,
+          forceReconnect: true,
+          activate: true,
+        });
+        return {
+          ok: res.ok,
+          fleet: res.fleet,
+          failure: null,
+        };
+      }
+      const res = await this.connectLocal(profileId, { forceReconnect: true, activate: true });
       const inspection: LocalInspectResult = await this.localBackend.inspect();
       return {
         ok: res.ok,
@@ -1136,39 +1771,81 @@ export class LocalConnectionSupervisor {
     },
 
     "profiles.list": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
-      const entry = this.getTransportForProfile(profileId);
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const entry = this.getTransport(connectionId, profileId);
       if (!entry) {
-        return { profiles: [...this.profiles] };
+        return {
+          profiles: scope?.connectionId
+            ? [...(this.profilesByConnection.get(connectionId) ?? [])]
+            : this.getAllProfiles(),
+        };
       }
       const profiles = await this.refreshProfiles(entry, profileId);
       return { profiles };
     },
 
+    "scopes.switch": async (payload, scope) => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const connectRes = await this.ensureTransport(connectionId, profileId, { activate: false });
+      const entry = this.getTransport(connectionId, profileId);
+      let transcript: SessionTranscriptSnapshot | null = null;
+      if (entry) {
+        const sessions = await this.refreshSessionsForProfile(entry, profileId);
+        const requestedSession =
+          typeof payload.sessionId === "string" && payload.sessionId.trim()
+            ? payload.sessionId.trim()
+            : scope?.sessionId ?? null;
+        const resolvedSessionId = requestedSession ?? sessions[0]?.sessionId ?? null;
+        this.activeScope = {
+          connectionId,
+          profileId,
+          ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
+        };
+        this.activeSessionId = resolvedSessionId;
+        if (resolvedSessionId) {
+          transcript = await this.loadTranscriptSnapshot(entry, profileId, resolvedSessionId);
+        }
+      } else {
+        this.activeScope = { connectionId, profileId };
+        this.activeSessionId = null;
+      }
+      this.emitFleet(connectionId);
+      return {
+        ok: connectRes.ok,
+        fleet: this.getFleetSnapshot(),
+        transcript,
+      };
+    },
+
     "sessions.list": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
-      const entry = this.getTransportForProfile(profileId);
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const entry = this.getTransport(connectionId, profileId);
       if (!entry) {
-        return { sessions: this.sessionsByScope.get(scopeKey("local", profileId)) ?? [] };
+        return { sessions: this.sessionsByScope.get(scopeKey(connectionId, profileId)) ?? [] };
       }
       const sessions = await this.refreshSessionsForProfile(entry, profileId);
-      this.emitFleet();
+      this.emitFleet(connectionId);
       return { sessions };
     },
 
     "sessions.select": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
-      const sessionId = typeof payload.sessionId === "string" && payload.sessionId.trim()
-        ? payload.sessionId.trim()
-        : scope?.sessionId ?? null;
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : scope?.sessionId ?? null;
 
-      await this.ensureProfileTransport(profileId);
-      const entry = this.requireTransport(profileId);
+      await this.ensureTransport(connectionId, profileId);
+      const entry = this.requireTransport(connectionId, profileId);
       const sessions = await this.refreshSessionsForProfile(entry, profileId);
       const resolvedSessionId = sessionId ?? sessions[0]?.sessionId ?? null;
 
       this.activeScope = {
-        connectionId: "local",
+        connectionId,
         profileId,
         ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
       };
@@ -1178,7 +1855,7 @@ export class LocalConnectionSupervisor {
       if (resolvedSessionId) {
         transcript = await this.loadTranscriptSnapshot(entry, profileId, resolvedSessionId);
       }
-      this.emitFleet();
+      this.emitFleet(connectionId);
       return {
         fleet: this.getFleetSnapshot(),
         transcript,
@@ -1186,9 +1863,10 @@ export class LocalConnectionSupervisor {
     },
 
     "sessions.create": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
-      await this.ensureProfileTransport(profileId);
-      const entry = this.requireTransport(profileId);
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      await this.ensureTransport(connectionId, profileId);
+      const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.sessionCreate) {
         throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持新建 Session");
       }
@@ -1211,8 +1889,8 @@ export class LocalConnectionSupervisor {
           ? (res.session as Record<string, unknown>)
           : res;
       const created =
-        mapRawSession(rawSession, "local", profileId) ?? {
-          connectionId: "local",
+        mapRawSession(rawSession, connectionId, profileId) ?? {
+          connectionId,
           profileId,
           sessionId: `sess-${Date.now()}`,
           title,
@@ -1225,60 +1903,62 @@ export class LocalConnectionSupervisor {
           status: "idle" as const,
         };
 
-      const key = scopeKey("local", profileId);
+      const key = scopeKey(connectionId, profileId);
       const existingList = this.sessionsByScope.get(key) ?? [];
       const nextList = [created, ...existingList.filter((s) => s.sessionId !== created.sessionId)];
       this.sessionsByScope.set(key, nextList);
 
       this.activeScope = {
-        connectionId: "local",
+        connectionId,
         profileId,
         sessionId: created.sessionId,
       };
       this.activeSessionId = created.sessionId;
 
       const snapshot = this.buildInitialTranscriptSnapshot(entry, profileId, created.sessionId);
-      this.transcripts.set(transcriptKey("local", profileId, created.sessionId), snapshot);
+      this.transcripts.set(transcriptKey(connectionId, profileId, created.sessionId), snapshot);
 
-      this.emitSessions(profileId);
+      this.emitSessions(connectionId, profileId);
       this.emitTopic(
         "session.transcript",
-        { connectionId: "local", profileId, sessionId: created.sessionId },
+        { connectionId, profileId, sessionId: created.sessionId },
         "snapshot",
         snapshot,
         (sub) =>
           Boolean(
             sub.scope &&
-              sub.scope.connectionId === "local" &&
+              sub.scope.connectionId === connectionId &&
               (sub.scope.profileId ?? "default") === profileId &&
               sub.scope.sessionId === created.sessionId,
           ),
       );
-      this.emitFleet();
+      this.emitFleet(connectionId);
       return { session: created, transcript: snapshot, fleet: this.getFleetSnapshot() };
     },
 
     "sessions.resume": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope);
       if (!sessionId) {
         throw makeBridgeError("invalid_request", "缺少目标 Session");
       }
-      await this.ensureProfileTransport(profileId);
-      const entry = this.requireTransport(profileId);
+      await this.ensureTransport(connectionId, profileId);
+      const entry = this.requireTransport(connectionId, profileId);
       const transcript = await this.loadTranscriptSnapshot(entry, profileId, sessionId);
       return { transcript };
     },
 
     "prompts.send": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope);
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
         throw makeBridgeError("invalid_request", "请输入对话内容后再发送");
       }
 
-      const entry = this.requireTransport(profileId);
+      const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptSubmit) {
         throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
       }
@@ -1302,7 +1982,7 @@ export class LocalConnectionSupervisor {
       );
       const nowIso = new Date().toISOString();
 
-      this.applyPatchToTranscript(entry, profileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
         type: "message_upsert",
         sessionId,
         message: {
@@ -1315,7 +1995,7 @@ export class LocalConnectionSupervisor {
           status: "complete",
         },
       });
-      this.applyPatchToTranscript(entry, profileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
         type: "message_upsert",
         sessionId,
         message: {
@@ -1329,7 +2009,7 @@ export class LocalConnectionSupervisor {
           status: "streaming",
         },
       });
-      this.applyPatchToTranscript(entry, profileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
         type: "turn_state",
         sessionId,
         activeTurnId: turnId,
@@ -1338,8 +2018,8 @@ export class LocalConnectionSupervisor {
         status: "streaming",
       });
 
-      this.emitTopic("prompt", { connectionId: "local", profileId, sessionId }, "patch", {
-        connectionId: "local",
+      this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+        connectionId,
         profileId,
         sessionId,
         turnId,
@@ -1347,13 +2027,22 @@ export class LocalConnectionSupervisor {
         messageId: assistantMsgId,
       } satisfies PromptEventPayload);
 
-      return { accepted: true, sessionId, turnId, userMessageId: userMsgId, assistantMessageId: assistantMsgId };
+      return {
+        accepted: true,
+        sessionId,
+        turnId,
+        userMessageId: userMsgId,
+        assistantMessageId: assistantMsgId,
+      };
     },
 
     "prompts.stop": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope);
-      const existing = sessionId ? this.transcripts.get(transcriptKey("local", profileId, sessionId)) : null;
+      const existing = sessionId
+        ? this.transcripts.get(transcriptKey(connectionId, profileId, sessionId))
+        : null;
       const turnId =
         typeof payload.turnId === "string" && payload.turnId.trim()
           ? payload.turnId.trim()
@@ -1363,12 +2052,12 @@ export class LocalConnectionSupervisor {
         throw makeBridgeError("unknown_turn", "当前没有可停止的 Turn");
       }
 
-      const entry = this.requireTransport(profileId);
+      const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptCancel) {
         throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持停止当前 Turn");
       }
 
-      this.applyPatchToTranscript(entry, profileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
         type: "turn_state",
         sessionId,
         activeTurnId: turnId,
@@ -1383,15 +2072,14 @@ export class LocalConnectionSupervisor {
           turn_id: turnId,
         });
       } catch (err) {
-        // Never pretend turn stopped when gateway Stop ACK fails!
-        this.applyPatchToTranscript(entry, profileId, sessionId, {
+        this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
           type: "turn_state",
           sessionId,
           activeTurnId: turnId,
           turnStopping: false,
         });
-        this.emitTopic("prompt", { connectionId: "local", profileId, sessionId }, "patch", {
-          connectionId: "local",
+        this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+          connectionId,
           profileId,
           sessionId,
           turnId,
@@ -1401,14 +2089,14 @@ export class LocalConnectionSupervisor {
       }
 
       if (res?.stopped === false) {
-        this.applyPatchToTranscript(entry, profileId, sessionId, {
+        this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
           type: "turn_state",
           sessionId,
           activeTurnId: turnId,
           turnStopping: false,
         });
-        this.emitTopic("prompt", { connectionId: "local", profileId, sessionId }, "patch", {
-          connectionId: "local",
+        this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+          connectionId,
           profileId,
           sessionId,
           turnId,
@@ -1417,15 +2105,15 @@ export class LocalConnectionSupervisor {
         throw makeBridgeError("internal", "Gateway 未确认停止 Turn");
       }
 
-      this.applyPatchToTranscript(entry, profileId, sessionId, {
+      this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
         type: "turn_state",
         sessionId,
         activeTurnId: null,
         turnStopping: false,
         status: "stopped",
       });
-      this.emitTopic("prompt", { connectionId: "local", profileId, sessionId }, "patch", {
-        connectionId: "local",
+      this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+        connectionId,
         profileId,
         sessionId,
         turnId,
@@ -1435,14 +2123,15 @@ export class LocalConnectionSupervisor {
     },
 
     "prompts.steer": async (payload, scope) => {
-      const profileId = this.resolveTargetProfile(payload, scope);
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope);
       const turnId = typeof payload.turnId === "string" ? payload.turnId : "";
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
         throw makeBridgeError("invalid_request", "缺少补充指令内容");
       }
-      const entry = this.requireTransport(profileId);
+      const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptSteer) {
         throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持中途纠偏");
       }
@@ -1461,6 +2150,7 @@ export class LocalConnectionSupervisor {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.unsubRegistry?.();
     for (const [key, entry] of this.transports.entries()) {
       this.disposeTransportEntry(key, entry);
     }
@@ -1468,3 +2158,5 @@ export class LocalConnectionSupervisor {
     this.subscribers.clear();
   }
 }
+
+export const LocalConnectionSupervisor = ConnectionSupervisor;

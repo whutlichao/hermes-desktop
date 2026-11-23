@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import type net from "node:net";
-import { buildGatewayWsSubprotocols } from "@hermes/domain";
+import { buildGatewayWsSubprotocols, GATEWAY_WS_PROTOCOL } from "@hermes/domain";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -20,14 +20,17 @@ export class GatewayRpcError extends Error {
 
 export class GatewayTransportError extends Error {
   readonly code: "unreachable" | "timeout" | "auth_failed" | "protocol_unsupported";
+  readonly statusCode?: number;
 
   constructor(
     code: "unreachable" | "timeout" | "auth_failed" | "protocol_unsupported",
     safeMessage: string,
+    statusCode?: number,
   ) {
     super(safeMessage);
     this.name = "GatewayTransportError";
     this.code = code;
+    this.statusCode = statusCode;
   }
 }
 
@@ -61,10 +64,17 @@ function encodeClientFrame(opcode: number, payload: Buffer): Buffer {
   return Buffer.concat([header, masked]);
 }
 
+export interface GatewayClientTlsOptions {
+  ca?: string | Buffer;
+  rejectUnauthorized?: boolean;
+}
+
 export interface GatewayClientConnectOptions {
   wsUrl: string;
-  ticket: string;
+  ticket?: string;
   ticketProtocolPrefix?: string;
+  headers?: Record<string, string>;
+  tls?: GatewayClientTlsOptions;
   connectTimeoutMs?: number;
 }
 
@@ -107,7 +117,10 @@ export class GatewayClient {
       throw new GatewayTransportError("protocol_unsupported", "Unsupported gateway WebSocket scheme");
     }
 
-    const protocols = buildGatewayWsSubprotocols(options.ticket, options.ticketProtocolPrefix);
+    const protocols =
+      options.ticket && options.ticket.trim()
+        ? buildGatewayWsSubprotocols(options.ticket, options.ticketProtocolPrefix)
+        : [GATEWAY_WS_PROTOCOL];
     const key = crypto.randomBytes(16).toString("base64");
     const expectedAccept = crypto
       .createHash("sha1")
@@ -118,6 +131,15 @@ export class GatewayClient {
     const reqModule = isSecure ? https : http;
     const port = parsedUrl.port ? Number(parsedUrl.port) : isSecure ? 443 : 80;
     const reqPath = `${parsedUrl.pathname || "/"}${parsedUrl.search || ""}`;
+
+    const sanitizedHeaders: Record<string, string> = {};
+    if (options.headers) {
+      for (const [k, v] of Object.entries(options.headers)) {
+        if (k.trim() && k.trim().toLowerCase() !== "origin" && typeof v === "string" && v.length > 0) {
+          sanitizedHeaders[k.trim()] = v;
+        }
+      }
+    }
 
     return new Promise<GatewayClient>((resolve, reject) => {
       let settled = false;
@@ -135,12 +157,21 @@ export class GatewayClient {
         path: reqPath,
         method: "GET",
         headers: {
+          ...sanitizedHeaders,
           Upgrade: "websocket",
           Connection: "Upgrade",
           "Sec-WebSocket-Key": key,
           "Sec-WebSocket-Version": "13",
           "Sec-WebSocket-Protocol": protocols.join(", "),
         },
+        ...(isSecure && options.tls
+          ? {
+              ...(options.tls.ca !== undefined ? { ca: options.tls.ca } : {}),
+              ...(options.tls.rejectUnauthorized !== undefined
+                ? { rejectUnauthorized: options.tls.rejectUnauthorized }
+                : {}),
+            }
+          : {}),
       });
 
       const timer = setTimeout(() => {
@@ -170,15 +201,22 @@ export class GatewayClient {
 
       req.on("response", (res) => {
         res.resume();
-        if (res.statusCode === 401 || res.statusCode === 403) {
-          fail(new GatewayTransportError("auth_failed", "Gateway rejected WebSocket ticket"));
+        const statusCode = res.statusCode ?? 0;
+        if (statusCode === 401 || statusCode === 403) {
+          fail(new GatewayTransportError("auth_failed", "Gateway rejected WebSocket auth", statusCode));
         } else {
-          fail(new GatewayTransportError("unreachable", `Gateway upgrade failed (${res.statusCode ?? 0})`));
+          fail(
+            new GatewayTransportError(
+              "unreachable",
+              `Gateway upgrade failed (${statusCode})`,
+              statusCode,
+            ),
+          );
         }
       });
 
       req.on("error", () => {
-        fail(new GatewayTransportError("unreachable", "Unable to reach local gateway WebSocket"));
+        fail(new GatewayTransportError("unreachable", "Unable to reach gateway WebSocket"));
       });
 
       req.end();

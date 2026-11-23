@@ -3,6 +3,8 @@ import {
   HOST_TOPICS,
   type AppCommand,
   type AppInfo,
+  type AuthStartResult,
+  type AuthStateSnapshot,
   type BridgeEvent,
   type BridgeResult,
   type BridgeScope,
@@ -12,12 +14,15 @@ import {
   type HermesHost,
   type HostCommand,
   type HostTopic,
+  type LaunchMode,
   type LocalInspectResult,
   type LocalSelectCliResult,
-  type SanitizedDiagnosticsPayload,
-  type LaunchMode,
   type RegistryDiff,
+  type RegistryIssue,
   type RegistrySnapshotView,
+  type RemoteTestActionId,
+  type RemoteTestResult,
+  type SanitizedDiagnosticsPayload,
 } from "@hermes/contracts";
 import {
   createBridgeDispatcher,
@@ -28,10 +33,12 @@ import {
   mapLocalFailure,
   normalizeRegistryDocument,
   projectRegistrySnapshot,
+  redactSensitiveData,
   sanitizeDiagnosticsPayload,
   validateClientAddConnection,
   validateClientRemoveConnection,
   validateClientUpdateConnection,
+  validateRemoteEndpointUrl,
   type NormalizedRegistryResult,
 } from "@hermes/domain";
 
@@ -118,6 +125,7 @@ function isSafeExternalHttpUrl(rawUrl: string): boolean {
 
 export function createMockHostBridge(): HermesHost {
   let reqSeq = 0;
+  let authSeq = 0;
   const commandListeners = new Set<(cmd: AppCommand) => void>();
   const mockAppInfo = createMockAppInfo();
   const currentInspection = createInitialMockInspection();
@@ -125,11 +133,53 @@ export function createMockHostBridge(): HermesHost {
   const registryListeners = new Set<
     (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void
   >();
+  const authListeners = new Set<(event: BridgeEvent<AuthStateSnapshot>) => void>();
 
   let currentNorm: NormalizedRegistryResult = normalizeRegistryDocument(
     createEmptyRegistryDocument(),
   );
   let registrySeq = 0;
+  let authRev = 0;
+  let authEventSeq = 0;
+
+  const oauthBoundIds = new Set<string>();
+  const tokenSyncFailedIds = new Set<string>();
+  const grantedAuthTokens = new Map<string, string>();
+  const activeAuthTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const activeAuthMeta = new Map<string, { originDisplay: string; connectionId?: string }>();
+  let latestAuthState: AuthStateSnapshot | null = null;
+
+  const getExtraIssues = (): RegistryIssue[] =>
+    [...tokenSyncFailedIds].map((connectionId) => ({
+      code: "token_sync_failed",
+      severity: "warning",
+      connectionId,
+      messageKey: "registry.issue.tokenSyncFailed",
+    }));
+
+  const currentRegistrySnapshot = (): RegistrySnapshotView =>
+    projectRegistrySnapshot(currentNorm, {
+      oauthTokenIds: oauthBoundIds,
+      extraIssues: getExtraIssues(),
+    });
+
+  const emitAuthState = (snapshot: AuthStateSnapshot) => {
+    const safe = redactSensitiveData(snapshot);
+    latestAuthState = safe;
+    authRev += 1;
+    authEventSeq += 1;
+    const scope = safe.connectionId ? { connectionId: safe.connectionId } : null;
+    for (const listener of authListeners) {
+      listener({
+        topic: "auth.state",
+        scope,
+        kind: "patch",
+        seq: authEventSeq,
+        revision: authRev,
+        payload: safe,
+      });
+    }
+  };
 
   const buildMockDiagnostics = (): SanitizedDiagnosticsPayload =>
     sanitizeDiagnosticsPayload({
@@ -150,25 +200,31 @@ export function createMockHostBridge(): HermesHost {
         { phase: "override", outcome: "skipped" },
         { phase: "login_shell_ilc", outcome: "skipped" },
         { phase: "login_shell_lc", outcome: "skipped" },
-        { phase: "common_dirs", outcome: "failed", code: "hermes_not_found" },
+        { phase: "common_dirs", outcome: "failed" },
       ],
-      notes: ["浏览器 Mock 模式：未读取真实 HERMES_HOME 或执行本机进程。"],
+      notes: ["MockHostBridge mode"],
     });
 
-  function emitRegistryPatch(prevNorm: NormalizedRegistryResult): RegistrySnapshotView {
+  function emitRegistryPatch(
+    prev: NormalizedRegistryResult,
+    prevIssues: RegistryIssue[] = [],
+  ): RegistrySnapshotView {
+    const nextIssues = getExtraIssues();
+    const diff = diffRegistries(prev, currentNorm, {
+      extraPrevIssues: prevIssues,
+      extraNextIssues: nextIssues,
+    });
+    const snapshot = currentRegistrySnapshot();
     registrySeq += 1;
-    const snapshot = projectRegistrySnapshot(currentNorm);
-    const diff = diffRegistries(prevNorm, currentNorm);
-    const event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }> = {
-      topic: "registry",
-      scope: null,
-      kind: "patch",
-      seq: registrySeq,
-      revision: snapshot.revision,
-      payload: { snapshot, diff },
-    };
     for (const listener of registryListeners) {
-      listener(event);
+      listener({
+        topic: "registry",
+        scope: null,
+        kind: "patch",
+        seq: registrySeq,
+        revision: snapshot.revision,
+        payload: { snapshot, diff },
+      });
     }
     return snapshot;
   }
@@ -180,6 +236,7 @@ export function createMockHostBridge(): HermesHost {
       url: typeof payload.url === "string" ? payload.url : undefined,
       authMode: payload.authMode === "oauth" ? "oauth" : payload.authMode === "token" ? "token" : undefined,
       token: typeof payload.token === "string" ? payload.token : undefined,
+      authSessionId: typeof payload.authSessionId === "string" ? payload.authSessionId : undefined,
       clearToken: Boolean(payload.clearToken),
       host: typeof payload.host === "string" ? payload.host : undefined,
       user: typeof payload.user === "string" ? payload.user : undefined,
@@ -196,21 +253,262 @@ export function createMockHostBridge(): HermesHost {
   const dispatcher = createBridgeDispatcher({
     "bridge.hello": async (): Promise<AppInfo> => mockAppInfo,
     "connections.list": async () => {
-      const registry = projectRegistrySnapshot(currentNorm);
+      const registry = currentRegistrySnapshot();
       return { connections: registry.connections, registry };
     },
+    "connections.test": async (payload): Promise<RemoteTestResult> => {
+      const authMode = payload.authMode === "oauth" ? "oauth" : "token";
+      const rawUrl = typeof payload.url === "string" ? payload.url : "";
+      const token = typeof payload.token === "string" ? payload.token : "";
+      const authSessionId =
+        typeof payload.authSessionId === "string" ? payload.authSessionId : "";
+      const connectionId =
+        typeof payload.connectionId === "string" ? payload.connectionId : "";
+      const checkedAt = new Date().toISOString();
+
+      const check = validateRemoteEndpointUrl(rawUrl);
+      if (!check.valid) {
+        return redactSensitiveData<RemoteTestResult>({
+          ok: false,
+          kind: "remote",
+          originDisplay: rawUrl.split(/[?#]/)[0]?.replace(/:\/\/[^/@]+@/, "://") ?? "",
+          authMode,
+          httpLeg: { ok: false, status: "skipped" },
+          wsLeg: { ok: false, status: "skipped" },
+          failedStage: "validation",
+          errorCode: check.code,
+          messageKey: check.messageKey,
+          actions: ["edit_endpoint"],
+          checkedAt,
+        });
+      }
+
+      const hostname = new URL(check.normalizedUrl).hostname.toLowerCase();
+      if (hostname.includes("http-fail")) {
+        return redactSensitiveData<RemoteTestResult>({
+          ok: false,
+          kind: "remote",
+          originDisplay: check.originDisplay,
+          authMode,
+          httpLeg: {
+            ok: false,
+            status: "failed",
+            statusCode: 503,
+            latencyMs: 14,
+            errorCode: "unreachable",
+            messageKey: "remote.test.httpFailed",
+          },
+          wsLeg: { ok: false, status: "skipped" },
+          failedStage: "http",
+          errorCode: "unreachable",
+          messageKey: "remote.test.httpFailed",
+          actions: ["edit_endpoint", "retry_test"],
+          checkedAt,
+        });
+      }
+
+      if (hostname.includes("ws-fail")) {
+        return redactSensitiveData<RemoteTestResult>({
+          ok: false,
+          kind: "remote",
+          originDisplay: check.originDisplay,
+          authMode,
+          httpLeg: { ok: true, status: "ok", statusCode: 200, latencyMs: 9 },
+          wsLeg: {
+            ok: false,
+            status: "failed",
+            latencyMs: 15,
+            errorCode: "unreachable",
+            messageKey: "remote.test.wsFailed",
+          },
+          failedStage: "ws",
+          errorCode: "unreachable",
+          messageKey: "remote.test.wsFailed",
+          actions: ["edit_endpoint", "retry_test"],
+          checkedAt,
+        });
+      }
+
+      const existingConn = connectionId
+        ? currentNorm.doc.connections.find((c) => c.id === connectionId)
+        : undefined;
+      const hasExistingStatic = Boolean(existingConn?.token?.value);
+      const hasGrantedOAuth =
+        (Boolean(authSessionId) && grantedAuthTokens.get(authSessionId) === check.normalizedUrl) ||
+        (Boolean(connectionId) && oauthBoundIds.has(connectionId));
+
+      const authFailure =
+        hostname.includes("auth-fail") ||
+        (authMode === "token" && (token === "bad-token" || (!token && !hasExistingStatic))) ||
+        (authMode === "oauth" && !hasGrantedOAuth);
+
+      if (authFailure) {
+        const authAction: RemoteTestActionId =
+          authMode === "oauth" ? "reauthorize_oauth" : "edit_auth";
+        return redactSensitiveData<RemoteTestResult>({
+          ok: false,
+          kind: "remote",
+          originDisplay: check.originDisplay,
+          authMode,
+          httpLeg: {
+            ok: false,
+            status: "failed",
+            statusCode: 401,
+            latencyMs: 8,
+            errorCode: "auth_required",
+            messageKey: "remote.test.authRequired",
+          },
+          wsLeg: { ok: false, status: "skipped" },
+          failedStage: "auth",
+          errorCode: "auth_required",
+          messageKey: "remote.test.authRequired",
+          actions: [authAction, "retry_test"],
+          checkedAt,
+        });
+      }
+
+      return redactSensitiveData<RemoteTestResult>({
+        ok: true,
+        kind: "remote",
+        originDisplay: check.originDisplay,
+        authMode,
+        httpLeg: { ok: true, status: "ok", statusCode: 200, latencyMs: 11 },
+        wsLeg: { ok: true, status: "ok", latencyMs: 16 },
+        messageKey: "remote.test.ok",
+        actions: [],
+        checkedAt,
+      });
+    },
+    "auth.start": async (payload): Promise<AuthStartResult> => {
+      const rawUrl = typeof payload.url === "string" ? payload.url : "";
+      const connectionId =
+        typeof payload.connectionId === "string" && payload.connectionId.trim()
+          ? payload.connectionId.trim()
+          : undefined;
+      const check = validateRemoteEndpointUrl(rawUrl);
+      if (!check.valid) {
+        const err = new Error(check.messageKey);
+        (err as { code?: string }).code = check.code;
+        throw err;
+      }
+
+      authSeq += 1;
+      const authSessionId = `mock-auth-${authSeq}`;
+      const originDisplay = check.originDisplay;
+      activeAuthMeta.set(authSessionId, { originDisplay, connectionId });
+
+      emitAuthState({
+        authSessionId,
+        ...(connectionId ? { connectionId } : {}),
+        originDisplay,
+        status: "waiting",
+        messageKey: "gateways.oauthWaiting",
+        updatedAt: new Date().toISOString(),
+      });
+
+      const hostname = new URL(check.normalizedUrl).hostname.toLowerCase();
+      if (!hostname.includes("oauth-wait")) {
+        const timer = setTimeout(() => {
+          activeAuthTimers.delete(authSessionId);
+          activeAuthMeta.delete(authSessionId);
+          if (hostname.includes("oauth-fail")) {
+            emitAuthState({
+              authSessionId,
+              ...(connectionId ? { connectionId } : {}),
+              originDisplay,
+              status: "failed",
+              errorCode: "auth_failed",
+              messageKey: "gateways.oauthFailed",
+              updatedAt: new Date().toISOString(),
+            });
+            return;
+          }
+          if (connectionId) {
+            const prevIssues = getExtraIssues();
+            oauthBoundIds.add(connectionId);
+            tokenSyncFailedIds.delete(connectionId);
+            emitRegistryPatch(currentNorm, prevIssues);
+          } else {
+            grantedAuthTokens.set(authSessionId, check.normalizedUrl);
+          }
+          emitAuthState({
+            authSessionId,
+            ...(connectionId ? { connectionId } : {}),
+            originDisplay,
+            status: "granted",
+            messageKey: "gateways.oauthGranted",
+            updatedAt: new Date().toISOString(),
+          });
+        }, 30);
+        activeAuthTimers.set(authSessionId, timer);
+      }
+
+      return redactSensitiveData<AuthStartResult>({
+        authSessionId,
+        ...(connectionId ? { connectionId } : {}),
+        originDisplay,
+        status: "waiting",
+        messageKey: "gateways.oauthWaiting",
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    "auth.cancel": async (payload) => {
+      const authSessionId = typeof payload.authSessionId === "string" ? payload.authSessionId : "";
+      const timer = activeAuthTimers.get(authSessionId);
+      if (timer) {
+        clearTimeout(timer);
+        activeAuthTimers.delete(authSessionId);
+      }
+      const meta = activeAuthMeta.get(authSessionId);
+      activeAuthMeta.delete(authSessionId);
+      if (meta) {
+        emitAuthState({
+          authSessionId,
+          ...(meta.connectionId ? { connectionId: meta.connectionId } : {}),
+          originDisplay: meta.originDisplay,
+          status: "cancelled",
+          errorCode: "cancelled",
+          messageKey: "gateways.oauthCancelled",
+          updatedAt: new Date().toISOString(),
+        });
+        return { cancelled: true, authSessionId };
+      }
+      return { cancelled: false, authSessionId };
+    },
     "connections.add": async (payload): Promise<ConnectionMutationResponse> => {
-      const check = validateClientAddConnection(currentNorm.doc, asInput(payload));
+      const input = asInput(payload);
+      const prevIssues = getExtraIssues();
+      const check = validateClientAddConnection(currentNorm.doc, input, oauthBoundIds);
       if (!check.ok) {
         return {
           committed: false,
-          snapshot: projectRegistrySnapshot(currentNorm),
+          snapshot: currentRegistrySnapshot(),
           warnings: [],
           rejectedIssue: check.issue,
           conflict: check.conflict,
         };
       }
       const prev = currentNorm;
+      const warnings: RegistryIssue[] = [];
+      const addedId = check.connection.id;
+      if (
+        check.connection.kind === "remote" &&
+        input.authMode === "oauth" &&
+        input.authSessionId
+      ) {
+        if (check.connection.url?.includes("sync-fail")) {
+          tokenSyncFailedIds.add(addedId);
+          warnings.push({
+            code: "token_sync_failed",
+            severity: "warning",
+            connectionId: addedId,
+            messageKey: "registry.issue.tokenSyncFailed",
+          });
+        } else if (grantedAuthTokens.has(input.authSessionId)) {
+          oauthBoundIds.add(addedId);
+          grantedAuthTokens.delete(input.authSessionId);
+        }
+      }
       currentNorm = normalizeRegistryDocument({
         ...currentNorm.doc,
         revision: currentNorm.doc.revision + 1,
@@ -218,23 +516,43 @@ export function createMockHostBridge(): HermesHost {
       });
       return {
         committed: true,
-        snapshot: emitRegistryPatch(prev),
-        warnings: [],
+        snapshot: emitRegistryPatch(prev, prevIssues),
+        warnings,
       };
     },
     "connections.update": async (payload): Promise<ConnectionMutationResponse> => {
       const connectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
-      const check = validateClientUpdateConnection(currentNorm.doc, connectionId, asInput(payload));
+      const input = asInput(payload);
+      const prevIssues = getExtraIssues();
+      const check = validateClientUpdateConnection(currentNorm.doc, connectionId, input, oauthBoundIds);
       if (!check.ok) {
         return {
           committed: false,
-          snapshot: projectRegistrySnapshot(currentNorm),
+          snapshot: currentRegistrySnapshot(),
           warnings: [],
           rejectedIssue: check.issue,
           conflict: check.conflict,
         };
       }
       const prev = currentNorm;
+      const warnings: RegistryIssue[] = [];
+      if (input.authMode === "token" && input.token) {
+        tokenSyncFailedIds.delete(connectionId);
+      } else if (input.authMode === "oauth" && input.authSessionId) {
+        if (check.connection.url?.includes("sync-fail")) {
+          tokenSyncFailedIds.add(connectionId);
+          warnings.push({
+            code: "token_sync_failed",
+            severity: "warning",
+            connectionId,
+            messageKey: "registry.issue.tokenSyncFailed",
+          });
+        } else if (grantedAuthTokens.has(input.authSessionId)) {
+          oauthBoundIds.add(connectionId);
+          tokenSyncFailedIds.delete(connectionId);
+          grantedAuthTokens.delete(input.authSessionId);
+        }
+      }
       currentNorm = normalizeRegistryDocument({
         ...currentNorm.doc,
         revision: currentNorm.doc.revision + 1,
@@ -244,21 +562,24 @@ export function createMockHostBridge(): HermesHost {
       });
       return {
         committed: true,
-        snapshot: emitRegistryPatch(prev),
-        warnings: [],
+        snapshot: emitRegistryPatch(prev, prevIssues),
+        warnings,
       };
     },
     "connections.remove": async (payload): Promise<ConnectionMutationResponse> => {
       const connectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      const prevIssues = getExtraIssues();
       const check = validateClientRemoveConnection(currentNorm.doc, connectionId);
       if (!check.ok) {
         return {
           committed: false,
-          snapshot: projectRegistrySnapshot(currentNorm),
+          snapshot: currentRegistrySnapshot(),
           warnings: [],
           rejectedIssue: check.issue,
         };
       }
+      oauthBoundIds.delete(connectionId);
+      tokenSyncFailedIds.delete(connectionId);
       const prev = currentNorm;
       currentNorm = normalizeRegistryDocument({
         ...currentNorm.doc,
@@ -269,7 +590,7 @@ export function createMockHostBridge(): HermesHost {
       });
       return {
         committed: true,
-        snapshot: emitRegistryPatch(prev),
+        snapshot: emitRegistryPatch(prev, prevIssues),
         warnings: [],
       };
     },
@@ -279,7 +600,7 @@ export function createMockHostBridge(): HermesHost {
       if (!exists || currentNorm.duplicateIds.has(connectionId)) {
         return {
           committed: false,
-          snapshot: projectRegistrySnapshot(currentNorm),
+          snapshot: currentRegistrySnapshot(),
           warnings: [],
           rejectedIssue: {
             code: "registry_invalid",
@@ -306,7 +627,7 @@ export function createMockHostBridge(): HermesHost {
       if (launchMode !== "primary" && launchMode !== "last-used") {
         return {
           committed: false,
-          snapshot: projectRegistrySnapshot(currentNorm),
+          snapshot: currentRegistrySnapshot(),
           warnings: [],
           rejectedIssue: {
             code: "registry_invalid",
@@ -333,7 +654,7 @@ export function createMockHostBridge(): HermesHost {
       if (!exists || currentNorm.duplicateIds.has(connectionId)) {
         return {
           committed: false,
-          snapshot: projectRegistrySnapshot(currentNorm),
+          snapshot: currentRegistrySnapshot(),
           warnings: [],
           rejectedIssue: {
             code: "registry_invalid",
@@ -358,12 +679,12 @@ export function createMockHostBridge(): HermesHost {
     "connections.backupAndRepair": async (): Promise<ConnectionMutationResponse> => {
       return {
         committed: true,
-        snapshot: projectRegistrySnapshot(currentNorm),
+        snapshot: currentRegistrySnapshot(),
         warnings: [],
       };
     },
     "connections.exportSafeSummary": async () => {
-      const snap = projectRegistrySnapshot(currentNorm);
+      const snap = currentRegistrySnapshot();
       return {
         exportedAt: new Date().toISOString(),
         version: snap.version,
@@ -387,9 +708,10 @@ export function createMockHostBridge(): HermesHost {
       };
     },
     "registry.refresh": async () => ({
-      registry: projectRegistrySnapshot(currentNorm),
+      registry: currentRegistrySnapshot(),
     }),
     "profiles.list": async () => ({ profiles: EMPTY_FLEET.profiles }),
+    "scopes.switch": async () => ({ ok: false, fleet: EMPTY_FLEET, transcript: null }),
     "sessions.list": async () => ({ sessions: EMPTY_FLEET.sessions }),
     "connections.retry": async () => ({
       ok: false,
@@ -515,7 +837,7 @@ export function createMockHostBridge(): HermesHost {
           listener as (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void,
         );
         queueMicrotask(() => {
-          const snapshot = projectRegistrySnapshot(currentNorm);
+          const snapshot = currentRegistrySnapshot();
           listener({
             topic: "registry",
             scope: null,
@@ -529,6 +851,25 @@ export function createMockHostBridge(): HermesHost {
           registryListeners.delete(
             listener as (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void,
           );
+        };
+      } else if (topic === "auth.state") {
+        const typed = listener as (event: BridgeEvent<AuthStateSnapshot>) => void;
+        authListeners.add(typed);
+        if (latestAuthState) {
+          queueMicrotask(() => {
+            if (!authListeners.has(typed) || !latestAuthState) return;
+            typed({
+              topic: "auth.state",
+              scope: latestAuthState.connectionId ? { connectionId: latestAuthState.connectionId } : null,
+              kind: "snapshot",
+              seq: 0,
+              revision: authRev,
+              payload: latestAuthState,
+            });
+          });
+        }
+        return () => {
+          authListeners.delete(typed);
         };
       }
       return () => {

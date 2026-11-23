@@ -204,11 +204,15 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await settings.getByRole("button", { name: "保存连接" }).click();
     await expect(localRow).toContainText("MacBook Studio");
 
-    // Add Remote connection with token (cleared after save, only hasToken shown)
+    // Add Remote connection with token (Save disabled until Test passes, cleared after save, only Main only shown)
     await settings.getByRole("button", { name: "添加连接" }).click();
     await settings.getByLabel("设备名称").fill("Prod VPS");
     await settings.getByLabel("Gateway 地址").fill("https://vps.example.com/");
     await settings.getByLabel("静态 Token（仅写入 Main）").fill("secret-token-should-not-echo");
+    await expect(settings.getByRole("button", { name: "保存连接" })).toBeDisabled();
+    await settings.getByRole("button", { name: "测试连接" }).click();
+    await expect(settings.getByText("HTTP 与 WebSocket 双端测试通过，可以保存此 Remote 连接。")).toBeVisible();
+    await expect(settings.getByRole("button", { name: "保存连接" })).toBeEnabled();
     await settings.getByRole("button", { name: "保存连接" }).click();
 
     const prodRow = settings.locator('[data-connection-id="prod-vps"]');
@@ -216,6 +220,12 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await expect(prodRow).toContainText("https://vps.example.com");
     await expect(prodRow).toContainText("Main 已保存凭据（Main only）");
     await expect(settings).not.toContainText("secret-token-should-not-echo");
+
+    // Reopen edit -> plaintext token is NEVER pre-filled, only Main only hint shown
+    await prodRow.getByRole("button", { name: "编辑 / 改名" }).click();
+    await expect(settings.getByLabel("静态 Token（仅写入 Main）")).toHaveValue("");
+    await expect(settings).toContainText("Main 已保存凭据（Main only）");
+    await settings.getByRole("button", { name: "放弃编辑" }).click();
 
     // Set Primary to Prod VPS and verify NEXT LAUNCH moves immediately
     await prodRow.getByRole("button", { name: "设为 Primary" }).click();
@@ -231,6 +241,8 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await settings.getByRole("button", { name: "添加连接" }).click();
     await settings.getByLabel("设备名称").fill("Prod Mirror");
     await settings.getByLabel("Gateway 地址").fill("HTTPS://VPS.EXAMPLE.COM");
+    await settings.getByLabel("静态 Token（仅写入 Main）").fill("mirror-tok");
+    await settings.getByRole("button", { name: "测试连接" }).click();
     await settings.getByRole("button", { name: "保存连接" }).click();
 
     const conflictAlert = settings.getByRole("alert");
@@ -245,6 +257,70 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await prodRow.getByRole("button", { name: "移除连接" }).click();
     await expect(prodRow).toHaveCount(0);
     await expect(localRow).toContainText("NEXT LAUNCH");
+  });
+
+  test("Remote wizard verifies two-leg test failure/invalidation, OAuth waiting/cancel/grant, and token_sync_failed re-auth", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: "打开 Settings" }).click();
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    await expect(settings).toBeVisible();
+
+    // 1. Two-leg WS failure preserves draft & keeps Save disabled; editing endpoint invalidates Test pass state
+    await settings.getByRole("button", { name: "添加连接" }).click();
+    await settings.getByLabel("设备名称").fill("WS Broken VPS");
+    await settings.getByLabel("Gateway 地址").fill("https://ws-fail.example.com");
+    await settings.getByLabel("静态 Token（仅写入 Main）").fill("draft-tok-keep");
+    await settings.getByRole("button", { name: "测试连接" }).click();
+
+    const failAlert = settings.getByRole("alert");
+    await expect(failAlert).toContainText("HTTP 探测");
+    await expect(failAlert).toContainText("通过");
+    await expect(failAlert).toContainText("WebSocket 握手");
+    await expect(failAlert).toContainText("失败");
+    await expect(settings.getByRole("button", { name: "保存连接" })).toBeDisabled();
+    await expect(settings.getByLabel("设备名称")).toHaveValue("WS Broken VPS");
+    await expect(settings.getByLabel("Gateway 地址")).toHaveValue("https://ws-fail.example.com");
+
+    await settings.getByLabel("Gateway 地址").fill("https://vps-ready.example.com");
+    await settings.getByRole("button", { name: "测试连接" }).click();
+    await expect(settings.getByRole("button", { name: "保存连接" })).toBeEnabled();
+
+    // Editing URL invalidates passed test state -> Save disables again
+    await settings.getByLabel("Gateway 地址").fill("https://vps-ready-2.example.com");
+    await expect(settings.getByRole("button", { name: "保存连接" })).toBeDisabled();
+
+    // 2. OAuth waiting + cancel makes 0 registry writes and preserves draft
+    await settings.getByLabel("认证方式").selectOption("oauth");
+    await settings.getByLabel("设备名称").fill("OAuth Wait VPS");
+    await settings.getByLabel("Gateway 地址").fill("https://oauth-wait.example.com");
+    await settings.getByRole("button", { name: "通过浏览器授权" }).click();
+    await expect(settings.getByText("正在等待浏览器完成 OAuth 授权")).toBeVisible();
+    await settings.getByRole("button", { name: "取消授权" }).click();
+    await expect(settings.getByText("已取消 OAuth 授权")).toBeVisible();
+    await expect(settings.locator(".gateway-row")).toHaveCount(1);
+    await expect(settings.getByLabel("设备名称")).toHaveValue("OAuth Wait VPS");
+
+    // 3. OAuth grant -> Test -> Save with token_sync_failed warning -> Re-authorize clears warning
+    await settings.getByLabel("设备名称").fill("Sync Fail Remote");
+    await settings.getByLabel("Gateway 地址").fill("https://sync-fail.example.com");
+    await settings.getByRole("button", { name: "通过浏览器授权" }).click();
+    await expect(settings.getByText("浏览器 OAuth 授权已完成")).toBeVisible();
+    await settings.getByRole("button", { name: "测试连接" }).click();
+    await expect(settings.getByRole("button", { name: "保存连接" })).toBeEnabled();
+    await settings.getByRole("button", { name: "保存连接" }).click();
+
+    const syncRow = settings.locator('[data-connection-id="sync-fail-remote"]');
+    await expect(syncRow).toBeVisible();
+    await expect(syncRow).toContainText("需重新授权");
+    await expect(syncRow).toContainText("OAuth Token 同步失败");
+
+    await syncRow.getByRole("button", { name: "重新授权" }).click();
+    await expect(syncRow.getByText("需重新授权")).toHaveCount(0);
+    await expect(syncRow).toContainText("Main 已保存凭据（Main only）");
   });
 
   test("Settings modal displays same-source About info and Updates notice with zero fake update buttons", async ({
