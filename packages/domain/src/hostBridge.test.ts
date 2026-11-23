@@ -206,9 +206,25 @@ describe("HostBridge v1 contracts & invariants", () => {
     const originCheck = redactSensitiveData({
       originDisplay: "https://user:pw@vps.example.com/v1?token=secret#frag",
       hostDisplay: "wss://secret@raw-ws.example.com",
+      sshTargetDisplay: "ubuntu@lab.example.com:2222",
+      remoteHermesPath: "/home/ubuntu/.local/bin/hermes",
+      knownHostsPath: "/Users/alice/.ssh/known_hosts",
+      hostKeyChallenge: {
+        hostDisplay: "lab.example.com:2222",
+        keyType: "ED25519",
+        fingerprint: "SHA256:abcdef123456",
+      },
     });
     expect(originCheck.originDisplay).toBe("https://vps.example.com/v1");
     expect(originCheck.hostDisplay).toBe("[REDACTED_URL]");
+    expect(originCheck.sshTargetDisplay).toBe("ubuntu@lab.example.com:2222");
+    expect(originCheck.remoteHermesPath).toBe("[REDACTED]");
+    expect(originCheck.knownHostsPath).toBe("[REDACTED]");
+    expect(originCheck.hostKeyChallenge).toEqual({
+      hostDisplay: "lab.example.com:2222",
+      keyType: "ED25519",
+      fingerprint: "SHA256:abcdef123456",
+    });
   });
 
   it("enforces snapshot (seq:0) -> monotonic seq patch -> gap resync_required", () => {

@@ -74,13 +74,23 @@ export default function App() {
   }, [state.activeScope?.connectionId, state.connections]);
 
   const hasReadyConnection = Boolean(activeConnection && activeConnection.actual === "ready");
+  const activeScopeConnId = state.activeScope?.connectionId;
+  const activeScopeProfileId = state.activeScope?.profileId;
+  const activeScopeSessionId = state.activeScope?.sessionId;
+  const fallbackConnId = activeConnection?.connectionId;
   const effectiveScope: BridgeScope | null = useMemo(() => {
-    if (state.activeScope) return state.activeScope;
-    if (activeConnection) {
-      return { connectionId: activeConnection.connectionId, profileId: "default" };
+    if (activeScopeConnId) {
+      return {
+        connectionId: activeScopeConnId,
+        ...(activeScopeProfileId ? { profileId: activeScopeProfileId } : {}),
+        ...(activeScopeSessionId ? { sessionId: activeScopeSessionId } : {}),
+      };
+    }
+    if (fallbackConnId) {
+      return { connectionId: fallbackConnId, profileId: "default" };
     }
     return null;
-  }, [activeConnection, state.activeScope]);
+  }, [activeScopeConnId, activeScopeProfileId, activeScopeSessionId, fallbackConnId]);
 
   const scopedProfiles = useMemo(
     () => filterProfilesForConnection(state.profiles, effectiveScope?.connectionId),
@@ -274,6 +284,9 @@ export default function App() {
     [handleCreateSession],
   );
 
+  const handleAppCommandRef = useRef(handleAppCommand);
+  handleAppCommandRef.current = handleAppCommand;
+
   // HostBridge bootstrap: hello + local.inspect + fleet subscription + native command listener
   useEffect(() => {
     let active = true;
@@ -312,14 +325,14 @@ export default function App() {
       }
     });
 
-    const unsubCmd = host.onCommand(handleAppCommand);
+    const unsubCmd = host.onCommand((command) => handleAppCommandRef.current(command));
     return () => {
       active = false;
       unsubFleet();
       unsubRegistry();
       unsubCmd();
     };
-  }, [handleAppCommand]);
+  }, []);
 
   // Subscribe to active session transcript stream with sequence verification & resync recovery
   useEffect(() => {
@@ -851,6 +864,7 @@ export default function App() {
       >
         <GatewaysSettings
           snapshot={registrySnapshot}
+          fleetConnections={state.connections}
           onSnapshotChange={setRegistrySnapshot}
           onAnnounce={(message) => dispatch({ type: "ANNOUNCE", message })}
         />
@@ -941,6 +955,50 @@ export default function App() {
           <p>{getCopy("scope.empty")}</p>
         ) : (
           <div className="scope-popover-body">
+            {state.connections.length > 0 && (
+              <section className="settings-section" aria-label={getCopy("scope.connectionSection")}>
+                <h3 className="settings-section-title">{getCopy("scope.connectionSection")}</h3>
+                <div className="scope-list">
+                  {state.connections.map((conn) => {
+                    const isCurrent = conn.connectionId === activeConnection?.connectionId;
+                    return (
+                      <button
+                        key={conn.connectionId}
+                        type="button"
+                        className={["palette-item", isCurrent && "is-active-scope"]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onClick={async () => {
+                          dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" });
+                          const res = await host.request<{
+                            fleet?: FleetSnapshot;
+                          }>("sessions.select", { connectionId: conn.connectionId });
+                          if (res.ok && res.value.fleet) {
+                            dispatch({
+                              type: "APPLY_FLEET_SNAPSHOT",
+                              connections: res.value.fleet.connections,
+                              profiles: res.value.fleet.profiles,
+                              sessions: res.value.fleet.sessions,
+                              activeScope: res.value.fleet.activeScope,
+                              activeSessionId: res.value.fleet.activeSessionId,
+                            });
+                          }
+                          dispatch({ type: "ANNOUNCE", message: getCopy("scope.switchNotice") });
+                        }}
+                      >
+                        <span>
+                          <strong>{conn.label}</strong>
+                          <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
+                            {conn.kind} · {conn.originDisplay}
+                          </span>
+                        </span>
+                        {isCurrent && <span className="gateway-badge is-primary">Active</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
             {scopedProfiles.length > 0 && (
               <section className="settings-section" aria-label={getCopy("scope.profileSection")}>
                 <h3 className="settings-section-title">{getCopy("scope.profileSection")}</h3>

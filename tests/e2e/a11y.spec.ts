@@ -38,6 +38,13 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("settings modal");
     await settingsDialog.getByRole("button", { name: "添加连接" }).click();
     await checkAxe("settings gateways add form");
+    await settingsDialog.getByLabel("连接类型").selectOption("ssh");
+    await checkAxe("settings gateways ssh wizard form");
+    await settingsDialog.getByLabel("设备名称").fill("A11y SSH");
+    await settingsDialog.getByLabel("SSH 主机").fill("unknown-host.example.com");
+    await settingsDialog.getByRole("button", { name: "测试连接" }).click();
+    await expect(settingsDialog).toContainText("SHA256:");
+    await checkAxe("settings gateways ssh host key prompt");
     await page.keyboard.press("Escape");
 
     // Capabilities drawer

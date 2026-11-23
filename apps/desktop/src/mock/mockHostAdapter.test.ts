@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { BridgeEvent, ConnectionMutationResponse, RegistrySnapshotView } from "@hermes/contracts";
+import type {
+  BridgeEvent,
+  ConnectionMutationResponse,
+  ConnectionTestResult,
+  RegistrySnapshotView,
+  SshHostKeyConfirmResult,
+} from "@hermes/contracts";
 import { createMockHostBridge } from "./mockHostAdapter";
 
 describe("MockHostBridge Local first-run contract (Ticket #25)", () => {
@@ -119,6 +125,104 @@ describe("MockHostBridge Ticket #28 chat/session parity", () => {
     if (retryRes.ok) {
       expect(retryRes.value.ok).toBe(false);
     }
+
+    unsub();
+  });
+
+  it("supports Ticket #30 SSH wizard test, host key trust/hard-block, and remote Scope chat without leaking passphrase", async () => {
+    const mock = createMockHostBridge();
+    const fleetEvents: BridgeEvent[] = [];
+    const unsub = mock.subscribe("fleet", null, (ev) => fleetEvents.push(ev));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Unknown host key -> blocked, does NOT trust or write registry
+    const unknownRes = await mock.request<ConnectionTestResult>("connections.test", {
+      kind: "ssh",
+      host: "unknown-host.example.com",
+      user: "ubuntu",
+      passphrase: "top-secret-passphrase",
+    });
+    expect(unknownRes.ok).toBe(true);
+    if (unknownRes.ok) {
+      expect(unknownRes.value.ok).toBe(false);
+      expect(unknownRes.value.failureCode).toBe("host_key_unknown");
+      expect(unknownRes.value.hostKeyChallenge?.fingerprint).toMatch(/^SHA256:/);
+      expect(unknownRes.value.actions).toContain("confirm_host_key");
+      expect(JSON.stringify(unknownRes.value)).not.toContain("top-secret-passphrase");
+    }
+
+    // Registry untouched by Test
+    const regList = await mock.request<{ connections: unknown[] }>("connections.list", {});
+    expect(regList.ok && regList.value.connections).toHaveLength(1);
+
+    // Confirm unknown host key -> re-test passes
+    const confirmRes = await mock.request<SshHostKeyConfirmResult>("connections.confirmHostKey", {
+      host: "unknown-host.example.com",
+      user: "ubuntu",
+    });
+    expect(confirmRes.ok && confirmRes.value.confirmed).toBe(true);
+
+    const passedRes = await mock.request<ConnectionTestResult>("connections.test", {
+      kind: "ssh",
+      host: "unknown-host.example.com",
+      user: "ubuntu",
+    });
+    expect(passedRes.ok && passedRes.value.ok).toBe(true);
+
+    // Changed host key -> hard-blocked even if confirmHostKey is called
+    const changedRes = await mock.request<ConnectionTestResult>("connections.test", {
+      kind: "ssh",
+      host: "changed-host.example.com",
+    });
+    expect(changedRes.ok).toBe(true);
+    if (changedRes.ok) {
+      expect(changedRes.value.ok).toBe(false);
+      expect(changedRes.value.failureCode).toBe("host_key_changed");
+      expect(changedRes.value.actions).not.toContain("confirm_host_key");
+    }
+    const bypass = await mock.request<SshHostKeyConfirmResult>("connections.confirmHostKey", {
+      host: "changed-host.example.com",
+    });
+    expect(bypass.ok && bypass.value.hardBlocked).toBe(true);
+    expect(bypass.ok && bypass.value.confirmed).toBe(false);
+
+    // Legacy attach-only & Windows Session 0 notices
+    const legacyRes = await mock.request<ConnectionTestResult>("connections.test", {
+      kind: "ssh",
+      host: "legacy-host.example.com",
+    });
+    expect(legacyRes.ok && legacyRes.value.sshMode).toBe("attach_only");
+    expect(legacyRes.ok && legacyRes.value.legacyNotice).toBe(true);
+
+    const win0Res = await mock.request<ConnectionTestResult>("connections.test", {
+      kind: "ssh",
+      host: "win0-host.example.com",
+    });
+    expect(win0Res.ok && win0Res.value.windowsServiceSession).toBe(true);
+    expect(win0Res.ok && win0Res.value.sshMode).toBe("attach_only");
+
+    // Save SSH gateway -> activates SSH connection in fleet, supports Scope select + prompts.send
+    const addSsh = await mock.request<ConnectionMutationResponse>("connections.add", {
+      kind: "ssh",
+      label: "Lab Server",
+      host: "unknown-host.example.com",
+      user: "ubuntu",
+      passphrase: "top-secret-passphrase",
+    });
+    expect(addSsh.ok && addSsh.value.committed).toBe(true);
+
+    const selRes = await mock.request("sessions.select", {
+      connectionId: "lab-server",
+      profileId: "default",
+    });
+    expect(selRes.ok).toBe(true);
+    const allFleetJson = JSON.stringify(fleetEvents);
+    expect(allFleetJson).not.toContain("top-secret-passphrase");
+
+    const sendRes = await mock.request("prompts.send", {
+      text: "hello remote ssh",
+    });
+    expect(sendRes.ok).toBe(true);
 
     unsub();
   });

@@ -471,6 +471,13 @@ export class RegistryStore {
     }
   }
 
+  getDocument(): RegistryDocument {
+    return {
+      ...this.lastNormalized.doc,
+      connections: this.lastNormalized.doc.connections.map((c) => ({ ...c })),
+    };
+  }
+
   snapshot(): RegistrySnapshotView {
     return projectRegistrySnapshot(this.lastNormalized, {
       oauthTokenIds: this.lastOAuthIds,

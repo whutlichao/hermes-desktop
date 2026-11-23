@@ -22,6 +22,11 @@ import {
 } from "./security";
 import { createRegistryBridgeHandlers } from "./registryBridge";
 import { RegistryStore } from "./registryStore";
+import {
+  SshTransportManager,
+  createNodeSshTransportPorts,
+  type SshTargetConfig,
+} from "./sshTransport";
 
 declare const __HERMES_BUILD_META__: EmbeddedBuildMeta | undefined;
 
@@ -134,10 +139,62 @@ const localPorts = createNodeLocalBackendPorts({
 });
 
 const localBackendManager = new LocalBackendManager(localPorts);
+const sshTransportManager = new SshTransportManager(
+  createNodeSshTransportPorts({
+    askpassSandboxDir: sandbox.userDataDir,
+    confirmHostKeyPrompt: async (challenge) => {
+      const targetWin = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+      const boxOptions: Electron.MessageBoxOptions = {
+        type: "warning",
+        buttons: ["暂不信任", "信任主机密钥"],
+        defaultId: 0,
+        cancelId: 0,
+        title: "确认 SSH 主机密钥",
+        message: `是否信任主机 ${challenge.hostDisplay} 的 ${challenge.keyType} 密钥？`,
+        detail: `指纹：${challenge.fingerprint}\n确认后将写入本机 known_hosts。`,
+      };
+      const result = targetWin
+        ? await dialog.showMessageBox(targetWin, boxOptions)
+        : await dialog.showMessageBox(boxOptions);
+      return result.response === 1;
+    },
+  }),
+);
 const connectionSupervisor = new LocalConnectionSupervisor(localBackendManager, {
   getLocalLabel: () =>
     registryStore.snapshot().connections.find((conn) => conn.id === "local")?.label ?? "This device",
+  registryStore,
+  sshTransport: sshTransportManager,
 });
+
+registryStore.subscribe((ev) => {
+  queueMicrotask(() => {
+    void connectionSupervisor.handleRegistrySnapshot(ev.snapshot, ev.diff);
+  });
+});
+
+function sshTargetFromPayload(payload: Record<string, unknown>, fallbackConnectionId = "probe"): SshTargetConfig {
+  const portRaw = typeof payload.port === "number" ? payload.port : undefined;
+  return {
+    connectionId:
+      typeof payload.connectionId === "string" && payload.connectionId.trim()
+        ? payload.connectionId.trim()
+        : fallbackConnectionId,
+    host: typeof payload.host === "string" ? payload.host : "",
+    ...(typeof payload.user === "string" && payload.user.trim() ? { user: payload.user.trim() } : {}),
+    ...(portRaw && Number.isInteger(portRaw) ? { port: portRaw } : {}),
+    ...(typeof payload.keyPath === "string" && payload.keyPath.trim()
+      ? { keyPath: payload.keyPath.trim() }
+      : {}),
+    ...(typeof payload.remoteHermesPath === "string" && payload.remoteHermesPath.trim()
+      ? { remoteHermesPath: payload.remoteHermesPath.trim() }
+      : {}),
+    ...(typeof payload.remoteProfile === "string" && payload.remoteProfile.trim()
+      ? { remoteProfile: payload.remoteProfile.trim() }
+      : {}),
+    ...(payload.preferLegacyAttach ? { preferLegacyAttach: true } : {}),
+  };
+}
 
 function shouldAutoDialLocalOnStartup(): boolean {
   if (process.env.HERMES_LOCAL_AUTO_DIAL === "1") return true;
@@ -153,6 +210,68 @@ const dispatcher = createBridgeDispatcher({
     return mainAppInfo;
   },
   ...registryBridge.handlers,
+  "connections.add": async (payload, scope) => {
+    const passphrase = typeof payload.passphrase === "string" ? payload.passphrase : undefined;
+    const isSsh = payload.kind === "ssh";
+    const sshTarget = isSsh ? sshTargetFromPayload(payload) : null;
+    if (isSsh && sshTarget && passphrase) {
+      sshTransportManager.setPendingTargetPassphrase(sshTarget, passphrase);
+    }
+    const prevIds = new Set(registryStore.snapshot().connections.map((c) => c.id));
+    const res = await registryBridge.handlers["connections.add"](payload, scope);
+    const body = res as { committed?: boolean; snapshot?: { connections?: Array<{ id: string; kind: string }> } };
+    if (isSsh && sshTarget) {
+      if (body.committed && passphrase) {
+        const added = body.snapshot?.connections?.find((c) => c.kind === "ssh" && !prevIds.has(c.id));
+        if (added) {
+          sshTransportManager.promotePendingTargetPassphrase(sshTarget, added.id);
+        }
+      } else {
+        sshTransportManager.clearPendingTargetPassphrase(sshTarget);
+      }
+    }
+    return res;
+  },
+  "connections.update": async (payload, scope) => {
+    const connectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+    const passphrase = typeof payload.passphrase === "string" ? payload.passphrase : undefined;
+    const isSsh = payload.kind === "ssh";
+    const sshTarget = isSsh ? sshTargetFromPayload(payload, connectionId || "probe") : null;
+    if (isSsh && sshTarget && passphrase) {
+      sshTransportManager.setPendingTargetPassphrase(sshTarget, passphrase);
+    }
+    const res = await registryBridge.handlers["connections.update"](payload, scope);
+    const body = res as { committed?: boolean };
+    if (isSsh && sshTarget) {
+      if (body.committed && passphrase && connectionId) {
+        sshTransportManager.promotePendingTargetPassphrase(sshTarget, connectionId);
+      } else {
+        sshTransportManager.clearPendingTargetPassphrase(sshTarget);
+      }
+    }
+    return res;
+  },
+  "connections.test": async (payload) => {
+    const kind = payload.kind;
+    if (kind !== "ssh") {
+      return {
+        ok: false,
+        kind: typeof kind === "string" ? kind : "remote",
+        status: "failed",
+        failureCode: "invalid_request",
+        message: "当前仅支持 SSH 连接探测。",
+        actions: ["edit_target"],
+      };
+    }
+    const passphrase = typeof payload.passphrase === "string" ? payload.passphrase : undefined;
+    const target = sshTargetFromPayload(payload);
+    return sshTransportManager.testConnection(target, { passphrase });
+  },
+  "connections.confirmHostKey": async (payload) => {
+    const passphrase = typeof payload.passphrase === "string" ? payload.passphrase : undefined;
+    const target = sshTargetFromPayload(payload);
+    return sshTransportManager.confirmHostKey(target, { passphrase });
+  },
   ...connectionSupervisor.handlers,
   "local.inspect": async () => localBackendManager.inspect(),
   "local.selectCli": async () => {
