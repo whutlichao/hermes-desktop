@@ -14,6 +14,8 @@ import {
   type BridgeScope,
   type CapabilityDomainId,
   type CapabilitySnapshot,
+  type CronMutationResult,
+  type CronStateView,
   type ChatSessionProjection,
   type ConnectionHealthSummary,
   type ConnectionMutationInput,
@@ -39,6 +41,8 @@ import {
   type MissingSessionExport,
   type OrphanedDraftReason,
   type ProfileSummary,
+  type PromptSteerResult,
+  type QueuedAdmissionState,
   type RegistryDiff,
   type RegistryIssue,
   type RegistrySnapshotView,
@@ -48,6 +52,7 @@ import {
   type SessionSummary,
   type SessionTranscriptSnapshot,
   type SshHostKeyConfirmResult,
+  type SteerFailureReason,
   type ArtifactAnnotation,
   type CheckpointDiffSnapshot,
   type ErrorCode,
@@ -56,6 +61,8 @@ import {
   type TerminalCloseResult,
   type TerminalOpenResult,
   type TerminalSnapshot,
+  type TranscriptPatchPayload,
+  type TurnRecoveryTopicSnapshot,
   type WorkspaceAgentItem,
   type WorkspaceArtifactItem,
   type WorkspaceCheckpointItem,
@@ -71,6 +78,7 @@ import {
   TERMINAL_DEFAULT_COLS,
   TERMINAL_DEFAULT_ROWS,
   appendTerminalChunk,
+  TurnRecoveryCoordinator,
   boundSubagentTailLines,
   computeSessionPinned,
   assertApprovalDismissPayloadSafe,
@@ -111,6 +119,8 @@ import {
   type ApprovalIngestInput,
   type NormalizedRegistryResult,
   type TerminalScrollbackState,
+  type RawGatewayQueueItem,
+  type RawGatewayUnknownTurn,
 } from "@hermes/domain";
 
 declare const __HERMES_MOCK_BUILD_META__:
@@ -198,6 +208,22 @@ interface MockE2EFixture {
       items?: Array<Record<string, unknown>>;
       errorCode?: string;
     };
+    memory?: {
+      outcome?: "ok" | "method_not_found" | "refused" | "older" | "error";
+      sourceMethod?: "session.context_breakdown" | "session.info";
+      rawPayload?: unknown;
+      errorCode?: string;
+    };
+    messaging?: {
+      outcome?: "ok" | "method_not_found" | "refused" | "older" | "error";
+      rawPayload?: unknown;
+      errorCode?: string;
+    };
+    cron?: {
+      outcome?: "ok" | "method_not_found" | "refused" | "older" | "error";
+      rawPayload?: unknown;
+      errorCode?: string;
+    };
   };
   config?: {
     supported?: boolean;
@@ -239,6 +265,31 @@ interface MockE2EFixture {
   promptReceiptMode?: "accepted" | "admitted" | "delivery_unknown";
   failSessionCreate?: boolean;
   failPromptSend?: boolean;
+  turnRecovery?: {
+    sessions?: Array<{
+      connectionId?: string;
+      profileId?: string;
+      sessionId: string;
+      activeTurnId?: string | null;
+      executionGeneration?: number;
+      ownerGeneration?: number;
+      unknownTurns?: RawGatewayUnknownTurn[];
+      queuedAdmissions?: RawGatewayQueueItem[];
+      lastTurnOutcome?: "completed" | "stopped" | "interrupted" | "error" | null;
+      offline?: boolean;
+    }>;
+    stopMode?: "ack_stopping" | "ack_loss" | "terminal_stopped" | "owner_changed";
+    stopDelayedTerminalMs?: number;
+    queueAckMode?: "admitted" | "ack_loss_already_admitted" | "ack_loss_unadmitted" | "ack_loss";
+    queueCancelOutcome?: "cancelled" | "stopped" | "already_started" | "completed" | "ack_loss";
+    queueCancelReconcileOutcome?: QueuedAdmissionState;
+    steerMode?: "ok" | "turn_finished" | "generation_mismatch" | "rejected";
+    offline?: boolean;
+    keepSendRunning?: boolean;
+    autoFollowerOnDiscard?:
+      | RawGatewayQueueItem
+      | { text: string; turnId?: string; executionGeneration?: number };
+  };
 }
 
 function readE2EFixture(): MockE2EFixture | undefined {
@@ -318,8 +369,10 @@ export function createMockHostBridge(): HermesHost {
   const chatStateListeners = new Set<(event: BridgeEvent<ChatSessionProjection>) => void>();
   const capabilitiesListeners = new Set<(event: BridgeEvent<CapabilitySnapshot>) => void>();
   const approvalListeners = new Set<(event: BridgeEvent<ApprovalTopicSnapshot>) => void>();
+  const turnRecoveryListeners = new Set<(event: BridgeEvent<TurnRecoveryTopicSnapshot>) => void>();
   let capabilitiesSeq = 0;
   let approvalSeq = 0;
+  let turnRecoverySeq = 0;
   const registryListeners = new Set<
     (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void
   >();
@@ -516,6 +569,24 @@ export function createMockHostBridge(): HermesHost {
     terminalResizeCalls: 0,
     terminalCloseCalls: 0,
     externalLinksOpened: [] as string[],
+    resolveUnknownCalls: 0,
+    promptsSendCalls: 0,
+    promptsStopCalls: 0,
+    promptsQueueCalls: 0,
+    promptsCheckQueueReceiptCalls: 0,
+    promptsRetryQueueCalls: 0,
+    promptsCancelQueuedCalls: 0,
+    promptsSteerCalls: 0,
+    approvalRespondCalls: 0,
+    cronSubmitCalls: 0,
+    cronCancelCalls: 0,
+    cronRecoverCalls: 0,
+    capabilitiesDescribeCalls: 0,
+    capabilitiesDescribeDomains: [] as string[],
+    queueSubmittedIds: [] as string[],
+    stopPayloads: [] as Array<{ turnId?: string; executionGeneration?: number }>,
+    steerPayloads: [] as Array<{ turnId?: string; executionGeneration?: number; text?: string }>,
+    resolveUnknownPayloads: [] as Array<{ admission_id: string; execution_generation: number }>,
   };
   if (fixture) {
     (globalThis as { __HERMES_E2E_COUNTS__?: typeof e2eCounts }).__HERMES_E2E_COUNTS__ = e2eCounts;
@@ -567,6 +638,28 @@ export function createMockHostBridge(): HermesHost {
   const mockTranscripts = new Map<string, SessionTranscriptSnapshot>();
   let mockActiveScope: BridgeScope | null = null;
   let mockActiveSessionId: string | null = null;
+  const mockCronJobsByScope = new Map<string, Array<Record<string, unknown>>>();
+  let mockCronSeq = 0;
+  const cronScopeKey = (connectionId: string, profileId: string) =>
+    `${connectionId}::${profileId}`;
+  const mockCronPayloadForScope = (connectionId: string, profileId: string): unknown => {
+    const key = cronScopeKey(connectionId, profileId);
+    const existing = mockCronJobsByScope.get(key);
+    if (existing) return { jobs: existing };
+    const liveFixture = readE2EFixture() ?? fixture;
+    const raw = liveFixture?.capabilities?.cron?.rawPayload;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const obj = raw as Record<string, unknown>;
+      const list = Array.isArray(obj.jobs) ? obj.jobs : [];
+      const copied = list
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .map((item) => ({ ...item }));
+      mockCronJobsByScope.set(key, copied);
+      return { ...obj, jobs: copied };
+    }
+    mockCronJobsByScope.set(key, []);
+    return { jobs: [] };
+  };
   let fleetRev = 1;
   let registrySeq = 0;
   let fleetSeq = 0;
@@ -778,6 +871,134 @@ export function createMockHostBridge(): HermesHost {
     }
     approvalEmitSuppressed = false;
     syncSessionNeedsInput(approvalCoordinator.snapshot());
+  }
+
+  let turnEmitSuppressed = false;
+  let mockTurnSeq = 0;
+  let mockQueueAdmissionSeq = 0;
+  let mockTurnGlobalOffline = Boolean(fixture?.turnRecovery?.offline);
+  const mockGatewayQueueStore = new Map<string, RawGatewayQueueItem[]>();
+  const mockQueueAttemptBySubId = new Map<string, number>();
+
+  function syncSessionQueuedAdmission(snap: TurnRecoveryTopicSnapshot): void {
+    const queuedSet = new Set<string>();
+    for (const v of snap.sessions) {
+      if (
+        v.queuedAdmissions.some(
+          (q) => q.state === "queued" || q.state === "cancelling" || q.state === "cancel_unknown",
+        )
+      ) {
+        queuedSet.add(`${v.connectionId}::${v.profileId}::${v.sessionId}`);
+      }
+    }
+    let changed = false;
+    if (fixture) {
+      currentFleet = {
+        ...currentFleet,
+        sessions: currentFleet.sessions.map((s) => {
+          const next = queuedSet.has(`${s.connectionId}::${s.profileId}::${s.sessionId}`);
+          if (Boolean(s.queuedAdmission) !== next) changed = true;
+          return Boolean(s.queuedAdmission) === next ? s : { ...s, queuedAdmission: next };
+        }),
+      };
+    } else {
+      for (let i = 0; i < mockSessions.length; i += 1) {
+        const s = mockSessions[i];
+        const next = queuedSet.has(`${s.connectionId}::${s.profileId}::${s.sessionId}`);
+        if (Boolean(s.queuedAdmission) !== next) {
+          mockSessions[i] = { ...s, queuedAdmission: next };
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      if (fixture) {
+        emitSessionsSnapshot();
+        emitFleetSnapshot();
+      } else {
+        emitMockFleet();
+      }
+    }
+  }
+
+  const turnCoordinator = new TurnRecoveryCoordinator({
+    onChange: (snap) => {
+      if (turnEmitSuppressed) return;
+      syncSessionQueuedAdmission(snap);
+      turnRecoverySeq += 1;
+      for (const listener of turnRecoveryListeners) {
+        listener({
+          topic: "turn.recovery",
+          scope: null,
+          kind: "patch",
+          seq: turnRecoverySeq,
+          revision: turnRecoverySeq + 1,
+          payload: snap,
+        });
+      }
+    },
+  });
+
+  if (fixture?.turnRecovery?.sessions && fixture.turnRecovery.sessions.length > 0) {
+    turnEmitSuppressed = true;
+    for (const sess of fixture.turnRecovery.sessions) {
+      const cid = sess.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const pid = sess.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const sid = sess.sessionId;
+      const storeKey = `${cid}::${pid}::${sid}`;
+      if (Array.isArray(sess.queuedAdmissions)) {
+        mockGatewayQueueStore.set(
+          storeKey,
+          sess.queuedAdmissions.map((item) => ({ ...item })),
+        );
+      }
+      turnCoordinator.reconcileFromResume({
+        connectionId: cid,
+        profileId: pid,
+        sessionId: sid,
+        ownerGeneration: sess.ownerGeneration ?? mockOwnerGen,
+        activeTurnId: sess.activeTurnId ?? null,
+        ...(sess.executionGeneration !== undefined
+          ? { executionGeneration: sess.executionGeneration }
+          : {}),
+        ...(Array.isArray(sess.unknownTurns) ? { unknownTurns: sess.unknownTurns } : {}),
+        ...(Array.isArray(sess.queuedAdmissions)
+          ? { queuedAdmissions: sess.queuedAdmissions }
+          : {}),
+        ...(sess.lastTurnOutcome !== undefined ? { lastTurnOutcome: sess.lastTurnOutcome } : {}),
+      });
+      if (sess.offline || mockTurnGlobalOffline) {
+        turnCoordinator.onConnectionOffline(cid, pid);
+      }
+    }
+    turnEmitSuppressed = false;
+    syncSessionQueuedAdmission(turnCoordinator.snapshot());
+  }
+
+  if (fixture) {
+    turnEmitSuppressed = true;
+    for (const tx of transcriptMap.values()) {
+      if (tx.activeTurnId && !turnCoordinator.getSessionView({
+        connectionId: tx.connectionId,
+        profileId: tx.profileId,
+        sessionId: tx.sessionId,
+      })) {
+        turnCoordinator.noteTurnStarted({
+          connectionId: tx.connectionId,
+          profileId: tx.profileId,
+          sessionId: tx.sessionId,
+          turnId: tx.activeTurnId,
+          ...(tx.executionGeneration !== undefined
+            ? { executionGeneration: tx.executionGeneration }
+            : {}),
+          ownerGeneration: mockOwnerGen,
+        });
+        if (mockTurnGlobalOffline) {
+          turnCoordinator.onConnectionOffline(tx.connectionId, tx.profileId);
+        }
+      }
+    }
+    turnEmitSuppressed = false;
   }
 
   const fixtureRegistryConnections = (fixture?.fleet?.connections ?? [])
@@ -2289,6 +2510,7 @@ export function createMockHostBridge(): HermesHost {
       e2eCounts.connectionsRetryCalls += 1;
       const cid = typeof payload.connectionId === "string" ? payload.connectionId : "local";
       if (fixture) {
+        mockTurnGlobalOffline = false;
         const hit = currentFleet.connections.find((c) => c.connectionId === cid);
         if (hit) {
           currentFleet = {
@@ -2322,6 +2544,83 @@ export function createMockHostBridge(): HermesHost {
                 : p,
             ),
           };
+          const liveFix = readE2EFixture() ?? fixture;
+          for (const view of turnCoordinator.snapshot().sessions) {
+            if (view.connectionId !== cid) continue;
+            const storeKey = `${view.connectionId}::${view.profileId}::${view.sessionId}`;
+            const rawQueue = (mockGatewayQueueStore.get(storeKey) ?? []).map((item) => {
+              const st = String(item.state ?? item.status ?? "queued");
+              if (st === "cancel_unknown" || st === "cancelling") {
+                return {
+                  ...item,
+                  state: liveFix?.turnRecovery?.queueCancelReconcileOutcome ?? "cancelled",
+                };
+              }
+              return item;
+            });
+            mockGatewayQueueStore.set(storeKey, rawQueue);
+            const reconciled = turnCoordinator.reconcileFromResume({
+              connectionId: view.connectionId,
+              profileId: view.profileId,
+              sessionId: view.sessionId,
+              ownerGeneration: mockOwnerGen,
+              activeTurnId: view.stopState === "cancel_outcome_unknown" ? null : view.activeTurnId,
+              executionGeneration: view.executionGeneration,
+              ...(view.unknownTurn
+                ? {
+                    unknownTurns: [
+                      {
+                        admissionId: view.unknownTurn.admissionId,
+                        executionGeneration: view.unknownTurn.executionGeneration,
+                        turnId: view.unknownTurn.turnId,
+                        originalInput: view.unknownTurn.originalInput,
+                        lostReason: view.unknownTurn.lostReason,
+                        message: view.unknownTurn.message,
+                      },
+                    ],
+                  }
+                : {}),
+              queuedAdmissions: rawQueue,
+              ...(view.stopState === "cancel_outcome_unknown"
+                ? { lastTurnOutcome: "stopped" as const }
+                : {}),
+            });
+            if (view.stopState === "cancel_outcome_unknown") {
+              const existingTx = lookupTranscript(
+                transcriptMap,
+                view.connectionId,
+                view.profileId,
+                view.sessionId,
+              );
+              if (existingTx) {
+                const updatedTx: SessionTranscriptSnapshot = {
+                  ...existingTx,
+                  activeTurnId: null,
+                  turnStopping: false,
+                  executionGeneration: reconciled.executionGeneration,
+                  stopState: reconciled.stopState,
+                };
+                transcriptMap.set(storeKey, updatedTx);
+                emitTranscriptEvent(
+                  {
+                    connectionId: view.connectionId,
+                    profileId: view.profileId,
+                    sessionId: view.sessionId,
+                  },
+                  "patch",
+                  {
+                    type: "turn_state",
+                    sessionId: view.sessionId,
+                    activeTurnId: null,
+                    turnStopping: false,
+                    executionGeneration: reconciled.executionGeneration,
+                    stopState: reconciled.stopState,
+                    status: "stopped",
+                  } satisfies TranscriptPatchPayload,
+                );
+              }
+            }
+          }
           emitFleetSnapshot();
           return {
             ok: true,
@@ -3465,6 +3764,7 @@ export function createMockHostBridge(): HermesHost {
       return currentChatState;
     },
     "prompts.send": async (payload, scope) => {
+      e2eCounts.promptsSendCalls += 1;
       const liveFixture = readE2EFixture() ?? fixture;
       const draftId =
         typeof payload.draftId === "string" && payload.draftId.trim()
@@ -3564,50 +3864,171 @@ export function createMockHostBridge(): HermesHost {
         };
       }
 
+      const liveFix = liveFixture;
       const cid =
         typeof payload.connectionId === "string" && payload.connectionId
           ? payload.connectionId
-          : scope?.connectionId ?? mockActiveScope?.connectionId;
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            (fixture ? "local" : undefined);
       const pid =
         typeof payload.profileId === "string" && payload.profileId
           ? payload.profileId
-          : scope?.profileId ?? mockActiveScope?.profileId ?? "default";
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
       const sid =
         typeof payload.sessionId === "string" && payload.sessionId
           ? payload.sessionId
-          : scope?.sessionId ?? mockActiveSessionId;
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId);
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
-      if (!cid || !sid || !mockConnections.some((c) => c.connectionId === cid && c.actual === "ready")) {
+      const online = fixture
+        ? Boolean(
+            cid &&
+              sid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              sid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      if (!online || !cid || !sid) {
         const err = new Error("Not connected to Gateway");
-        (err as { code?: string }).code = "unreachable";
+        (err as { code?: ErrorCode }).code = "unreachable";
         throw err;
       }
+      const existingRec = turnCoordinator.getSessionView({
+        connectionId: cid,
+        profileId: pid,
+        sessionId: sid,
+      });
+      if (existingRec?.queuePaused || existingRec?.unknownTurn) {
+        const err = new Error(getCopy("turn.queue.pausedNotice"));
+        (err as { code?: ErrorCode }).code = "conflict";
+        throw err;
+      }
+      if (payload.queued === true) {
+        e2eCounts.promptsQueueCalls += 1;
+        const subId =
+          typeof payload.submissionId === "string" && payload.submissionId.trim()
+            ? payload.submissionId.trim()
+            : undefined;
+        return await turnCoordinator.submitQueued(
+          {
+            connectionId: cid,
+            profileId: pid,
+            sessionId: sid,
+            text,
+            online: true,
+            ...(subId ? { submissionId: subId } : {}),
+          },
+          async (rpcPayload) => {
+            e2eCounts.queueSubmittedIds.push(rpcPayload.submission_id);
+            const attempt = (mockQueueAttemptBySubId.get(rpcPayload.submission_id) ?? 0) + 1;
+            mockQueueAttemptBySubId.set(rpcPayload.submission_id, attempt);
+            const ackMode = liveFix?.turnRecovery?.queueAckMode ?? "admitted";
+            const storeKey = `${cid}::${pid}::${sid}`;
+            const currentQueue = mockGatewayQueueStore.get(storeKey) ?? [];
+            if (attempt === 1 && ackMode === "ack_loss_already_admitted") {
+              mockQueueAdmissionSeq += 1;
+              const admId = `adm-srv-${mockQueueAdmissionSeq}`;
+              currentQueue.push({
+                admission_id: admId,
+                submission_id: rpcPayload.submission_id,
+                text: rpcPayload.text,
+                position: currentQueue.length + 1,
+                state: "queued",
+              });
+              mockGatewayQueueStore.set(storeKey, currentQueue);
+              const err = new Error("Queue submit ACK timeout");
+              err.name = "GatewayTransportError";
+              (err as { code?: ErrorCode }).code = "timeout";
+              throw err;
+            }
+            if (
+              (attempt === 1 && ackMode === "ack_loss_unadmitted") ||
+              ackMode === "ack_loss"
+            ) {
+              const err = new Error("Queue submit ACK timeout");
+              err.name = "GatewayTransportError";
+              (err as { code?: ErrorCode }).code = "timeout";
+              throw err;
+            }
+            mockQueueAdmissionSeq += 1;
+            const admId = `adm-srv-${mockQueueAdmissionSeq}`;
+            const pos = currentQueue.length + 1;
+            currentQueue.push({
+              admission_id: admId,
+              submission_id: rpcPayload.submission_id,
+              text: rpcPayload.text,
+              position: pos,
+              state: "queued",
+            });
+            mockGatewayQueueStore.set(storeKey, currentQueue);
+            return {
+              admitted: true,
+              admission_id: admId,
+              position: pos,
+              status: "queued",
+            };
+          },
+        );
+      }
+
       const key = transcriptKey(cid, pid, sid);
-      const tx = mockTranscripts.get(key);
+      const tx = fixture
+        ? lookupTranscript(transcriptMap, cid, pid, sid) ?? makeEmptyTranscript(cid, pid, sid)
+        : mockTranscripts.get(key);
       const now = new Date().toISOString();
-      const userMsgId = `mock-u-${Date.now()}`;
-      const assistantMsgId = `mock-a-${Date.now()}`;
-      const turnId = `mock-turn-${Date.now()}`;
+      mockTurnSeq += 1;
+      const turnId = `mock-turn-${mockTurnSeq}`;
+      const recovery = turnCoordinator.noteTurnStarted({
+        connectionId: cid,
+        profileId: pid,
+        sessionId: sid,
+        turnId,
+        ownerGeneration: mockOwnerGen,
+      });
+      const userMsgId = `mock-u-${Date.now()}-${mockTurnSeq}`;
+      const assistantMsgId = `mock-a-${Date.now()}-${mockTurnSeq}`;
+      const keepRunning = Boolean(liveFix?.turnRecovery?.keepSendRunning);
+      const userMsg = {
+        messageId: userMsgId,
+        sessionId: sid,
+        role: "user" as const,
+        text,
+        createdAt: now,
+        turnId,
+        status: "complete" as const,
+      };
+      const assistantMsg = {
+        messageId: assistantMsgId,
+        sessionId: sid,
+        role: "assistant" as const,
+        text: keepRunning ? "" : `Mock Gateway (${cid}) received: ${text}`,
+        createdAt: now,
+        turnId,
+        streaming: keepRunning,
+        status: keepRunning ? ("streaming" as const) : ("complete" as const),
+      };
       if (tx) {
-        const userMsg = {
-          messageId: userMsgId,
-          sessionId: sid,
-          role: "user" as const,
-          text,
-          createdAt: now,
-          status: "complete" as const,
+        const nextTx: SessionTranscriptSnapshot = {
+          ...tx,
+          messages: [...tx.messages, userMsg, assistantMsg],
+          activeTurnId: keepRunning ? turnId : null,
+          turnStopping: false,
+          executionGeneration: recovery.executionGeneration,
+          stopState: "idle",
         };
-        const assistantMsg = {
-          messageId: assistantMsgId,
-          sessionId: sid,
-          role: "assistant" as const,
-          text: `SSH Mock Gateway (${cid}) received: ${text}`,
-          createdAt: now,
-          turnId,
-          streaming: false,
-          status: "complete" as const,
-        };
-        tx.messages.push(userMsg, assistantMsg);
+        if (fixture) {
+          transcriptMap.set(key, nextTx);
+        } else {
+          tx.messages.push(userMsg, assistantMsg);
+          tx.activeTurnId = keepRunning ? turnId : null;
+          tx.executionGeneration = recovery.executionGeneration;
+        }
         emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
           type: "message_upsert",
           sessionId: sid,
@@ -3618,6 +4039,24 @@ export function createMockHostBridge(): HermesHost {
           sessionId: sid,
           message: assistantMsg,
         });
+        emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
+          type: "turn_state",
+          sessionId: sid,
+          activeTurnId: keepRunning ? turnId : null,
+          turnStopping: false,
+          executionGeneration: recovery.executionGeneration,
+          stopState: "idle",
+        } satisfies TranscriptPatchPayload);
+      }
+      if (!keepRunning) {
+        turnCoordinator.noteTurnTerminal({
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          turnId,
+          executionGeneration: recovery.executionGeneration,
+          outcome: "completed",
+        });
       }
       clearMockDraftOnReceipt(cid, pid, sid, draftId, "accepted");
       return {
@@ -3627,17 +4066,688 @@ export function createMockHostBridge(): HermesHost {
         profileId: pid,
         sessionId: sid,
         turnId,
+        executionGeneration: recovery.executionGeneration,
       };
     },
-    "prompts.stop": async () => {
-      const err = new Error("Not connected to Gateway");
-      (err as { code?: string }).code = "unreachable";
-      throw err;
+    "prompts.stop": async (payload, scope) => {
+      e2eCounts.promptsStopCalls += 1;
+      e2eCounts.stopPayloads.push({
+        ...(typeof payload.turnId === "string" ? { turnId: payload.turnId } : {}),
+        ...(typeof payload.executionGeneration === "number"
+          ? { executionGeneration: payload.executionGeneration }
+          : {}),
+      });
+      const liveFix = readE2EFixture() ?? fixture;
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            (fixture ? "local" : undefined);
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId);
+      const online = fixture
+        ? Boolean(
+            cid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      const existingView =
+        cid && sid
+          ? turnCoordinator.getSessionView({ connectionId: cid, profileId: pid, sessionId: sid })
+          : null;
+      const existingTx =
+        cid && sid
+          ? fixture
+            ? lookupTranscript(transcriptMap, cid, pid, sid)
+            : mockTranscripts.get(transcriptKey(cid, pid, sid))
+          : null;
+      const turnId =
+        typeof payload.turnId === "string" && payload.turnId.trim()
+          ? payload.turnId.trim()
+          : existingView?.activeTurnId ?? existingTx?.activeTurnId ?? "";
+
+      if (!online && !turnId) {
+        const err = new Error("Not connected to Gateway");
+        (err as { code?: ErrorCode }).code = "unreachable";
+        throw err;
+      }
+      if (!cid || !sid || !turnId) {
+        const err = new Error("当前没有可停止的 Turn");
+        (err as { code?: ErrorCode }).code = "unknown_turn";
+        throw err;
+      }
+      const execGen =
+        typeof payload.executionGeneration === "number"
+          ? payload.executionGeneration
+          : existingView?.executionGeneration ?? existingTx?.executionGeneration;
+
+      const stopMode = liveFix?.turnRecovery?.stopMode ?? "ack_stopping";
+      const result = await turnCoordinator.requestStop(
+        {
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          turnId,
+          ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+        },
+        async ({ executionGeneration: g }) => {
+          if (!online || stopMode === "ack_loss") {
+            const err = new Error("Interrupt ACK lost");
+            err.name = "GatewayTransportError";
+            (err as { code?: ErrorCode }).code = online ? "timeout" : "unreachable";
+            throw err;
+          }
+          if (stopMode === "owner_changed") {
+            mockOwnerGen += 1;
+            turnCoordinator.onOwnerGenerationChanged(cid, mockOwnerGen);
+            return { status: "stopping", execution_generation: g };
+          }
+          if (stopMode === "terminal_stopped") {
+            return { status: "stopped", execution_generation: g };
+          }
+          return { status: "stopping", execution_generation: g };
+        },
+      );
+
+      const isStopped = result.status === "stopped";
+      const isStopping = result.status === "stopping";
+      if (existingTx) {
+        const updatedTx: SessionTranscriptSnapshot = {
+          ...existingTx,
+          activeTurnId: isStopped ? null : turnId,
+          turnStopping: isStopping,
+          executionGeneration: result.executionGeneration,
+          stopState: result.status,
+        };
+        if (fixture) {
+          transcriptMap.set(transcriptKey(cid, pid, sid), updatedTx);
+        } else {
+          mockTranscripts.set(transcriptKey(cid, pid, sid), updatedTx);
+        }
+      }
+      emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
+        type: "turn_state",
+        sessionId: sid,
+        activeTurnId: isStopped ? null : turnId,
+        turnStopping: isStopping,
+        executionGeneration: result.executionGeneration,
+        stopState: result.status,
+        ...(isStopped ? { status: "stopped" as const } : {}),
+      } satisfies TranscriptPatchPayload);
+
+      const delayedMs = liveFix?.turnRecovery?.stopDelayedTerminalMs;
+      if (isStopping && typeof delayedMs === "number" && delayedMs > 0) {
+        setTimeout(() => {
+          const settled = turnCoordinator.noteTurnTerminal({
+            connectionId: cid,
+            profileId: pid,
+            sessionId: sid,
+            turnId,
+            executionGeneration: result.executionGeneration,
+            outcome: "stopped",
+          });
+          emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
+            type: "turn_state",
+            sessionId: sid,
+            activeTurnId: null,
+            turnStopping: false,
+            executionGeneration: settled.executionGeneration,
+            stopState: settled.stopState,
+            status: "stopped",
+          } satisfies TranscriptPatchPayload);
+        }, delayedMs);
+      }
+
+      return {
+        stopped: isStopped,
+        status: result.status,
+        sessionId: sid,
+        turnId,
+        executionGeneration: result.executionGeneration,
+      };
     },
-    "prompts.steer": async () => {
-      const err = new Error("Not connected to Gateway");
-      (err as { code?: string }).code = "unreachable";
-      throw err;
+    "prompts.resolveUnknown": async (payload, scope) => {
+      e2eCounts.resolveUnknownCalls += 1;
+      const liveFix = readE2EFixture() ?? fixture;
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            "local";
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId) ?? "";
+      const online = fixture
+        ? Boolean(
+            cid &&
+              sid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              sid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      if (!online || !sid) {
+        const err = new Error("Not connected to Gateway");
+        (err as { code?: ErrorCode }).code = "unreachable";
+        throw err;
+      }
+      const admissionId =
+        typeof payload.admissionId === "string" && payload.admissionId.trim()
+          ? payload.admissionId.trim()
+          : undefined;
+      const executionGeneration =
+        typeof payload.executionGeneration === "number" ? payload.executionGeneration : undefined;
+      const res = await turnCoordinator.resolveUnknown(
+        {
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          admissionId,
+          executionGeneration,
+        },
+        async (rpcPayload) => {
+          e2eCounts.resolveUnknownPayloads.push(rpcPayload);
+          return { resolved: true, status: "interrupted" };
+        },
+      );
+      const existingTx = fixture
+        ? lookupTranscript(transcriptMap, cid, pid, sid)
+        : mockTranscripts.get(transcriptKey(cid, pid, sid));
+      if (existingTx) {
+        const updatedTx: SessionTranscriptSnapshot = {
+          ...existingTx,
+          activeTurnId: null,
+          turnStopping: false,
+          stopState: "stopped",
+        };
+        if (fixture) {
+          transcriptMap.set(transcriptKey(cid, pid, sid), updatedTx);
+        } else {
+          mockTranscripts.set(transcriptKey(cid, pid, sid), updatedTx);
+        }
+      }
+      emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
+        type: "turn_state",
+        sessionId: sid,
+        activeTurnId: null,
+        turnStopping: false,
+        stopState: "stopped",
+      } satisfies TranscriptPatchPayload);
+
+      const followerCfg = liveFix?.turnRecovery?.autoFollowerOnDiscard;
+      if (followerCfg) {
+        const storeKey = `${cid}::${pid}::${sid}`;
+        const rawQueue = mockGatewayQueueStore.get(storeKey) ?? [];
+        const firstQueued = rawQueue[0];
+        const nextTurnId =
+          ("turnId" in followerCfg && followerCfg.turnId) || `turn-follower-${++mockTurnSeq}`;
+        const nextGen =
+          ("executionGeneration" in followerCfg && followerCfg.executionGeneration) ||
+          res.executionGeneration + 1;
+        const started = turnCoordinator.noteTurnStarted({
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          turnId: nextTurnId,
+          executionGeneration: nextGen,
+          ownerGeneration: mockOwnerGen,
+        });
+        if (firstQueued) {
+          const admId = String(firstQueued.admissionId ?? firstQueued.admission_id ?? "");
+          if (admId) {
+            turnCoordinator.applyAdmissionEvent({
+              connectionId: cid,
+              profileId: pid,
+              sessionId: sid,
+              admissionId: admId,
+              state: "already_started",
+              turnId: nextTurnId,
+              executionGeneration: started.executionGeneration,
+            });
+          }
+        }
+        emitTranscriptEvent({ connectionId: cid, profileId: pid, sessionId: sid }, "patch", {
+          type: "turn_state",
+          sessionId: sid,
+          activeTurnId: nextTurnId,
+          turnStopping: false,
+          executionGeneration: started.executionGeneration,
+          stopState: "idle",
+        } satisfies TranscriptPatchPayload);
+      }
+
+      return res;
+    },
+    "prompts.queue": async (payload, scope) => {
+      e2eCounts.promptsQueueCalls += 1;
+      const liveFix = readE2EFixture() ?? fixture;
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            "local";
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId) ?? "";
+      const text = typeof payload.text === "string" ? payload.text.trim() : "";
+      if (!sid || !text) {
+        const err = new Error("请输入内容后再排队");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const existingRec = turnCoordinator.getSessionView({
+        connectionId: cid,
+        profileId: pid,
+        sessionId: sid,
+      });
+      if (existingRec?.queuePaused || existingRec?.unknownTurn) {
+        const err = new Error(getCopy("turn.queue.pausedNotice"));
+        (err as { code?: ErrorCode }).code = "conflict";
+        throw err;
+      }
+      const online = fixture
+        ? Boolean(
+            cid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      const subId =
+        typeof payload.submissionId === "string" && payload.submissionId.trim()
+          ? payload.submissionId.trim()
+          : undefined;
+      return await turnCoordinator.submitQueued(
+        {
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          text,
+          online,
+          ...(subId ? { submissionId: subId } : {}),
+        },
+        async (rpcPayload) => {
+          e2eCounts.queueSubmittedIds.push(rpcPayload.submission_id);
+          const attempt = (mockQueueAttemptBySubId.get(rpcPayload.submission_id) ?? 0) + 1;
+          mockQueueAttemptBySubId.set(rpcPayload.submission_id, attempt);
+          const ackMode = liveFix?.turnRecovery?.queueAckMode ?? "admitted";
+          const storeKey = `${cid}::${pid}::${sid}`;
+          const currentQueue = mockGatewayQueueStore.get(storeKey) ?? [];
+          if (attempt === 1 && ackMode === "ack_loss_already_admitted") {
+            mockQueueAdmissionSeq += 1;
+            const admId = `adm-srv-${mockQueueAdmissionSeq}`;
+            currentQueue.push({
+              admission_id: admId,
+              submission_id: rpcPayload.submission_id,
+              text: rpcPayload.text,
+              position: currentQueue.length + 1,
+              state: "queued",
+            });
+            mockGatewayQueueStore.set(storeKey, currentQueue);
+            const err = new Error("Queue submit ACK timeout");
+            err.name = "GatewayTransportError";
+            (err as { code?: ErrorCode }).code = "timeout";
+            throw err;
+          }
+          if (
+            (attempt === 1 && ackMode === "ack_loss_unadmitted") ||
+            ackMode === "ack_loss"
+          ) {
+            const err = new Error("Queue submit ACK timeout");
+            err.name = "GatewayTransportError";
+            (err as { code?: ErrorCode }).code = "timeout";
+            throw err;
+          }
+          mockQueueAdmissionSeq += 1;
+          const admId = `adm-srv-${mockQueueAdmissionSeq}`;
+          const pos = currentQueue.length + 1;
+          currentQueue.push({
+            admission_id: admId,
+            submission_id: rpcPayload.submission_id,
+            text: rpcPayload.text,
+            position: pos,
+            state: "queued",
+          });
+          mockGatewayQueueStore.set(storeKey, currentQueue);
+          return {
+            admitted: true,
+            admission_id: admId,
+            position: pos,
+            status: "queued",
+          };
+        },
+      );
+    },
+    "prompts.checkQueueReceipt": async (payload, scope) => {
+      e2eCounts.promptsCheckQueueReceiptCalls += 1;
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            "local";
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId) ?? "";
+      const submissionId =
+        typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
+      const online = fixture
+        ? Boolean(
+            cid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      if (!online || !sid || !submissionId) {
+        const err = new Error(online ? "缺少 submissionId" : "Not connected to Gateway");
+        (err as { code?: ErrorCode }).code = online ? "invalid_request" : "unreachable";
+        throw err;
+      }
+      const storeKey = `${cid}::${pid}::${sid}`;
+      return await turnCoordinator.checkQueueReceipt(
+        { connectionId: cid, profileId: pid, sessionId: sid, submissionId },
+        async (subId) => {
+          const list = mockGatewayQueueStore.get(storeKey) ?? [];
+          const match = list.find(
+            (item) => (item.submission_id ?? item.submissionId) === subId,
+          );
+          return {
+            found: Boolean(match),
+            ...(match ? { admission: match } : {}),
+            queuedAdmissions: list,
+          };
+        },
+      );
+    },
+    "prompts.retryQueue": async (payload, scope) => {
+      e2eCounts.promptsRetryQueueCalls += 1;
+      const liveFix = readE2EFixture() ?? fixture;
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            "local";
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId) ?? "";
+      const submissionId =
+        typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
+      const online = fixture
+        ? Boolean(
+            cid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      if (!online || !sid || !submissionId) {
+        const err = new Error(online ? "缺少 submissionId" : "Not connected to Gateway");
+        (err as { code?: ErrorCode }).code = online ? "invalid_request" : "unreachable";
+        throw err;
+      }
+      const storeKey = `${cid}::${pid}::${sid}`;
+      return await turnCoordinator.retryQueued(
+        { connectionId: cid, profileId: pid, sessionId: sid, submissionId, online: true },
+        async (rpcPayload) => {
+          e2eCounts.queueSubmittedIds.push(rpcPayload.submission_id);
+          if (liveFix?.turnRecovery?.queueAckMode === "ack_loss") {
+            const err = new Error("Retry ACK lost");
+            err.name = "GatewayTransportError";
+            (err as { code?: ErrorCode }).code = "timeout";
+            throw err;
+          }
+          const currentQueue = mockGatewayQueueStore.get(storeKey) ?? [];
+          mockQueueAdmissionSeq += 1;
+          const admId = `adm-srv-${mockQueueAdmissionSeq}`;
+          const pos = currentQueue.length + 1;
+          currentQueue.push({
+            admission_id: admId,
+            submission_id: rpcPayload.submission_id,
+            text: rpcPayload.text,
+            position: pos,
+            state: "queued",
+          });
+          mockGatewayQueueStore.set(storeKey, currentQueue);
+          return {
+            admitted: true,
+            admission_id: admId,
+            position: pos,
+            status: "queued",
+          };
+        },
+      );
+    },
+    "prompts.cancelQueued": async (payload, scope) => {
+      e2eCounts.promptsCancelQueuedCalls += 1;
+      const liveFix = readE2EFixture() ?? fixture;
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            "local";
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId) ?? "";
+      const admissionId =
+        typeof payload.admissionId === "string" ? payload.admissionId.trim() : "";
+      const online = fixture
+        ? Boolean(
+            cid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      if (!online || !sid || !admissionId) {
+        const err = new Error(online ? "缺少排队 admissionId" : "Not connected to Gateway");
+        (err as { code?: ErrorCode }).code = online ? "invalid_request" : "unreachable";
+        throw err;
+      }
+      const storeKey = `${cid}::${pid}::${sid}`;
+      return await turnCoordinator.cancelQueued(
+        { connectionId: cid, profileId: pid, sessionId: sid, admissionId },
+        async ({ admission_id }) => {
+          const outcome = liveFix?.turnRecovery?.queueCancelOutcome ?? "cancelled";
+          if (outcome === "ack_loss") {
+            const err = new Error("Queued cancel ACK timeout");
+            err.name = "GatewayTransportError";
+            (err as { code?: ErrorCode }).code = "timeout";
+            throw err;
+          }
+          const list = (mockGatewayQueueStore.get(storeKey) ?? []).map((item) => {
+            const itemId = String(item.admission_id ?? item.admissionId ?? "");
+            return itemId === admission_id ? { ...item, state: outcome } : item;
+          });
+          mockGatewayQueueStore.set(storeKey, list);
+          return { status: outcome };
+        },
+      );
+    },
+    "prompts.steer": async (payload, scope): Promise<PromptSteerResult> => {
+      e2eCounts.promptsSteerCalls += 1;
+      e2eCounts.steerPayloads.push({
+        ...(typeof payload.turnId === "string" ? { turnId: payload.turnId } : {}),
+        ...(typeof payload.executionGeneration === "number"
+          ? { executionGeneration: payload.executionGeneration }
+          : {}),
+        ...(typeof payload.text === "string" ? { text: payload.text } : {}),
+      });
+      const liveFix = readE2EFixture() ?? fixture;
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            (fixture ? "local" : undefined);
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId) ?? "";
+      const online = fixture
+        ? Boolean(
+            cid &&
+              !mockTurnGlobalOffline &&
+              currentFleet.connections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          )
+        : Boolean(
+            cid &&
+              mockConnections.some((c) => c.connectionId === cid && c.actual === "ready"),
+          );
+      if (!online || !cid || !sid) {
+        const err = new Error("Not connected to Gateway");
+        (err as { code?: ErrorCode }).code = "unreachable";
+        throw err;
+      }
+      const turnId = typeof payload.turnId === "string" ? payload.turnId.trim() : "";
+      const executionGeneration =
+        typeof payload.executionGeneration === "number" ? payload.executionGeneration : undefined;
+      const text = typeof payload.text === "string" ? payload.text.trim() : "";
+      if (!text) {
+        const err = new Error("缺少补充指令内容");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const hasHistory = turnCoordinator.hasTurnHistory({
+        connectionId: cid,
+        profileId: pid,
+        sessionId: sid,
+      });
+      if (hasHistory || executionGeneration !== undefined) {
+        const precheck = turnCoordinator.evaluateSteerPrecheck({
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          ...(turnId ? { turnId } : {}),
+          ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+          text,
+          requireRunning: true,
+        });
+        if (!precheck.allowed) {
+          return turnCoordinator.recordSteerFailure({
+            connectionId: cid,
+            profileId: pid,
+            sessionId: sid,
+            ...(turnId ? { turnId } : {}),
+            ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+            text,
+            reason: precheck.reason,
+            message: precheck.message,
+          });
+        }
+      }
+
+      const steerMode = liveFix?.turnRecovery?.steerMode ?? "ok";
+      if (steerMode !== "ok") {
+        const reason: SteerFailureReason = steerMode;
+        return turnCoordinator.recordSteerFailure({
+          connectionId: cid,
+          profileId: pid,
+          sessionId: sid,
+          ...(turnId ? { turnId } : {}),
+          ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+          text,
+          reason,
+          message: getCopy("turn.steer.fallbackBody"),
+        });
+      }
+      return turnCoordinator.recordSteerSuccess({
+        connectionId: cid,
+        profileId: pid,
+        sessionId: sid,
+        ...(turnId ? { turnId } : {}),
+        ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+      });
+    },
+    "prompts.dismissSteerFallback": async (payload, scope) => {
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ??
+            (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ??
+            "local";
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ??
+            (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ??
+            "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? (fixture ? currentFleet.activeSessionId : mockActiveSessionId) ?? "";
+      if (!sid) return { ok: true };
+      turnCoordinator.clearSteerFallback({ connectionId: cid, profileId: pid, sessionId: sid });
+      return { ok: true };
     },
     "local.inspect": async (): Promise<LocalInspectResult> => currentInspection,
     "local.selectCli": async (): Promise<LocalSelectCliResult> => ({
@@ -3646,9 +4756,23 @@ export function createMockHostBridge(): HermesHost {
       inspection: currentInspection,
     }),
     "local.diagnose": async (): Promise<SanitizedDiagnosticsPayload> => buildMockDiagnostics(),
-    "capabilities.describe": async (payload): Promise<CapabilitySnapshot> => {
+    "capabilities.describe": async (payload, scope): Promise<CapabilitySnapshot> => {
+      e2eCounts.capabilitiesDescribeCalls += 1;
+      if (typeof payload.domain === "string") {
+        e2eCounts.capabilitiesDescribeDomains.push(payload.domain);
+      }
       const liveFixture = readE2EFixture() ?? fixture;
       syncFixtureGenerationIfNeeded(liveFixture);
+      const cid =
+        (typeof payload.connectionId === "string" && payload.connectionId) ||
+        scope?.connectionId ||
+        (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ||
+        "local";
+      const pid =
+        (typeof payload.profileId === "string" && payload.profileId) ||
+        scope?.profileId ||
+        (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ||
+        "default";
       const domain =
         typeof payload.domain === "string" ? (payload.domain as CapabilityDomainId) : undefined;
       const action = payload.action === "reload" ? "reload" : undefined;
@@ -3736,6 +4860,40 @@ export function createMockHostBridge(): HermesHost {
               reloaded: action === "reload",
               errorCode: mcpCfg?.errorCode,
             });
+          } else if (domain === "memory") {
+            const memCfg = liveFixture?.capabilities?.memory;
+            const normalizedOutcome = baseOutcome === "timeout" ? "older" : baseOutcome;
+            capabilityRegistry.applyMemoryState({
+              expectedOwnerGeneration: snap.key.ownerGeneration,
+              expectedAuthorityEpoch: snap.key.authorityEpoch,
+              expectedGeneration: snap.generation,
+              outcome: memCfg?.outcome ?? (normalizedOutcome === "ok" ? "ok" : normalizedOutcome),
+              sourceMethod: memCfg?.sourceMethod ?? "session.context_breakdown",
+              rawPayload: memCfg?.rawPayload ?? {},
+              errorCode: memCfg?.errorCode,
+            });
+          } else if (domain === "messaging") {
+            const msgCfg = liveFixture?.capabilities?.messaging;
+            const normalizedOutcome = baseOutcome === "timeout" ? "older" : baseOutcome;
+            capabilityRegistry.applyMessagingState({
+              expectedOwnerGeneration: snap.key.ownerGeneration,
+              expectedAuthorityEpoch: snap.key.authorityEpoch,
+              expectedGeneration: snap.generation,
+              outcome: msgCfg?.outcome ?? (normalizedOutcome === "ok" ? "ok" : normalizedOutcome),
+              rawPayload: msgCfg?.rawPayload ?? {},
+              errorCode: msgCfg?.errorCode,
+            });
+          } else if (domain === "cron") {
+            const cronCfg = liveFixture?.capabilities?.cron;
+            const normalizedOutcome = baseOutcome === "timeout" ? "older" : baseOutcome;
+            capabilityRegistry.applyCronState({
+              expectedOwnerGeneration: snap.key.ownerGeneration,
+              expectedAuthorityEpoch: snap.key.authorityEpoch,
+              expectedGeneration: snap.generation,
+              outcome: cronCfg?.outcome ?? (normalizedOutcome === "ok" ? "ok" : normalizedOutcome),
+              rawPayload: mockCronPayloadForScope(cid, pid),
+              errorCode: cronCfg?.errorCode,
+            });
           }
 
           capabilityRegistry.applyProbeOutcome({
@@ -3750,6 +4908,109 @@ export function createMockHostBridge(): HermesHost {
         }
       }
       return capabilityRegistry.getSnapshot();
+    },
+    "cron.status": async (_payload, scope): Promise<CronStateView> => {
+      const snap = capabilityRegistry.getSnapshot();
+      const cid = scope?.connectionId ?? (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ?? "local";
+      const pid = scope?.profileId ?? (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ?? "default";
+      capabilityRegistry.applyCronState({
+        expectedOwnerGeneration: snap.key.ownerGeneration,
+        expectedAuthorityEpoch: snap.key.authorityEpoch,
+        expectedGeneration: snap.generation,
+        outcome: "ok",
+        rawPayload: mockCronPayloadForScope(cid, pid),
+      });
+      emitCapabilitiesPatch();
+      return capabilityRegistry.getSnapshot().cron;
+    },
+    "cron.submit": async (payload, scope): Promise<CronMutationResult> => {
+      e2eCounts.cronSubmitCalls += 1;
+      const snap = capabilityRegistry.getSnapshot();
+      if (!snap.cron.supportedActions.canSubmit) {
+        const err = new Error("Cron submit unavailable");
+        (err as { code?: ErrorCode }).code = "capability_unavailable";
+        throw err;
+      }
+      const cid = scope?.connectionId ?? (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ?? "local";
+      const pid = scope?.profileId ?? (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ?? "default";
+      const name = typeof payload.name === "string" ? payload.name.trim() : "";
+      const schedule = typeof payload.schedule === "string" ? payload.schedule.trim() : "";
+      const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
+      if (!name || !schedule || !prompt) {
+        const err = new Error("Missing cron fields");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const store = mockCronJobsByScope.get(cronScopeKey(cid, pid)) ?? [];
+      mockCronSeq += 1;
+      const jobId = `cron-mock-${mockCronSeq}`;
+      store.push({
+        id: jobId,
+        name,
+        schedule,
+        prompt,
+        prompt_summary: prompt,
+        status: "scheduled",
+        next_run_at: new Date(Date.now() + 60_000).toISOString(),
+      });
+      mockCronJobsByScope.set(cronScopeKey(cid, pid), store);
+      capabilityRegistry.applyCronState({
+        expectedOwnerGeneration: snap.key.ownerGeneration,
+        expectedAuthorityEpoch: snap.key.authorityEpoch,
+        expectedGeneration: snap.generation,
+        outcome: "ok",
+        rawPayload: { jobs: store },
+      });
+      emitCapabilitiesPatch();
+      return { ok: true, jobId, cron: capabilityRegistry.getSnapshot().cron };
+    },
+    "cron.cancel": async (payload, scope): Promise<CronMutationResult> => {
+      e2eCounts.cronCancelCalls += 1;
+      const cid = scope?.connectionId ?? (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ?? "local";
+      const pid = scope?.profileId ?? (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ?? "default";
+      const jobId = typeof payload.jobId === "string" ? payload.jobId.trim() : "";
+      const store = mockCronJobsByScope.get(cronScopeKey(cid, pid)) ?? [];
+      const job = store.find((item) => item.id === jobId);
+      if (!job) {
+        const err = new Error("Cron job not found");
+        (err as { code?: ErrorCode }).code = "not_found";
+        throw err;
+      }
+      job.status = "cancelled";
+      const snap = capabilityRegistry.getSnapshot();
+      capabilityRegistry.applyCronState({
+        expectedOwnerGeneration: snap.key.ownerGeneration,
+        expectedAuthorityEpoch: snap.key.authorityEpoch,
+        expectedGeneration: snap.generation,
+        outcome: "ok",
+        rawPayload: { jobs: store },
+      });
+      emitCapabilitiesPatch();
+      return { ok: true, jobId, cron: capabilityRegistry.getSnapshot().cron };
+    },
+    "cron.recover": async (payload, scope): Promise<CronMutationResult> => {
+      e2eCounts.cronRecoverCalls += 1;
+      const cid = scope?.connectionId ?? (fixture ? currentFleet.activeScope?.connectionId : mockActiveScope?.connectionId) ?? "local";
+      const pid = scope?.profileId ?? (fixture ? currentFleet.activeScope?.profileId : mockActiveScope?.profileId) ?? "default";
+      const jobId = typeof payload.jobId === "string" ? payload.jobId.trim() : "";
+      const store = mockCronJobsByScope.get(cronScopeKey(cid, pid)) ?? [];
+      const job = store.find((item) => item.id === jobId);
+      if (!job) {
+        const err = new Error("Cron job not found");
+        (err as { code?: ErrorCode }).code = "not_found";
+        throw err;
+      }
+      job.status = "scheduled";
+      const snap = capabilityRegistry.getSnapshot();
+      capabilityRegistry.applyCronState({
+        expectedOwnerGeneration: snap.key.ownerGeneration,
+        expectedAuthorityEpoch: snap.key.authorityEpoch,
+        expectedGeneration: snap.generation,
+        outcome: "ok",
+        rawPayload: { jobs: store },
+      });
+      emitCapabilitiesPatch();
+      return { ok: true, jobId, cron: capabilityRegistry.getSnapshot().cron };
     },
     "config.get": async (_payload, scope): Promise<GatewayConfigSnapshot> => {
       const activeScope = scope ?? (fixture ? currentFleet.activeScope : mockActiveScope);
@@ -3807,6 +5068,7 @@ export function createMockHostBridge(): HermesHost {
       return approvalCoordinator.snapshot();
     },
     "approvals.respond": async (payload) => {
+      e2eCounts.approvalRespondCalls += 1;
       const { approvalKey, choice } = assertApprovalRespondPayloadSafe(payload);
       return await approvalCoordinator.respond(approvalKey, choice);
     },
@@ -4349,6 +5611,23 @@ export function createMockHostBridge(): HermesHost {
             terminalListeners.delete(entry);
           };
         }
+      } else if (topic === "turn.recovery") {
+        const typed = listener as (event: BridgeEvent<TurnRecoveryTopicSnapshot>) => void;
+        turnRecoveryListeners.add(typed);
+        queueMicrotask(() => {
+          if (!turnRecoveryListeners.has(typed)) return;
+          typed({
+            topic: "turn.recovery",
+            scope: null,
+            kind: "snapshot",
+            seq: 0,
+            revision: turnRecoverySeq + 1,
+            payload: turnCoordinator.snapshot(),
+          });
+        });
+        return () => {
+          turnRecoveryListeners.delete(typed);
+        };
       }
       return () => {
         // No background network resources in MockHostBridge

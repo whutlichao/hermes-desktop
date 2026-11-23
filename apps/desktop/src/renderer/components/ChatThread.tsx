@@ -12,17 +12,17 @@ import type {
   DraftExportBundle,
   DraftRecord,
   LocalInspectResult,
-  LocalSafeActionId,
   MissingSessionExport,
   SessionTranscriptSnapshot,
   ToolExecutionRow,
   TranscriptPendingApprovalView,
+  TurnSessionRecoveryView,
 } from "@hermes/contracts";
-import { getCopy } from "@hermes/domain";
+import { getCopy, getLocalFailureCopy } from "@hermes/domain";
 import { AttributionBadge } from "./AttributionBadge";
 import { ApprovalCard } from "./ApprovalCard";
-import { LocalRepairCard } from "./LocalRepairCard";
 import { MarkdownText } from "./MarkdownText";
+import { TurnRecoveryCards } from "./TurnRecoveryCards";
 
 interface ChatThreadProps {
   hasReadyConnection: boolean;
@@ -46,6 +46,13 @@ interface ChatThreadProps {
   scopeNewDrafts: DraftRecord[];
   activeNewDraftId: string | null;
   stopError: string | null;
+  turnRecovery: TurnSessionRecoveryView | null;
+  recoveryBusy: boolean;
+  cronHintText: string;
+  hasRecentSession: boolean;
+  canQueue: boolean;
+  canSteer: boolean;
+  canCancelQueue: boolean;
   canCreateSession: boolean;
   composerRef: RefObject<HTMLTextAreaElement>;
   onDraftChange: (value: string) => void;
@@ -57,18 +64,27 @@ interface ChatThreadProps {
   onSelectNewDraft: (draftId: string) => void;
   onStartNewDraft: () => void;
   onSendPrompt: () => void;
+  onQueuePrompt: () => void;
   onStopTurn: () => void;
-  onCreateSession: () => void;
   onExportMissingSession: () => void;
   onDismissMissingSession: () => void;
-  onLocalAction: (action: LocalSafeActionId) => void;
   onRespondApproval: (approval: ApprovalView, choice: ApprovalChoice) => void;
   onInspectApproval: (approval: ApprovalView) => void;
   onDismissOrphanedApproval: (approval: ApprovalView) => void;
-  onOpenSettings: () => void;
-  onOpenPalette: () => void;
-  onOpenShortcuts: () => void;
-  onOpenRemoteEscape: () => void;
+  onOpenCapabilities: () => void;
+  onToggleWorkspace: () => void;
+  onContinueRecent: () => void;
+  onRepairLocal: () => void;
+  onAddRemote: () => void;
+  onAddSsh: () => void;
+  onDiscardUnknown: () => void;
+  onCancelQueued: (admissionId: string) => void;
+  onCheckQueueReceipt: (submissionId: string) => void;
+  onRetryQueue: (submissionId: string) => void;
+  onSteer: (text: string) => void;
+  onSteerFallbackNewTurn: (text: string) => void;
+  onSteerFallbackQueue: (text: string) => void;
+  onDismissSteerFallback: () => void;
 }
 
 function getToolStatusLabel(status: ToolExecutionRow["status"]): string {
@@ -128,6 +144,13 @@ export function ChatThread({
   scopeNewDrafts,
   activeNewDraftId,
   stopError,
+  turnRecovery,
+  recoveryBusy,
+  cronHintText,
+  hasRecentSession,
+  canQueue,
+  canSteer,
+  canCancelQueue,
   canCreateSession,
   composerRef,
   onDraftChange,
@@ -139,18 +162,27 @@ export function ChatThread({
   onSelectNewDraft,
   onStartNewDraft,
   onSendPrompt,
+  onQueuePrompt,
   onStopTurn,
-  onCreateSession,
   onExportMissingSession,
   onDismissMissingSession,
-  onLocalAction,
   onRespondApproval,
   onInspectApproval,
   onDismissOrphanedApproval,
-  onOpenSettings,
-  onOpenPalette,
-  onOpenShortcuts,
-  onOpenRemoteEscape,
+  onOpenCapabilities,
+  onToggleWorkspace,
+  onContinueRecent,
+  onRepairLocal,
+  onAddRemote,
+  onAddSsh,
+  onDiscardUnknown,
+  onCancelQueued,
+  onCheckQueueReceipt,
+  onRetryQueue,
+  onSteer,
+  onSteerFallbackNewTurn,
+  onSteerFallbackQueue,
+  onDismissSteerFallback,
 }: ChatThreadProps) {
   const owningScope = activeScope ?? chatState?.lastActiveChat ?? null;
   const owningConnId = owningScope?.connectionId ?? null;
@@ -208,6 +240,7 @@ export function ChatThread({
   const hasExpiredAttachment = draftAttachments.some((att) => Boolean(att.expired));
   const hasEstablishedScope = Boolean(activeConnection || chatState?.lastActiveChat);
   const isTrulyUnconnected = !hasReadyConnection && !hasEstablishedScope;
+  const queuePaused = Boolean(turnRecovery?.queuePaused || turnRecovery?.unknownTurn);
 
   const renderDraftAlertsAndComposer = () => {
     if (isTrulyUnconnected) {
@@ -241,7 +274,18 @@ export function ChatThread({
     }
 
     const canSubmit =
-      hasReadyConnection && !chatBusy && !hasExpiredAttachment && Boolean(composerDraft.trim());
+      hasReadyConnection &&
+      !chatBusy &&
+      !queuePaused &&
+      !hasExpiredAttachment &&
+      Boolean(composerDraft.trim());
+    const canQueueNow =
+      canQueue &&
+      hasReadyConnection &&
+      !chatBusy &&
+      !queuePaused &&
+      Boolean(transcript?.activeTurnId) &&
+      Boolean(composerDraft.trim());
 
     return (
       <>
@@ -456,14 +500,28 @@ export function ChatThread({
               >
                 {getCopy("draft.attachAction")}
               </button>
+              {transcript?.activeTurnId && canQueue && (
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  disabled={!canQueueNow}
+                  onClick={onQueuePrompt}
+                >
+                  {getCopy("turn.queue.queueAction")}
+                </button>
+              )}
               {transcript?.activeTurnId && transcript.supportedActions.promptCancel && (
                 <button
                   type="button"
                   className="button button-secondary"
-                  disabled={transcript.turnStopping}
+                  disabled={transcript.turnStopping || turnRecovery?.stopState === "stopping"}
                   onClick={onStopTurn}
                 >
-                  {getCopy(transcript.turnStopping ? "chat.stoppingAction" : "chat.stopAction")}
+                  {getCopy(
+                    transcript.turnStopping || turnRecovery?.stopState === "stopping"
+                      ? "chat.stoppingAction"
+                      : "chat.stopAction",
+                  )}
                 </button>
               )}
               <button
@@ -490,6 +548,9 @@ export function ChatThread({
         : null;
     const isRemoteAuthRequired =
       activeConnection?.kind === "remote" && activeConnection.actual === "auth_required";
+    const failureCopy = localInspection?.failure
+      ? getLocalFailureCopy(localInspection.failure.code)
+      : null;
     return (
       <div className="thread-column">
         {unverifiedChat && (
@@ -507,45 +568,63 @@ export function ChatThread({
           </section>
         )}
 
-        {isRemoteAuthRequired ? (
-          <section className="empty-relay-card" role="status" aria-labelledby="remote-auth-heading">
-            <h1 id="remote-auth-heading">{getCopy("remote.authRequiredTitle")}</h1>
-            <p>{getCopy("remote.authRequiredBody")}</p>
-            <div className="empty-relay-actions">
-              <button type="button" className="button button-primary" onClick={onOpenSettings}>
-                {getCopy("remote.authRequiredAction")}
-              </button>
-              <button type="button" className="button button-secondary" onClick={onOpenPalette}>
-                {getCopy("empty.actionPalette")}
-              </button>
+        <section
+          className="empty-relay-card onboarding-empty-card"
+          aria-labelledby="empty-relay-heading"
+        >
+          <h1 id="empty-relay-heading">
+            {isRemoteAuthRequired ? getCopy("remote.authRequiredTitle") : getCopy("empty.title")}
+          </h1>
+          <p>{isRemoteAuthRequired ? getCopy("remote.authRequiredBody") : getCopy("empty.body")}</p>
+          {localInspection && (
+            <div
+              className="local-repair-header onboarding-local-repair"
+              data-testid="onboarding-local-repair"
+            >
+              <p className="local-repair-meta">
+                {localInspection.label} · {localInspection.cli.displayName}
+              </p>
+              <span className={`status-pill ${localInspection.failure ? "is-blocked" : "is-ready"}`}>
+                {localInspection.failure
+                  ? getCopy("local.statusBlocked")
+                  : getCopy("local.statusReady")}
+              </span>
             </div>
-          </section>
-        ) : (
-          <>
-            <section className="empty-relay-card" aria-labelledby="empty-relay-heading">
-              <h1 id="empty-relay-heading">{getCopy("empty.title")}</h1>
-              <p>{getCopy("empty.body")}</p>
-              <div className="empty-relay-actions">
-                <button type="button" className="button button-primary" onClick={onOpenSettings}>
-                  {getCopy("empty.actionSettings")}
-                </button>
-                <button type="button" className="button button-secondary" onClick={onOpenPalette}>
-                  {getCopy("empty.actionPalette")}
-                </button>
-                <button type="button" className="button button-secondary" onClick={onOpenShortcuts}>
-                  {getCopy("empty.actionShortcuts")}
-                </button>
+          )}
+          {failureCopy && (
+            <dl className="local-repair-dl onboarding-details">
+              <div>
+                <dt>{getCopy("local.whatHappenedLabel")}</dt>
+                <dd>{failureCopy.whatHappened}</dd>
               </div>
-            </section>
-
-            <LocalRepairCard
-              inspection={localInspection}
-              busy={localBusy}
-              onAction={onLocalAction}
-              onOpenRemoteEscape={onOpenRemoteEscape}
-            />
-          </>
-        )}
+              <div>
+                <dt>{getCopy("local.possibleCausesLabel")}</dt>
+                <dd>{failureCopy.possibleCauses}</dd>
+              </div>
+              <div>
+                <dt>{getCopy("local.nextStepLabel")}</dt>
+                <dd>{failureCopy.nextStep}</dd>
+              </div>
+            </dl>
+          )}
+          <div className="empty-relay-actions">
+            <button
+              type="button"
+              className="button button-primary"
+              disabled={localBusy}
+              onClick={onRepairLocal}
+            >
+              {getCopy("empty.actionRepairLocal")}
+            </button>
+            <button type="button" className="button button-secondary" onClick={onAddRemote}>
+              {getCopy("empty.actionAddRemote")}
+            </button>
+            <button type="button" className="button button-secondary" onClick={onAddSsh}>
+              {getCopy("empty.actionAddSsh")}
+            </button>
+          </div>
+          <p className="empty-cron-hint">{cronHintText}</p>
+        </section>
 
         {approvalSections}
 
@@ -627,21 +706,37 @@ export function ChatThread({
         </div>
       )}
 
-      {!transcript || transcript.messages.length === 0 ? (
-        <section className="empty-relay-card" aria-label={getCopy("chat.emptyTitle")}>
-          <h1>{getCopy("chat.emptyTitle")}</h1>
+      {(!transcript || transcript.messages.length === 0) && scopeNewDrafts.length === 0 ? (
+        <section
+          className="empty-relay-card chat-empty-card"
+          aria-labelledby="chat-empty-heading"
+          data-testid="chat-empty-state"
+        >
+          <h1 id="chat-empty-heading">{getCopy("chat.emptyTitle")}</h1>
           <p>{getCopy("chat.emptyBody")}</p>
-          {canCreateSession && !transcript && (
-            <div className="empty-relay-actions">
-              <button type="button" className="button button-primary" onClick={onCreateSession}>
-                {getCopy("nav.newSession")}
-              </button>
-            </div>
-          )}
+          <div className="empty-relay-actions">
+            <button
+              type="button"
+              className="button button-primary"
+              disabled={!hasRecentSession || !canCreateSession}
+              onClick={onContinueRecent}
+            >
+              {getCopy("chat.emptyContinueRecent")}
+            </button>
+            <button type="button" className="button button-secondary" onClick={onOpenCapabilities}>
+              {getCopy("chat.emptyCapabilities")}
+            </button>
+            <button type="button" className="button button-secondary" onClick={onToggleWorkspace}>
+              {getCopy("chat.emptyOpenWorkspace")}
+            </button>
+          </div>
+          <p className="empty-cron-hint">{cronHintText}</p>
         </section>
       ) : (
-        <ol className="transcript-list" aria-label={getCopy("nav.sessionsTab")}>
-          {transcript.messages.map((msg) => (
+        transcript &&
+        transcript.messages.length > 0 && (
+          <ol className="transcript-list" aria-label={getCopy("nav.sessionsTab")}>
+            {transcript.messages.map((msg) => (
             <li
               key={msg.messageId}
               className={["transcript-message", `is-${msg.role}`].join(" ")}
@@ -683,9 +778,25 @@ export function ChatThread({
                 </ul>
               )}
             </li>
-          ))}
-        </ol>
+            ))}
+          </ol>
+        )
       )}
+
+      <TurnRecoveryCards
+        recovery={turnRecovery}
+        busy={recoveryBusy}
+        canCancelQueue={canCancelQueue}
+        canSteer={canSteer}
+        onDiscardUnknown={onDiscardUnknown}
+        onCancelQueued={onCancelQueued}
+        onCheckQueueReceipt={onCheckQueueReceipt}
+        onRetryQueue={onRetryQueue}
+        onSteer={onSteer}
+        onSteerFallbackNewTurn={onSteerFallbackNewTurn}
+        onSteerFallbackQueue={onSteerFallbackQueue}
+        onDismissSteerFallback={onDismissSteerFallback}
+      />
 
       {transcript?.pendingApprovals && transcript.pendingApprovals.length > 0 && (
         <section

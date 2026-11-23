@@ -20,6 +20,11 @@ import {
   type CapabilitySnapshot,
   type ChatSessionProjection,
   type CheckpointDiffSnapshot,
+  type ConnectionKind,
+  type CronJobActionRequest,
+  type CronMutationResult,
+  type CronSubmitRequest,
+  type DomainInspectTab,
   type DraftAttachment,
   type DraftAttachmentKind,
   type DraftContextItem,
@@ -35,6 +40,7 @@ import {
   type MissingSessionExport,
   type OrphanedDraftRecord,
   type ProfileSummary,
+  type PromptSteerResult,
   type RegistrySnapshotView,
   type SanitizedDiagnosticsPayload,
   type SessionSummary,
@@ -43,6 +49,8 @@ import {
   type TerminalCloseResult,
   type TerminalOpenResult,
   type TerminalSnapshot,
+  type TurnRecoveryTopicSnapshot,
+  type TurnSessionRecoveryView,
   type WorkspaceAgentItem,
   type WorkspaceArtifactItem,
   type WorkspaceCheckpointItem,
@@ -115,6 +123,7 @@ import { CapabilitiesDrawer } from "./components/CapabilitiesDrawer";
 import { ChatThread } from "./components/ChatThread";
 import { CommandPalette } from "./components/CommandPalette";
 import { DiagnosticsModal } from "./components/DiagnosticsModal";
+import { DomainInspectDrawer } from "./components/DomainInspectDrawer";
 import {
   ExtensionInventoryViewPanel,
   type ExtensionDomainTab,
@@ -160,7 +169,15 @@ export default function App() {
     useState<ExtensionDomainTab>("plugins");
   const [extBusyDomain, setExtBusyDomain] = useState<ExtensionDomainTab | null>(null);
   const attemptedExtFetchRef = useRef<Map<ExtensionDomainTab, string>>(new Map());
+  const [domainInspectBusy, setDomainInspectBusy] = useState(false);
+  const [domainInspectError, setDomainInspectError] = useState<string | null>(null);
+  const [settingsAddRequest, setSettingsAddRequest] = useState<{
+    kind: ConnectionKind;
+    nonce: number;
+  } | null>(null);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
   const [cancelledApprovalKey, setCancelledApprovalKey] = useState<string | null>(null);
+  const approvalInFlightKeysRef = useRef<Set<string>>(new Set());
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const paletteTriggerRef = useRef<HTMLButtonElement>(null);
@@ -168,6 +185,7 @@ export default function App() {
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const capabilitiesTriggerRef = useRef<HTMLButtonElement>(null);
   const workspaceTriggerRef = useRef<HTMLButtonElement>(null);
+  const workspaceFocusPendingRef = useRef(false);
   const sessionsPopoverTriggerRef = useRef<HTMLButtonElement>(null);
   const scopePopoverTriggerRef = useRef<HTMLButtonElement>(null);
   const trackerRef = useRef(createSequenceTracker());
@@ -175,6 +193,7 @@ export default function App() {
   const capabilitiesTrackerRef = useRef(createSequenceTracker());
   const chatStateTrackerRef = useRef(createSequenceTracker());
   const approvalTrackerRef = useRef(createSequenceTracker());
+  const turnRecoveryTrackerRef = useRef(createSequenceTracker());
   const transcriptSyncRef = useRef(createTranscriptSyncController());
   const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingDraftSaveRef = useRef<{
@@ -239,6 +258,40 @@ export default function App() {
     [effectiveScope, state.activeSessionId, state.sessions],
   );
 
+  const activeTurnRecovery = useMemo<TurnSessionRecoveryView | null>(() => {
+    if (!effectiveScope?.connectionId || !state.activeSessionId) return null;
+    const profileId = effectiveScope.profileId ?? "default";
+    return (
+      state.turnRecovery.sessions.find(
+        (item) =>
+          item.connectionId === effectiveScope.connectionId &&
+          item.profileId === profileId &&
+          item.sessionId === state.activeSessionId,
+      ) ?? null
+    );
+  }, [
+    effectiveScope?.connectionId,
+    effectiveScope?.profileId,
+    state.activeSessionId,
+    state.turnRecovery.sessions,
+  ]);
+
+  const canQueuePrompt =
+    hasReadyConnection &&
+    Boolean(state.transcript?.supportedActions.promptSubmit) &&
+    !activeTurnRecovery?.queuePaused &&
+    !activeTurnRecovery?.unknownTurn;
+
+  const canSteerPrompt = hasReadyConnection && Boolean(state.transcript?.supportedActions.promptSteer);
+  const canCancelQueuePrompt =
+    hasReadyConnection && Boolean(state.transcript?.supportedActions.promptCancel);
+  const cronHintText = useMemo(() => {
+    const recent = state.capabilities.cron.recentRunSummary;
+    return recent
+      ? `${getCopy("chat.emptyCronRecentPrefix")}${recent}`
+      : getCopy("chat.emptyCronDefaultHint");
+  }, [state.capabilities.cron.recentRunSummary]);
+
   useEffect(() => {
     const syncFocus = (focused: boolean) => {
       void host.request("app.setFocused", { focused });
@@ -288,6 +341,18 @@ export default function App() {
       el.removeAttribute("inert");
     }
   }, [hasModal]);
+
+  // Hand focus to the Workspace drawer when it opens. The drawer occupies reserved space
+  // beside the transcript, so the shell remains interactive and unobscured.
+  useLayoutEffect(() => {
+    if (state.workspace.mode !== "open" || !workspaceFocusPendingRef.current) return;
+    workspaceFocusPendingRef.current = false;
+    const drawer = shellRef.current?.querySelector<HTMLElement>(".workspace-drawer");
+    const target = drawer?.querySelector<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled])',
+    );
+    target?.focus();
+  }, [state.workspace.mode]);
 
   const activeChatScope: BridgeScope | null = useMemo(() => {
     if (!effectiveScope) return null;
@@ -665,6 +730,7 @@ export default function App() {
 
   const handleOpenWorkspace = useCallback(
     (tab?: WorkspaceTab) => {
+      workspaceFocusPendingRef.current = true;
       focusControllerRef.current?.register("workspace", {
         layer: "drawer",
         returnFocus:
@@ -683,12 +749,14 @@ export default function App() {
   );
 
   const handleHideWorkspace = useCallback(() => {
+    workspaceFocusPendingRef.current = false;
     setWorkspaceState((prev) => hideWorkspace(prev));
     dispatch({ type: "SET_WORKSPACE_MODE", mode: "hidden" });
     focusControllerRef.current?.closeSurface("workspace", "shortcut");
   }, []);
 
   const handleCloseWorkspace = useCallback(() => {
+    workspaceFocusPendingRef.current = false;
     setWorkspaceState((prev) => closeWorkspace(prev));
     dispatch({ type: "SET_WORKSPACE_MODE", mode: "closed" });
     focusControllerRef.current?.closeSurface("workspace", "explicit");
@@ -1249,6 +1317,20 @@ export default function App() {
     [flushPendingDraftSave, state.surfaceStack],
   );
 
+  const openSettingsForAdd = useCallback((kind: ConnectionKind) => {
+    setSettingsAddRequest({ kind, nonce: Date.now() });
+    dispatch({ type: "OPEN_SURFACE", surface: "settings" });
+  }, []);
+
+  const handleContinueRecentSession = useCallback(() => {
+    const recent = scopedSessions[0];
+    if (recent) {
+      void handleSelectSession(recent);
+      return;
+    }
+    void handleCreateSession();
+  }, [handleCreateSession, handleSelectSession, scopedSessions]);
+
   const buildDraftPayload = useCallback(
     (
       nextText: string,
@@ -1596,7 +1678,11 @@ export default function App() {
         }
       }
       dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" });
-      dispatch({ type: "ANNOUNCE", message: getCopy("scope.switchNotice") });
+      dispatch({
+        type: "ANNOUNCE",
+        message: getCopy("scope.switchNotice"),
+        eventId: `scope-switch:${effectiveScope.connectionId}:${profileId}`,
+      });
     },
     [effectiveScope],
   );
@@ -1620,7 +1706,11 @@ export default function App() {
         activeScope: state.activeScope,
         activeSessionId: state.activeSessionId,
       });
-      dispatch({ type: "ANNOUNCE", message: getCopy("scope.profileRefreshedNotice") });
+      dispatch({
+        type: "ANNOUNCE",
+        message: getCopy("scope.profileRefreshedNotice"),
+        eventId: `profile-refresh:${effectiveScope.connectionId}:${res.value.profiles.length}`,
+      });
     }
   }, [effectiveScope, state.activeScope, state.activeSessionId, state.connections, state.profiles, state.sessions]);
 
@@ -1633,7 +1723,11 @@ export default function App() {
       );
       if (res.ok && res.value.snapshot) {
         setConfigSnapshot(res.value.snapshot);
-        dispatch({ type: "ANNOUNCE", message: getCopy("settings.configSavedNotice") });
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy("settings.configSavedNotice"),
+          eventId: `config-saved:${effectiveScope?.connectionId ?? "local"}:${String(key)}:${JSON.stringify(value)}`,
+        });
       }
     },
     [effectiveScope],
@@ -1822,6 +1916,289 @@ export default function App() {
     state.chatBusy,
   ]);
 
+  const clearComposerAfterReceipt = useCallback(() => {
+    dirtyDraftKeyRef.current = null;
+    setComposerDraft("");
+    setDraftAttachments([]);
+    setDraftContexts([]);
+    setDraftCapacityError(null);
+    setExportedDraft(null);
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+  }, []);
+
+  const submitRecoveryPrompt = useCallback(
+    async (
+      text: string,
+      queued: boolean,
+    ): Promise<"admitted" | "delivery_unknown" | "failed" | null> => {
+      const trimmed = text.trim();
+      if (!trimmed || !hasReadyConnection || !effectiveScope) return null;
+      let targetSessionId = state.activeSessionId;
+      if (!targetSessionId) {
+        const created = await handleCreateSession(activeNewDraftId ?? undefined);
+        targetSessionId = created?.sessionId ?? null;
+      }
+      if (!targetSessionId) return "failed";
+      const targetScope: BridgeScope = {
+        connectionId: effectiveScope.connectionId,
+        profileId: effectiveScope.profileId ?? "default",
+        sessionId: targetSessionId,
+      };
+      dispatch({ type: "SET_STOP_ERROR", message: null });
+      setRecoveryBusy(true);
+      try {
+        const res = await host.request<{
+          status?: "admitted" | "delivery_unknown";
+          accepted?: boolean;
+          admitted?: boolean;
+          deliveryUnknown?: boolean;
+          receipt?: string;
+          receiptStatus?: string;
+        }>(
+          queued ? "prompts.queue" : "prompts.send",
+          {
+            sessionId: targetSessionId,
+            text: trimmed,
+            ...(queued ? { queued: true } : {}),
+          },
+          targetScope,
+        );
+        if (!res.ok) {
+          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          return "failed";
+        }
+        const receipt = res.value.receipt ?? res.value.receiptStatus;
+        const unknown = res.value.deliveryUnknown || receipt === "delivery_unknown";
+        if (unknown) {
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy("turn.queue.deliveryUnknownTitle"),
+          });
+          return "delivery_unknown";
+        }
+        const admitted =
+          res.value.status === "admitted" ||
+          res.value.admitted === true ||
+          receipt === "admitted";
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy(queued ? "turn.queue.queuedNotice" : "chat.sendAccepted"),
+        });
+        return admitted || !queued ? "admitted" : "failed";
+      } finally {
+        setRecoveryBusy(false);
+      }
+    },
+    [
+      activeNewDraftId,
+      effectiveScope,
+      handleCreateSession,
+      hasReadyConnection,
+      state.activeSessionId,
+    ],
+  );
+
+  const handleQueuePrompt = useCallback(async () => {
+    const result = await submitRecoveryPrompt(composerDraft, true);
+    if (result === "admitted") {
+      clearComposerAfterReceipt();
+    }
+  }, [clearComposerAfterReceipt, composerDraft, submitRecoveryPrompt]);
+
+  const handleCheckQueueReceipt = useCallback(
+    async (submissionId: string) => {
+      if (!effectiveScope || !state.activeSessionId) return;
+      setRecoveryBusy(true);
+      try {
+        const res = await host.request<{ found: boolean; canRetrySameSubmission: boolean }>(
+          "prompts.checkQueueReceipt",
+          { sessionId: state.activeSessionId, submissionId },
+          { ...effectiveScope, sessionId: state.activeSessionId },
+        );
+        if (!res.ok) {
+          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          return;
+        }
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy(
+            res.value.found
+              ? "turn.queue.receiptAdmittedNotice"
+              : "turn.queue.receiptMissingNotice",
+          ),
+        });
+      } finally {
+        setRecoveryBusy(false);
+      }
+    },
+    [effectiveScope, state.activeSessionId],
+  );
+
+  const handleRetryQueue = useCallback(
+    async (submissionId: string) => {
+      if (!effectiveScope || !state.activeSessionId) return;
+      setRecoveryBusy(true);
+      try {
+        const res = await host.request<{ status?: string }>(
+          "prompts.retryQueue",
+          { sessionId: state.activeSessionId, submissionId },
+          { ...effectiveScope, sessionId: state.activeSessionId },
+        );
+        if (!res.ok) {
+          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          return;
+        }
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy("turn.queue.retriedNotice"),
+        });
+      } finally {
+        setRecoveryBusy(false);
+      }
+    },
+    [effectiveScope, state.activeSessionId],
+  );
+
+  const handleCancelQueued = useCallback(
+    async (admissionId: string) => {
+      if (!effectiveScope || !state.activeSessionId) return;
+      setRecoveryBusy(true);
+      try {
+        const res = await host.request<{ outcome?: string }>(
+          "prompts.cancelQueued",
+          { sessionId: state.activeSessionId, admissionId },
+          { ...effectiveScope, sessionId: state.activeSessionId },
+        );
+        if (!res.ok) {
+          dispatch({ type: "SET_STOP_ERROR", message: getCopy("turn.queue.cancelFailed") });
+          return;
+        }
+        const outcome = res.value.outcome ?? "cancel_unknown";
+        const key =
+          outcome === "cancelled" ||
+          outcome === "stopped" ||
+          outcome === "already_started" ||
+          outcome === "cancel_unknown"
+            ? (`turn.queue.cancelOutcome.${outcome}` as CopyKey)
+            : "turn.queue.cancelFailed";
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy(key),
+        });
+      } finally {
+        setRecoveryBusy(false);
+      }
+    },
+    [effectiveScope, state.activeSessionId],
+  );
+
+  const handleDiscardUnknownTurn = useCallback(async () => {
+    const unknown = activeTurnRecovery?.unknownTurn;
+    if (!unknown || !effectiveScope || !state.activeSessionId) return;
+    setRecoveryBusy(true);
+    try {
+      const res = await host.request<{ resolved: boolean }>(
+        "prompts.resolveUnknown",
+        {
+          sessionId: state.activeSessionId,
+          admissionId: unknown.admissionId,
+          executionGeneration: unknown.executionGeneration,
+        },
+        { ...effectiveScope, sessionId: state.activeSessionId },
+      );
+      if (!res.ok) {
+        dispatch({ type: "SET_STOP_ERROR", message: getCopy("turn.unknown.discardFailed") });
+        return;
+      }
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy("turn.unknown.discardedNotice"),
+          eventId: `unknown-discarded:${unknown.admissionId}:${unknown.executionGeneration}`,
+        });
+    } finally {
+      setRecoveryBusy(false);
+    }
+  }, [activeTurnRecovery?.unknownTurn, effectiveScope, state.activeSessionId]);
+
+  const handleSteerTurn = useCallback(
+    async (text: string) => {
+      if (
+        !text.trim() ||
+        !effectiveScope ||
+        !state.activeSessionId ||
+        !state.transcript?.activeTurnId
+      ) {
+        return;
+      }
+      setRecoveryBusy(true);
+      try {
+        const res = await host.request<PromptSteerResult>(
+          "prompts.steer",
+          {
+            sessionId: state.activeSessionId,
+            turnId: state.transcript.activeTurnId,
+            ...(typeof state.transcript.executionGeneration === "number"
+              ? { executionGeneration: state.transcript.executionGeneration }
+              : {}),
+            text: text.trim(),
+          },
+          { ...effectiveScope, sessionId: state.activeSessionId },
+        );
+        if (!res.ok) {
+          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          return;
+        }
+        if (res.value.steered) {
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy("turn.steer.successNotice"),
+          });
+        }
+      } finally {
+        setRecoveryBusy(false);
+      }
+    },
+    [
+      effectiveScope,
+      state.activeSessionId,
+      state.transcript?.activeTurnId,
+      state.transcript?.executionGeneration,
+    ],
+  );
+
+  const handleSteerFallbackNewTurn = useCallback(
+    async (text: string) => {
+      const result = await submitRecoveryPrompt(text, false);
+      if (result === "admitted" && effectiveScope && state.activeSessionId) {
+        await host.request(
+          "prompts.dismissSteerFallback",
+          { sessionId: state.activeSessionId },
+          { ...effectiveScope, sessionId: state.activeSessionId },
+        );
+      }
+    },
+    [effectiveScope, state.activeSessionId, submitRecoveryPrompt],
+  );
+
+  const handleSteerFallbackQueue = useCallback(
+    (text: string) => {
+      void submitRecoveryPrompt(text, true);
+    },
+    [submitRecoveryPrompt],
+  );
+
+  const handleDismissSteerFallback = useCallback(async () => {
+    if (!effectiveScope || !state.activeSessionId) return;
+    await host.request(
+      "prompts.dismissSteerFallback",
+      { sessionId: state.activeSessionId },
+      { ...effectiveScope, sessionId: state.activeSessionId },
+    );
+  }, [effectiveScope, state.activeSessionId]);
+
   const handleStopTurn = useCallback(async () => {
     if (!effectiveScope || !state.activeSessionId || !state.transcript?.activeTurnId) return;
     const targetScope: BridgeScope = {
@@ -1830,38 +2207,66 @@ export default function App() {
       sessionId: state.activeSessionId,
     };
     dispatch({ type: "SET_STOP_ERROR", message: null });
-    const res = await host.request(
+    const res = await host.request<{ stopped?: boolean; status?: string }>(
       "prompts.stop",
       {
         sessionId: state.activeSessionId,
         turnId: state.transcript.activeTurnId,
+        ...(typeof state.transcript.executionGeneration === "number"
+          ? { executionGeneration: state.transcript.executionGeneration }
+          : {}),
       },
       targetScope,
     );
     if (!res.ok) {
       dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.stopFailed") });
+    } else if (res.value.status === "cancel_outcome_unknown") {
+      dispatch({
+        type: "ANNOUNCE",
+        message: getCopy("turn.stop.cancelOutcomeUnknownBody"),
+      });
     }
-  }, [effectiveScope, state.activeSessionId, state.transcript?.activeTurnId]);
+  }, [
+    effectiveScope,
+    state.activeSessionId,
+    state.transcript?.activeTurnId,
+    state.transcript?.executionGeneration,
+  ]);
 
   const handleRespondApproval = useCallback(
     async (approval: ApprovalView, choice: ApprovalChoice) => {
+      if (approvalInFlightKeysRef.current.has(approval.approvalKey)) return;
+      approvalInFlightKeysRef.current.add(approval.approvalKey);
       setCancelledApprovalKey((prev) => (prev === approval.approvalKey ? null : prev));
-      const res = await host.request<ApprovalRespondResult>("approvals.respond", {
-        approvalKey: approval.approvalKey,
-        choice,
-      });
-      if (!res.ok) {
-        dispatch({ type: "ANNOUNCE", message: res.error.message });
-        return;
-      }
-      if (res.value.status === "cancelled_pending") {
-        setCancelledApprovalKey(approval.approvalKey);
-        dispatch({ type: "ANNOUNCE", message: getCopy("approval.cancelledPendingNotice") });
-      } else if (res.value.approval) {
-        dispatch({
-          type: "ANNOUNCE",
-          message: getCopy(`approval.state.${res.value.approval.state}` as CopyKey),
+      try {
+        const res = await host.request<ApprovalRespondResult>("approvals.respond", {
+          approvalKey: approval.approvalKey,
+          choice,
         });
+        if (!res.ok) {
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy("approval.actionFailedNotice"),
+            eventId: `approval-error:${approval.approvalKey}:${choice}`,
+          });
+          return;
+        }
+        if (res.value.status === "cancelled_pending") {
+          setCancelledApprovalKey(approval.approvalKey);
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy("approval.cancelledPendingNotice"),
+            eventId: `approval-cancelled:${approval.approvalKey}`,
+          });
+        } else if (res.value.approval) {
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy(`approval.state.${res.value.approval.state}` as CopyKey),
+            eventId: `approval:${approval.approvalKey}:${res.value.approval.state}`,
+          });
+        }
+      } finally {
+        approvalInFlightKeysRef.current.delete(approval.approvalKey);
       }
     },
     [],
@@ -1958,7 +2363,11 @@ export default function App() {
                 transcriptSyncRef.current.reset();
                 dispatch({ type: "CLEAR_TRANSCRIPT" });
               }
-              dispatch({ type: "ANNOUNCE", message: getCopy("scope.switchNotice") });
+              dispatch({
+                type: "ANNOUNCE",
+                message: getCopy("scope.switchNotice"),
+                eventId: `scope-focus:${target.connectionId}:${target.profileId ?? "default"}:${target.sessionId ?? ""}`,
+              });
             });
           break;
         }
@@ -1988,7 +2397,8 @@ export default function App() {
     if (res.ok) {
       dispatch({
         type: "ANNOUNCE",
-        message: `${session.title} · ${getCopy("nav.markReadAction")}`,
+        message: getCopy("nav.markReadNotice"),
+        eventId: `mark-read:${session.connectionId}:${session.profileId}:${session.sessionId}`,
       });
     }
   }, []);
@@ -2069,6 +2479,20 @@ export default function App() {
       }
     });
 
+    const unsubTurnRecovery = host.subscribe("turn.recovery", null, (event) => {
+      const accepted = turnRecoveryTrackerRef.current.accept(event);
+      if (accepted.status === "resync_required") {
+        turnRecoveryTrackerRef.current.reset();
+        return;
+      }
+      if (accepted.status === "applied") {
+        dispatch({
+          type: "APPLY_TURN_RECOVERY_SNAPSHOT",
+          snapshot: event.payload as TurnRecoveryTopicSnapshot,
+        });
+      }
+    });
+
     const unsubChatState = host.subscribe("chat.state", null, (event) => {
       const accepted = chatStateTrackerRef.current.accept(event);
       if (accepted.status === "resync_required") {
@@ -2118,6 +2542,7 @@ export default function App() {
       unsubRegistry();
       unsubCapabilities();
       unsubApproval();
+      unsubTurnRecovery();
       unsubCmd();
     };
   }, []);
@@ -2199,7 +2624,11 @@ export default function App() {
               { replace: true, resynced: true },
             );
             dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
-            dispatch({ type: "ANNOUNCE", message: getCopy("chat.resyncedNotice") });
+            dispatch({
+              type: "ANNOUNCE",
+              message: getCopy("chat.resyncedNotice"),
+              eventId: `transcript-resync:${targetScope.connectionId}:${targetScope.profileId}:${targetScope.sessionId}:${res.value.transcript.snapshotSeq ?? 0}`,
+            });
           });
       }
     });
@@ -2340,6 +2769,7 @@ export default function App() {
                 ? "extensions.skills.reloadedNotice"
                 : "extensions.mcp.reloadedNotice",
             ),
+            eventId: `extension-reload:${domain}:${res.value.generation}`,
           });
         }
       } finally {
@@ -2385,6 +2815,99 @@ export default function App() {
     },
     [effectiveScope],
   );
+
+  const openDomainInspect = useCallback((tab: DomainInspectTab) => {
+    setDomainInspectError(null);
+    dispatch({ type: "OPEN_DOMAIN_INSPECT", tab });
+  }, []);
+
+  const handleRefreshDomainInspect = useCallback(
+    async (tab: DomainInspectTab) => {
+      setDomainInspectBusy(true);
+      setDomainInspectError(null);
+      try {
+        const res = await host.request<CapabilitySnapshot>(
+          "capabilities.describe",
+          { domain: tab },
+          effectiveScope,
+        );
+        if (!res.ok) {
+          setDomainInspectError(res.error.message);
+          return;
+        }
+        dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+      } finally {
+        setDomainInspectBusy(false);
+      }
+    },
+    [effectiveScope],
+  );
+
+  const runCronMutation = useCallback(
+    async (
+      command: "cron.submit" | "cron.cancel" | "cron.recover",
+      payload: Record<string, unknown>,
+      noticeKey: CopyKey,
+    ) => {
+      setDomainInspectBusy(true);
+      setDomainInspectError(null);
+      try {
+        const res = await host.request<CronMutationResult>(command, payload, effectiveScope);
+        if (!res.ok) {
+          setDomainInspectError(res.error.message);
+          return;
+        }
+        const refreshed = await host.request<CapabilitySnapshot>(
+          "capabilities.describe",
+          {},
+          effectiveScope,
+        );
+        dispatch({
+          type: "APPLY_CAPABILITIES_SNAPSHOT",
+          snapshot: refreshed.ok
+            ? refreshed.value
+            : { ...state.capabilities, cron: res.value.cron },
+        });
+        dispatch({ type: "ANNOUNCE", message: getCopy(noticeKey) });
+      } finally {
+        setDomainInspectBusy(false);
+      }
+    },
+    [effectiveScope, state.capabilities],
+  );
+
+  const handleCronSubmit = useCallback(
+    (request: CronSubmitRequest) => {
+      void runCronMutation("cron.submit", { ...request }, "cron.submittedNotice");
+    },
+    [runCronMutation],
+  );
+
+  const handleCronCancel = useCallback(
+    (request: CronJobActionRequest) => {
+      void runCronMutation("cron.cancel", { jobId: request.jobId }, "cron.cancelledNotice");
+    },
+    [runCronMutation],
+  );
+
+  const handleCronRecover = useCallback(
+    (request: CronJobActionRequest) => {
+      void runCronMutation("cron.recover", { jobId: request.jobId }, "cron.recoveredNotice");
+    },
+    [runCronMutation],
+  );
+
+  const handleCopyDomainCli = useCallback(
+    (command: string) => {
+      void navigator.clipboard?.writeText?.(command);
+      dispatch({ type: "ANNOUNCE", message: getCopy("domainInspect.copiedCli") });
+    },
+    [],
+  );
+
+  const handleOpenDomainDocs = useCallback((url: string) => {
+    void host.request("links.openExternal", { url });
+  }, []);
 
   const capabilityHandlers = useMemo(
     () =>
@@ -2449,6 +2972,9 @@ export default function App() {
           dispatch({ type: "OPEN_SURFACE", surface: "scopePopover" });
         },
         probeDomain: handleProbeDomain,
+        openMemoryInspect: () => openDomainInspect("memory"),
+        openCronInspect: () => openDomainInspect("cron"),
+        openMessagingInspect: () => openDomainInspect("messaging"),
       }),
     [
       handleAppCommand,
@@ -2456,6 +2982,7 @@ export default function App() {
       handleProbeDomain,
       handleSelectSession,
       handleStopTurn,
+      openDomainInspect,
       scopedSessions,
       viewportMode,
     ],
@@ -2532,6 +3059,16 @@ export default function App() {
       setLocalBusy(false);
     }
   }, []);
+
+  const handleRepairLocalConnection = useCallback(() => {
+    const failureActions = state.localInspection?.failure?.actions ?? [];
+    const primary =
+      failureActions.find(
+        (action) =>
+          action === "choose_cli" || action === "retry" || action === "restart_gateway",
+      ) ?? "retry";
+    void handleLocalAction(primary);
+  }, [handleLocalAction, state.localInspection?.failure?.actions]);
 
   const handleAnnounce = useCallback((message: string) => {
     dispatch({ type: "ANNOUNCE", message });
@@ -2654,7 +3191,10 @@ export default function App() {
             </nav>
           )}
 
-          <main id="main-content" className="main-column">
+          <main
+            id="main-content"
+            className={`main-column${state.workspace.mode === "open" ? " has-workspace-open" : ""}`}
+          >
             <div className="route-strip">
               {viewportMode === "popover" && (
                 <button
@@ -2671,7 +3211,7 @@ export default function App() {
                 </button>
               )}
 
-              <div className="route-chain" aria-label="当前路由上下文">
+              <div className="route-chain" role="group" aria-label="当前路由上下文">
                 <span>{getCopy("route.you")}</span>
                 <span className="route-arrow" aria-hidden="true">
                   →
@@ -2906,6 +3446,13 @@ export default function App() {
                 scopeNewDrafts={scopeNewDrafts}
                 activeNewDraftId={activeNewDraftId}
                 stopError={state.stopError}
+                turnRecovery={activeTurnRecovery}
+                recoveryBusy={recoveryBusy}
+                cronHintText={cronHintText}
+                hasRecentSession={scopedSessions.length > 0}
+                canQueue={canQueuePrompt}
+                canSteer={canSteerPrompt}
+                canCancelQueue={canCancelQueuePrompt}
                 canCreateSession={canCreateSession}
                 composerRef={composerRef}
                 onDraftChange={handleDraftChange}
@@ -2917,26 +3464,29 @@ export default function App() {
                 onSelectNewDraft={handleSelectNewDraft}
                 onStartNewDraft={handleStartNewDraft}
                 onSendPrompt={() => void handleSendPrompt()}
+                onQueuePrompt={() => void handleQueuePrompt()}
                 onStopTurn={() => void handleStopTurn()}
-                onCreateSession={() => void handleCreateSession()}
                 onExportMissingSession={() => void handleExportMissingSession()}
                 onDismissMissingSession={() => void handleDismissMissingSession()}
-                onLocalAction={(action) => void handleLocalAction(action)}
                 onRespondApproval={(approval, choice) => void handleRespondApproval(approval, choice)}
                 onInspectApproval={handleInspectApproval}
                 onDismissOrphanedApproval={(approval) => void handleDismissOrphanedApproval(approval)}
-                onOpenSettings={() =>
-                  dispatch({ type: "OPEN_SURFACE", surface: "settings" })
+                onOpenCapabilities={() =>
+                  dispatch({ type: "OPEN_SURFACE", surface: "capabilities" })
                 }
-                onOpenPalette={() =>
-                  dispatch({ type: "OPEN_SURFACE", surface: "palette" })
-                }
-                onOpenShortcuts={() =>
-                  dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" })
-                }
-                onOpenRemoteEscape={() =>
-                  dispatch({ type: "OPEN_SURFACE", surface: "remoteEscape" })
-                }
+                onToggleWorkspace={() => dispatch({ type: "TOGGLE_WORKSPACE" })}
+                onContinueRecent={handleContinueRecentSession}
+                onRepairLocal={handleRepairLocalConnection}
+                onAddRemote={() => openSettingsForAdd("remote")}
+                onAddSsh={() => openSettingsForAdd("ssh")}
+                onDiscardUnknown={() => void handleDiscardUnknownTurn()}
+                onCancelQueued={(admissionId) => void handleCancelQueued(admissionId)}
+                onCheckQueueReceipt={(submissionId) => void handleCheckQueueReceipt(submissionId)}
+                onRetryQueue={(submissionId) => void handleRetryQueue(submissionId)}
+                onSteer={(text) => void handleSteerTurn(text)}
+                onSteerFallbackNewTurn={handleSteerFallbackNewTurn}
+                onSteerFallbackQueue={handleSteerFallbackQueue}
+                onDismissSteerFallback={() => void handleDismissSteerFallback()}
               />
             </div>
           </main>
@@ -3020,9 +3570,10 @@ export default function App() {
           <span>{getCopy("route.capabilitiesBadge")}</span>
         </footer>
 
-        <div className="sr-only" aria-live="polite" role="status">
-          {state.liveAnnouncement}
-        </div>
+      </div>
+
+      <div className="sr-only" aria-live="polite" aria-atomic="false" role="status">
+        {state.liveAnnouncement}
       </div>
 
       {/* Modal surfaces live outside the inert app shell */}
@@ -3073,6 +3624,8 @@ export default function App() {
             fleetConnections={state.connections}
             onSnapshotChange={setRegistrySnapshot}
             onAnnounce={handleAnnounce}
+            addRequest={settingsAddRequest}
+            onAddRequestConsumed={() => setSettingsAddRequest(null)}
           />
         </section>
 
@@ -3306,6 +3859,22 @@ export default function App() {
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "capabilities" })}
       />
 
+      <DomainInspectDrawer
+        open={state.surfaceStack.includes("domainInspect")}
+        tab={state.domainInspectTab}
+        snapshot={state.capabilities}
+        busy={domainInspectBusy}
+        error={domainInspectError}
+        onTabChange={(tab) => dispatch({ type: "SET_DOMAIN_INSPECT_TAB", tab })}
+        onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "domainInspect" })}
+        onRefresh={handleRefreshDomainInspect}
+        onSubmitCron={handleCronSubmit}
+        onCancelCron={handleCronCancel}
+        onRecoverCron={handleCronRecover}
+        onCopyText={handleCopyDomainCli}
+        onOpenDocs={handleOpenDomainDocs}
+      />
+
       <FocusDialog
         open={isExtensionsOpen}
         title={getCopy("extensions.title")}
@@ -3409,6 +3978,7 @@ export default function App() {
                         className={["palette-item", isCurrent && "is-active-scope"]
                           .filter(Boolean)
                           .join(" ")}
+                        aria-current={isCurrent ? "true" : undefined}
                         onClick={() => {
                           void host
                             .request<{ fleet?: FleetSnapshot } & Partial<FleetSnapshot>>(
@@ -3433,6 +4003,7 @@ export default function App() {
                                 dispatch({
                                   type: "ANNOUNCE",
                                   message: getCopy("scope.switchNotice"),
+                                  eventId: `scope-switch:${conn.connectionId}:${state.activeScope?.profileId ?? "default"}`,
                                 });
                               }
                             });
@@ -3441,11 +4012,15 @@ export default function App() {
                       >
                         <span>
                           <strong>{conn.label}</strong>
-                          <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
+                          <span style={{ display: "block", fontSize: "0.88462rem", color: "var(--muted)" }}>
                             {conn.kind} · {conn.originDisplay}
                           </span>
                         </span>
-                        {isCurrent && <span className="gateway-badge is-primary">Active</span>}
+                        {isCurrent && (
+                          <span className="gateway-badge is-primary">
+                            {getCopy("scope.activeBadge")}
+                          </span>
+                        )}
                       </button>
                     );
                   })}
@@ -3475,11 +4050,12 @@ export default function App() {
                         className={["palette-item", isCurrent && "is-active-scope"]
                           .filter(Boolean)
                           .join(" ")}
+                        aria-current={isCurrent ? "true" : undefined}
                         onClick={() => void handleSelectProfile(profile.profileId)}
                       >
                         <span>
                           <strong>{profile.displayName}</strong>
-                          <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
+                          <span style={{ display: "block", fontSize: "0.88462rem", color: "var(--muted)" }}>
                             @{profile.handle}
                           </span>
                         </span>
@@ -3489,7 +4065,9 @@ export default function App() {
                               {getCopy("scope.profileDefaultBadge")}
                             </span>
                           )}
-                          {profile.pinned && <span className="gateway-badge">Pinned</span>}
+                          {profile.pinned && (
+                            <span className="gateway-badge">{getCopy("nav.pinnedBadge")}</span>
+                          )}
                           {(profile.isException ||
                             profile.actual === "blocked" ||
                             profile.degraded) && (
@@ -3500,7 +4078,11 @@ export default function App() {
                             </span>
                           )}
                           <span className="gateway-badge">{getCopy(healthCopyKey)}</span>
-                          {isCurrent && <span className="gateway-badge is-primary">Active</span>}
+                          {isCurrent && (
+                            <span className="gateway-badge is-primary">
+                              {getCopy("scope.activeBadge")}
+                            </span>
+                          )}
                         </span>
                       </button>
                     );

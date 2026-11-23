@@ -30,6 +30,8 @@ import type {
   LocalTypedFailure,
   ProfileSummary,
   PromptEventPayload,
+  PromptSteerResult,
+  QueuedAdmissionState,
   RegistryDiff,
   RegistrySnapshotView,
   SafeBackgroundNotification,
@@ -41,9 +43,11 @@ import type {
   ToolExecutionRow,
   TranscriptMessage,
   TranscriptPatchPayload,
+  TurnRecoveryTopicSnapshot,
   WorkspaceAgentItem,
   WorkspaceCheckpointItem,
 } from "@hermes/contracts";
+import { ERROR_CODES } from "@hermes/contracts";
 import {
   ApprovalAndRecoveryCoordinator,
   aggregateConnectionHealth,
@@ -72,6 +76,7 @@ import {
   resolveExternalAttribution,
   resolveMethodWithAlias,
   toSupportedChatActions,
+  TurnRecoveryCoordinator,
   validateCheckpointRestoreBinding,
   validateRemoteEndpointUrl,
   type ApprovalIngestInput,
@@ -80,6 +85,8 @@ import {
   type GatewayApprovalRespondOutcome,
   type GatewayApprovalRespondPayload,
   type HostCommandHandler,
+  type RawGatewayQueueItem,
+  type RawGatewayUnknownTurn,
 } from "@hermes/domain";
 import type { ChatSessionStateStore } from "./chatSessionStateStore";
 import {
@@ -369,6 +376,7 @@ export class ConnectionSupervisor {
     request: ApprovalHighRiskSheetRequest,
   ) => Promise<boolean>;
   private readonly approvalCoordinator: ApprovalAndRecoveryCoordinator;
+  private readonly turnCoordinator: TurnRecoveryCoordinator;
   private readonly maxConcurrentDials: number;
 
   private revision = 1;
@@ -427,6 +435,13 @@ export class ConnectionSupervisor {
         this.syncApprovalNeedsInputToSessions(snap);
         this.scheduleApprovalExpiryCheck();
         this.emitTopic("approval", null, "patch", snap);
+      },
+    });
+    this.turnCoordinator = new TurnRecoveryCoordinator({
+      now: this.now,
+      onChange: (snap) => {
+        this.syncTurnRecoveryToSessions(snap);
+        this.emitTopic("turn.recovery", null, "patch", snap);
       },
     });
     this.localHealth = {
@@ -1416,6 +1431,7 @@ export class ConnectionSupervisor {
     }
     this.approvalCoordinator.onScopeRemoved({ connectionId });
     const createdOrphans = this.chatSessionStateStore?.orphanDraftsForRemovedConnection(connectionId) ?? [];
+    this.turnCoordinator.onConnectionOffline(connectionId);
     if (this.activeScope?.connectionId === connectionId) {
       const localProfiles = this.profilesByConnection.get("local") ?? [];
       if (this.localHealth.actual === "ready" || localProfiles.length > 0) {
@@ -1610,6 +1626,10 @@ export class ConnectionSupervisor {
         connectionId,
         entry.transportMode === "shared-host-scope" ? undefined : entry.defaultProfileId,
       );
+      this.turnCoordinator.onConnectionOffline(
+        connectionId,
+        entry.transportMode === "shared-host-scope" ? undefined : entry.defaultProfileId,
+      );
       if (connectionId === "local" || this.activeScope?.connectionId === connectionId) {
         this.capabilityRegistry.invalidate({ reason: "transport_closed" });
         this.emitCapabilities();
@@ -1619,6 +1639,7 @@ export class ConnectionSupervisor {
       !this.getTransport(connectionId, entry.defaultProfileId)
     ) {
       this.approvalCoordinator.onConnectionOffline(connectionId, entry.defaultProfileId);
+      this.turnCoordinator.onConnectionOffline(connectionId, entry.defaultProfileId);
     }
 
     if (entry.kind === "local" && entry.dial) {
@@ -2785,10 +2806,17 @@ export class ConnectionSupervisor {
 
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
+    const ownerProfileFilter =
+      entry.transportMode === "shared-host-scope" ? undefined : dial.profileId;
     this.approvalCoordinator.onOwnerGenerationChanged(
       connectionId,
       entry.ownerGeneration,
-      entry.transportMode === "shared-host-scope" ? undefined : dial.profileId,
+      ownerProfileFilter,
+    );
+    this.turnCoordinator.onOwnerGenerationChanged(
+      connectionId,
+      entry.ownerGeneration,
+      ownerProfileFilter,
     );
     await this.rehydrateApprovalsOnConnect(entry, dial.profileId);
 
@@ -3435,13 +3463,61 @@ export class ConnectionSupervisor {
         ? String(rawResult.active_turn_id ?? rawResult.activeTurnId)
         : null;
 
+    const gwExecGen =
+      rawResult && typeof (rawResult.execution_generation ?? rawResult.executionGeneration) === "number"
+        ? Number(rawResult.execution_generation ?? rawResult.executionGeneration)
+        : undefined;
+    const rawUnknownTurns = rawResult
+      ? ((rawResult.unknown_turns ?? rawResult.unknownTurns) as RawGatewayUnknownTurn[] | undefined)
+      : undefined;
+    const rawQueue = rawResult
+      ? ((rawResult.queued_admissions ?? rawResult.queuedAdmissions ?? rawResult.queue) as
+          | RawGatewayQueueItem[]
+          | undefined)
+      : undefined;
+    const rawLastOutcome = rawResult
+      ? ((rawResult.last_turn_outcome ?? rawResult.lastTurnOutcome) as
+          | "completed"
+          | "stopped"
+          | "interrupted"
+          | "error"
+          | null
+          | undefined)
+      : undefined;
+
+    const resolvedActiveTurnId = options?.replace ? gwTurnId : base.activeTurnId ?? gwTurnId;
+    const recoveryView = rawResult
+      ? this.turnCoordinator.reconcileFromResume({
+          connectionId,
+          profileId,
+          sessionId,
+          ownerGeneration: entry.ownerGeneration,
+          activeTurnId: resolvedActiveTurnId,
+          ...(gwExecGen !== undefined ? { executionGeneration: gwExecGen } : {}),
+          ...(Array.isArray(rawUnknownTurns) ? { unknownTurns: rawUnknownTurns } : {}),
+          ...(Array.isArray(rawQueue) ? { queuedAdmissions: rawQueue } : {}),
+          ...(rawLastOutcome !== undefined ? { lastTurnOutcome: rawLastOutcome } : {}),
+        })
+      : this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
+
+    const effectiveActiveTurnId = recoveryView?.unknownTurn
+      ? null
+      : recoveryView?.activeTurnId ?? resolvedActiveTurnId;
+
     const merged: SessionTranscriptSnapshot = {
       ...base,
       connectionId,
       profileId,
       sessionId,
       messages: finalMessages,
-      activeTurnId: options?.replace ? gwTurnId : base.activeTurnId ?? gwTurnId,
+      activeTurnId: effectiveActiveTurnId,
+      turnStopping: recoveryView ? recoveryView.stopState === "stopping" : base.turnStopping,
+      ...(recoveryView
+        ? {
+            executionGeneration: recoveryView.executionGeneration,
+            stopState: recoveryView.stopState,
+          }
+        : {}),
       chatAvailable: entry.supportedActions.promptSubmit,
       ...(entry.supportedActions.promptSubmit
         ? {}
@@ -3450,6 +3526,18 @@ export class ConnectionSupervisor {
       snapshotSeq: 0,
       ...(options?.resynced ? { resynced: true } : {}),
     };
+
+    if (recoveryView?.unknownTurn) {
+      this.backgroundJournal.setPinnedFlags(
+        makeSessionJournalKey(connectionId, profileId, sessionId),
+        { runningTurn: false },
+      );
+      this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+        ...prev,
+        activeTurnId: null,
+        status: "idle",
+      }));
+    }
 
     this.transcripts.set(key, merged);
     this.chatSessionStateStore?.recordTranscriptSnapshot(merged);
@@ -3577,6 +3665,21 @@ export class ConnectionSupervisor {
       return;
     }
 
+    if (domain === "memory") {
+      await this.probeMemoryDomain(entry, profileId);
+      return;
+    }
+
+    if (domain === "messaging") {
+      await this.probeMessagingDomain(entry, profileId);
+      return;
+    }
+
+    if (domain === "cron") {
+      await this.probeCronDomain(entry, profileId);
+      return;
+    }
+
     const probeMethod = resolveExplicitMethodAlias(meta.probeMethod) ?? meta.probeMethod;
     const methodToCheck = this.capabilityRegistry.getMethodTier(meta.probeMethod) !== "unknown"
       ? meta.probeMethod
@@ -3653,6 +3756,249 @@ export class ConnectionSupervisor {
           expectedOwnerGeneration: entry.ownerGeneration,
           expectedAuthorityEpoch: entry.authorityEpoch,
           expectedGeneration: startGeneration,
+        });
+      }
+    }
+  }
+
+  private async probeMemoryDomain(
+    entry: GatewayTransportEntry,
+    profileId: string,
+  ): Promise<void> {
+    const currentSnap = this.capabilityRegistry.getSnapshot();
+    const baseKey = {
+      expectedOwnerGeneration: entry.ownerGeneration,
+      expectedAuthorityEpoch: entry.authorityEpoch,
+      expectedGeneration: currentSnap.generation,
+    };
+    if (this.capabilityRegistry.isMethodRefused("session.context_breakdown")) {
+      this.capabilityRegistry.applyMemoryState({
+        ...baseKey,
+        outcome: "refused",
+      });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "memory",
+        method: "session.context_breakdown",
+        outcome: "refused",
+      });
+      return;
+    }
+
+    let primaryMissing = false;
+    try {
+      const raw = await entry.client.call<unknown>(
+        "session.context_breakdown",
+        { profile_id: profileId },
+        { timeoutMs: this.probeTimeoutMs },
+      );
+      this.capabilityRegistry.applyMemoryState({
+        ...baseKey,
+        outcome: "ok",
+        sourceMethod: "session.context_breakdown",
+        rawPayload: raw,
+      });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "memory",
+        method: "session.context_breakdown",
+        outcome: "ok",
+      });
+      return;
+    } catch (err) {
+      if (!isJsonRpcMethodNotFound(err)) {
+        this.capabilityRegistry.applyMemoryState({
+          ...baseKey,
+          outcome: err instanceof GatewayTransportError && err.code === "timeout" ? "older" : "error",
+          errorCode: err instanceof GatewayTransportError && err.code === "timeout" ? "RPC_TIMEOUT" : "MEMORY_FETCH_FAILED",
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "memory",
+          method: "session.context_breakdown",
+          outcome: "timeout",
+        });
+        return;
+      }
+      primaryMissing = true;
+    }
+
+    if (primaryMissing) {
+      this.capabilityRegistry.markMethodNotFound({
+        method: "session.context_breakdown",
+        expectedOwnerGeneration: entry.ownerGeneration,
+        expectedAuthorityEpoch: entry.authorityEpoch,
+      });
+    }
+
+    if (this.capabilityRegistry.isMethodRefused("session.info")) {
+      this.capabilityRegistry.applyMemoryState({ ...baseKey, outcome: "refused" });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "memory",
+        method: "session.info",
+        outcome: "refused",
+      });
+      return;
+    }
+    try {
+      const raw = await entry.client.call<unknown>(
+        "session.info",
+        { profile_id: profileId },
+        { timeoutMs: this.probeTimeoutMs },
+      );
+      this.capabilityRegistry.applyMemoryState({
+        ...baseKey,
+        outcome: "ok",
+        sourceMethod: "session.info",
+        rawPayload: raw,
+      });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "memory",
+        method: "session.info",
+        outcome: "ok",
+      });
+    } catch (err) {
+      if (isJsonRpcMethodNotFound(err)) {
+        this.capabilityRegistry.applyMemoryState({ ...baseKey, outcome: "method_not_found" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "memory",
+          method: "session.info",
+          outcome: "method_not_found",
+        });
+      } else {
+        this.capabilityRegistry.applyMemoryState({
+          ...baseKey,
+          outcome: err instanceof GatewayTransportError && err.code === "timeout" ? "older" : "error",
+          errorCode: err instanceof GatewayTransportError && err.code === "timeout" ? "RPC_TIMEOUT" : "MEMORY_FETCH_FAILED",
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "memory",
+          method: "session.info",
+          outcome: "timeout",
+        });
+      }
+    }
+  }
+
+  private async probeMessagingDomain(
+    entry: GatewayTransportEntry,
+    profileId: string,
+  ): Promise<void> {
+    const currentSnap = this.capabilityRegistry.getSnapshot();
+    const baseKey = {
+      expectedOwnerGeneration: entry.ownerGeneration,
+      expectedAuthorityEpoch: entry.authorityEpoch,
+      expectedGeneration: currentSnap.generation,
+    };
+    if (this.capabilityRegistry.isMethodRefused("messaging.status")) {
+      this.capabilityRegistry.applyMessagingState({ ...baseKey, outcome: "refused" });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "messaging",
+        method: "messaging.status",
+        outcome: "refused",
+      });
+      return;
+    }
+    try {
+      const raw = await entry.client.call<unknown>(
+        "messaging.status",
+        { profile_id: profileId },
+        { timeoutMs: this.probeTimeoutMs },
+      );
+      this.capabilityRegistry.applyMessagingState({
+        ...baseKey,
+        outcome: "ok",
+        rawPayload: raw,
+      });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "messaging",
+        method: "messaging.status",
+        outcome: "ok",
+      });
+    } catch (err) {
+      if (isJsonRpcMethodNotFound(err)) {
+        this.capabilityRegistry.applyMessagingState({ ...baseKey, outcome: "method_not_found" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "messaging",
+          method: "messaging.status",
+          outcome: "method_not_found",
+        });
+      } else {
+        this.capabilityRegistry.applyMessagingState({
+          ...baseKey,
+          outcome: err instanceof GatewayTransportError && err.code === "timeout" ? "older" : "error",
+          errorCode: err instanceof GatewayTransportError && err.code === "timeout" ? "RPC_TIMEOUT" : "MESSAGING_FETCH_FAILED",
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "messaging",
+          method: "messaging.status",
+          outcome: "timeout",
+        });
+      }
+    }
+  }
+
+  private async probeCronDomain(
+    entry: GatewayTransportEntry,
+    profileId: string,
+  ): Promise<void> {
+    const currentSnap = this.capabilityRegistry.getSnapshot();
+    const baseKey = {
+      expectedOwnerGeneration: entry.ownerGeneration,
+      expectedAuthorityEpoch: entry.authorityEpoch,
+      expectedGeneration: currentSnap.generation,
+    };
+    if (this.capabilityRegistry.isMethodRefused("cron.status")) {
+      this.capabilityRegistry.applyCronState({ ...baseKey, outcome: "refused" });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "cron",
+        method: "cron.status",
+        outcome: "refused",
+      });
+      return;
+    }
+    try {
+      const raw = await entry.client.call<unknown>(
+        "cron.status",
+        { profile_id: profileId },
+        { timeoutMs: this.probeTimeoutMs },
+      );
+      this.capabilityRegistry.applyCronState({ ...baseKey, outcome: "ok", rawPayload: raw });
+      this.capabilityRegistry.applyProbeOutcome({
+        ...baseKey,
+        domain: "cron",
+        method: "cron.status",
+        outcome: "ok",
+      });
+    } catch (err) {
+      if (isJsonRpcMethodNotFound(err)) {
+        this.capabilityRegistry.applyCronState({ ...baseKey, outcome: "method_not_found" });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "cron",
+          method: "cron.status",
+          outcome: "method_not_found",
+        });
+      } else {
+        this.capabilityRegistry.applyCronState({
+          ...baseKey,
+          outcome: err instanceof GatewayTransportError && err.code === "timeout" ? "older" : "error",
+          errorCode: err instanceof GatewayTransportError && err.code === "timeout" ? "RPC_TIMEOUT" : "CRON_FETCH_FAILED",
+        });
+        this.capabilityRegistry.applyProbeOutcome({
+          ...baseKey,
+          domain: "cron",
+          method: "cron.status",
+          outcome: "timeout",
         });
       }
     }
@@ -4161,8 +4507,54 @@ export class ConnectionSupervisor {
       return;
     }
 
-    if (method === "admission.queued" || method === "session.queued") {
+    if (
+      method === "admission.queued" ||
+      method === "session.queued" ||
+      method === "queue.snapshot" ||
+      method === "queue.updated" ||
+      method === "admission.updated"
+    ) {
       if (sessionId) {
+        const rawList = params.queued_admissions ?? params.queuedAdmissions ?? params.queue;
+        if (Array.isArray(rawList)) {
+          this.turnCoordinator.applyGatewayQueueSnapshot({
+            connectionId,
+            profileId: resolvedProfileId,
+            sessionId,
+            queuedAdmissions: rawList as RawGatewayQueueItem[],
+          });
+        } else {
+          const admissionId = asString(params.admission_id ?? params.admissionId).trim();
+          if (admissionId) {
+            const rawState = asString(params.state ?? params.status, "queued");
+            const mappedState: QueuedAdmissionState =
+              rawState === "cancelling" ||
+              rawState === "cancel_unknown" ||
+              rawState === "cancelled" ||
+              rawState === "stopped" ||
+              rawState === "already_started" ||
+              rawState === "completed" ||
+              rawState === "error" ||
+              rawState === "interrupted"
+                ? rawState
+                : "queued";
+            const execGen =
+              typeof (params.execution_generation ?? params.executionGeneration) === "number"
+                ? Number(params.execution_generation ?? params.executionGeneration)
+                : undefined;
+            this.turnCoordinator.applyAdmissionEvent({
+              connectionId,
+              profileId: resolvedProfileId,
+              sessionId,
+              admissionId,
+              submissionId: asString(params.submission_id ?? params.submissionId).trim() || undefined,
+              state: mappedState,
+              turnId: asString(params.turn_id ?? params.turnId).trim() || undefined,
+              executionGeneration: execGen,
+              reason: asString(params.reason ?? params.message).trim() || undefined,
+            });
+          }
+        }
         const queued = params.queued !== false;
         const jKey = makeSessionJournalKey(connectionId, resolvedProfileId, sessionId);
         this.backgroundJournal.setPinnedFlags(jKey, { queuedAdmission: queued });
@@ -4171,6 +4563,61 @@ export class ConnectionSupervisor {
           queuedAdmission: queued,
           updatedAt: new Date().toISOString(),
         }));
+      }
+      return;
+    }
+
+    if (method === "turn.unknown" || method === "prompt.unknown") {
+      if (sessionId) {
+        const admissionId = asString(params.admission_id ?? params.admissionId, `adm-${Date.now()}`);
+        const execGen =
+          typeof (params.execution_generation ?? params.executionGeneration) === "number"
+            ? Number(params.execution_generation ?? params.executionGeneration)
+            : 1;
+        const turnId = asString(params.turn_id ?? params.turnId).trim() || undefined;
+        const recovery = this.turnCoordinator.ingestUnknownTurn({
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+          admissionId,
+          executionGeneration: execGen,
+          ownerGeneration: entry.ownerGeneration,
+          turnId,
+          originalInput:
+            typeof params.original_input === "string"
+              ? params.original_input
+              : typeof params.originalInput === "string"
+                ? params.originalInput
+                : typeof params.text === "string"
+                  ? params.text
+                  : undefined,
+          lostReason: asString(params.lost_reason ?? params.lostReason ?? params.reason) || undefined,
+          message: asString(params.message) || undefined,
+        });
+        const jKey = makeSessionJournalKey(connectionId, resolvedProfileId, sessionId);
+        this.backgroundJournal.setPinnedFlags(jKey, { runningTurn: false });
+        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
+          type: "turn_state",
+          sessionId,
+          activeTurnId: null,
+          turnStopping: false,
+          executionGeneration: recovery.executionGeneration,
+          stopState: recovery.stopState,
+        });
+        this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+          ...prev,
+          activeTurnId: null,
+          status: "idle",
+          updatedAt: new Date().toISOString(),
+        }));
+        this.emitTopic("prompt", { connectionId, profileId: resolvedProfileId, sessionId }, "patch", {
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+          turnId: turnId ?? "",
+          executionGeneration: execGen,
+          kind: "unknown_turn",
+        } satisfies PromptEventPayload);
       }
       return;
     }
@@ -4240,6 +4687,30 @@ export class ConnectionSupervisor {
 
     if (method === "prompt.started" || method === "turn.started") {
       const turnId = asString(params.turn_id ?? params.turnId, `turn-${Date.now()}`);
+      const execGen =
+        typeof (params.execution_generation ?? params.executionGeneration) === "number"
+          ? Number(params.execution_generation ?? params.executionGeneration)
+          : undefined;
+      const recovery = this.turnCoordinator.noteTurnStarted({
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+        turnId,
+        ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+        ownerGeneration: entry.ownerGeneration,
+      });
+      const admId = asString(params.admission_id ?? params.admissionId).trim();
+      if (admId) {
+        this.turnCoordinator.applyAdmissionEvent({
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+          admissionId: admId,
+          state: "already_started",
+          turnId,
+          executionGeneration: recovery.executionGeneration,
+        });
+      }
       this.backgroundJournal.setPinnedFlags(jKey, { runningTurn: true });
       if (isActive) {
         this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
@@ -4247,6 +4718,8 @@ export class ConnectionSupervisor {
           sessionId,
           activeTurnId: turnId,
           turnStopping: false,
+          executionGeneration: recovery.executionGeneration,
+          stopState: "idle",
         });
       }
       this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
@@ -4255,6 +4728,31 @@ export class ConnectionSupervisor {
         status: "running",
         updatedAt: new Date().toISOString(),
       }));
+      return;
+    }
+
+    if (method === "prompt.stopping" || method === "turn.stopping") {
+      const turnId = asString(params.turn_id ?? params.turnId, "");
+      const execGen =
+        typeof (params.execution_generation ?? params.executionGeneration) === "number"
+          ? Number(params.execution_generation ?? params.executionGeneration)
+          : undefined;
+      const existing = this.turnCoordinator.getSessionView({
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+      });
+      const effectiveTurnId = turnId || existing?.activeTurnId || "";
+      if (effectiveTurnId && isActive) {
+        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
+          type: "turn_state",
+          sessionId,
+          activeTurnId: effectiveTurnId,
+          turnStopping: true,
+          ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+          stopState: "stopping",
+        });
+      }
       return;
     }
 
@@ -4481,6 +4979,10 @@ export class ConnectionSupervisor {
       method === "prompt.error"
     ) {
       const turnId = asString(params.turn_id ?? params.turnId, "");
+      const execGen =
+        typeof (params.execution_generation ?? params.executionGeneration) === "number"
+          ? Number(params.execution_generation ?? params.executionGeneration)
+          : undefined;
       const messageId = asString(params.message_id ?? params.messageId) || undefined;
       const status: TranscriptMessage["status"] =
         method === "prompt.stopped"
@@ -4488,11 +4990,35 @@ export class ConnectionSupervisor {
           : method === "prompt.error"
             ? "error"
             : "complete";
+      const terminalOutcome =
+        method === "prompt.stopped" ? "stopped" : method === "prompt.error" ? "error" : "completed";
+      const recovery = this.turnCoordinator.noteTurnTerminal({
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+        ...(turnId ? { turnId } : {}),
+        ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+        outcome: terminalOutcome,
+      });
+      const admId = asString(params.admission_id ?? params.admissionId).trim();
+      if (admId) {
+        this.turnCoordinator.applyAdmissionEvent({
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+          admissionId: admId,
+          state: terminalOutcome,
+          ...(turnId ? { turnId } : {}),
+          executionGeneration: recovery.executionGeneration,
+        });
+      }
       const patch: TranscriptPatchPayload = {
         type: "turn_state",
         sessionId,
         activeTurnId: null,
         turnStopping: false,
+        executionGeneration: recovery.executionGeneration,
+        stopState: recovery.stopState,
         messageId,
         status,
       };
@@ -4652,6 +5178,15 @@ export class ConnectionSupervisor {
     rpcMethod?: string,
     profileId?: string,
   ): never {
+    if (!(err instanceof GatewayRpcError) && !(err instanceof GatewayTransportError)) {
+      const existingCode = (err as { code?: unknown } | null)?.code;
+      if (
+        typeof existingCode === "string" &&
+        (ERROR_CODES as readonly string[]).includes(existingCode)
+      ) {
+        throw err;
+      }
+    }
     if (isProfileUnavailableRpcError(err)) {
       const targetPid = profileId ?? entry.defaultProfileId;
       this.markProfileUnavailable(entry.connectionId, targetPid, err);
@@ -4822,6 +5357,15 @@ export class ConnectionSupervisor {
           revision: rev,
           payload: this.approvalCoordinator.snapshot(),
         });
+      } else if (topic === "turn.recovery") {
+        listener({
+          topic,
+          scope: null,
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: this.turnCoordinator.snapshot(),
+        });
       }
     });
 
@@ -4832,6 +5376,10 @@ export class ConnectionSupervisor {
 
   readonly handlers: Record<
     | "capabilities.describe"
+    | "cron.status"
+    | "cron.submit"
+    | "cron.cancel"
+    | "cron.recover"
     | "fleet.refresh"
     | "connections.retry"
     | "profiles.list"
@@ -4845,6 +5393,12 @@ export class ConnectionSupervisor {
     | "prompts.send"
     | "prompts.stop"
     | "prompts.steer"
+    | "prompts.resolveUnknown"
+    | "prompts.queue"
+    | "prompts.checkQueueReceipt"
+    | "prompts.retryQueue"
+    | "prompts.cancelQueued"
+    | "prompts.dismissSteerFallback"
     | "chatState.get"
     | "chatState.dismissRouteBanner"
     | "chatState.saveDraft"
@@ -4893,6 +5447,105 @@ export class ConnectionSupervisor {
         }
       }
       return this.capabilityRegistry.getSnapshot();
+    },
+
+    "cron.status": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const entry = this.requireTransport(connectionId, profileId);
+      await this.probeCronDomain(entry, profileId);
+      this.emitCapabilities();
+      return this.capabilityRegistry.getSnapshot().cron;
+    },
+
+    "cron.submit": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const entry = this.requireTransport(connectionId, profileId);
+      const name = typeof payload.name === "string" ? payload.name.trim() : "";
+      const schedule = typeof payload.schedule === "string" ? payload.schedule.trim() : "";
+      const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
+      if (!name || !schedule || !prompt) {
+        throw makeBridgeError("invalid_request", "请填写任务名称、Cron 表达式与执行提示词");
+      }
+      await this.probeCronDomain(entry, profileId);
+      if (!this.capabilityRegistry.getSnapshot().cron.supportedActions.canSubmit) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持新建 Cron 任务");
+      }
+      try {
+        const res = await entry.client.call<Record<string, unknown>>(
+          "cron.submit",
+          { profile_id: profileId, name, schedule, prompt },
+        );
+        await this.probeCronDomain(entry, profileId);
+        this.emitCapabilities();
+        return {
+          ok: true,
+          ...(typeof (res.job_id ?? res.jobId) === "string"
+            ? { jobId: String(res.job_id ?? res.jobId) }
+            : {}),
+          cron: this.capabilityRegistry.getSnapshot().cron,
+        };
+      } catch (err) {
+        await this.probeCronDomain(entry, profileId);
+        this.translateRpcFailure(entry, err, undefined, "cron.submit", profileId);
+      }
+    },
+
+    "cron.cancel": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const entry = this.requireTransport(connectionId, profileId);
+      const jobId = typeof payload.jobId === "string" ? payload.jobId.trim() : "";
+      if (!jobId) {
+        throw makeBridgeError("invalid_request", "缺少 Cron 任务 ID");
+      }
+      await this.probeCronDomain(entry, profileId);
+      if (!this.capabilityRegistry.getSnapshot().cron.supportedActions.canCancel) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持取消 Cron 任务");
+      }
+      try {
+        await entry.client.call(
+          "cron.cancel",
+          { profile_id: profileId, job_id: jobId },
+        );
+        await this.probeCronDomain(entry, profileId);
+        this.emitCapabilities();
+        return { ok: true, jobId, cron: this.capabilityRegistry.getSnapshot().cron };
+      } catch (err) {
+        await this.probeCronDomain(entry, profileId);
+        this.translateRpcFailure(entry, err, undefined, "cron.cancel", profileId);
+      }
+    },
+
+    "cron.recover": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const entry = this.requireTransport(connectionId, profileId);
+      const jobId = typeof payload.jobId === "string" ? payload.jobId.trim() : "";
+      if (!jobId) {
+        throw makeBridgeError("invalid_request", "缺少 Cron 任务 ID");
+      }
+      await this.probeCronDomain(entry, profileId);
+      if (!this.capabilityRegistry.getSnapshot().cron.supportedActions.canRecover) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持恢复 Cron 任务");
+      }
+      try {
+        await entry.client.call(
+          "cron.recover",
+          { profile_id: profileId, job_id: jobId },
+        );
+        await this.probeCronDomain(entry, profileId);
+        this.emitCapabilities();
+        return { ok: true, jobId, cron: this.capabilityRegistry.getSnapshot().cron };
+      } catch (err) {
+        await this.probeCronDomain(entry, profileId);
+        this.translateRpcFailure(entry, err, undefined, "cron.recover", profileId);
+      }
     },
 
     "fleet.refresh": async () => {
@@ -5266,6 +5919,26 @@ export class ConnectionSupervisor {
         throw makeBridgeError("invalid_request", "请输入对话内容后再发送");
       }
 
+      const existingRecovery = this.turnCoordinator.getSessionView({
+        connectionId,
+        profileId,
+        sessionId,
+      });
+      if (existingRecovery?.queuePaused || existingRecovery?.unknownTurn) {
+        throw makeBridgeError("conflict", getCopy("turn.queue.pausedNotice"));
+      }
+
+      if (payload.queued === true) {
+        return this.submitQueuedPromptOverGateway({
+          connectionId,
+          profileId,
+          sessionId,
+          text,
+          submissionId:
+            typeof payload.submissionId === "string" ? payload.submissionId.trim() : undefined,
+        });
+      }
+
       const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptSubmit) {
         throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
@@ -5331,6 +6004,18 @@ export class ConnectionSupervisor {
       }
 
       const turnId = asString(res.turn_id ?? res.turnId, `turn-${Date.now()}`);
+      const gwExecGen =
+        typeof (res.execution_generation ?? res.executionGeneration) === "number"
+          ? Number(res.execution_generation ?? res.executionGeneration)
+          : undefined;
+      const recovery = this.turnCoordinator.noteTurnStarted({
+        connectionId,
+        profileId,
+        sessionId,
+        turnId,
+        ...(gwExecGen !== undefined ? { executionGeneration: gwExecGen } : {}),
+        ownerGeneration: entry.ownerGeneration,
+      });
       const userMsgId = asString(res.user_message_id ?? res.userMessageId, `user-${Date.now()}`);
       const assistantMsgId = asString(
         res.assistant_message_id ?? res.assistantMessageId,
@@ -5370,6 +6055,8 @@ export class ConnectionSupervisor {
         sessionId,
         activeTurnId: turnId,
         turnStopping: false,
+        executionGeneration: recovery.executionGeneration,
+        stopState: "idle",
         messageId: assistantMsgId,
         status: "streaming",
       });
@@ -5390,6 +6077,7 @@ export class ConnectionSupervisor {
         profileId,
         sessionId,
         turnId,
+        executionGeneration: recovery.executionGeneration,
         kind: "accepted",
         messageId: assistantMsgId,
       } satisfies PromptEventPayload);
@@ -5399,6 +6087,7 @@ export class ConnectionSupervisor {
         receipt,
         sessionId,
         turnId,
+        executionGeneration: recovery.executionGeneration,
         userMessageId: userMsgId,
         assistantMessageId: assistantMsgId,
       };
@@ -5412,10 +6101,17 @@ export class ConnectionSupervisor {
       const existing = sessionId
         ? this.transcripts.get(transcriptKey(connectionId, profileId, sessionId))
         : null;
+      const currentRecovery = sessionId
+        ? this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId })
+        : null;
       const turnId =
         typeof payload.turnId === "string" && payload.turnId.trim()
           ? payload.turnId.trim()
-          : existing?.activeTurnId ?? "";
+          : existing?.activeTurnId ?? currentRecovery?.activeTurnId ?? "";
+      const executionGeneration =
+        typeof payload.executionGeneration === "number"
+          ? payload.executionGeneration
+          : existing?.executionGeneration ?? currentRecovery?.executionGeneration;
 
       if (!sessionId || !turnId) {
         throw makeBridgeError("unknown_turn", "当前没有可停止的 Turn");
@@ -5431,21 +6127,166 @@ export class ConnectionSupervisor {
         sessionId,
         activeTurnId: turnId,
         turnStopping: true,
+        ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+        stopState: "stopping",
       });
 
-      let res: Record<string, unknown>;
+      const servedMethods = Array.isArray(entry.describeResult?.served_methods)
+        ? (entry.describeResult?.served_methods as unknown[])
+        : [];
+      let usedRpcMethod = servedMethods.includes("session.interrupt")
+        ? "session.interrupt"
+        : "prompt.cancel";
+
       try {
-        res = await entry.client.call<Record<string, unknown>>("prompt.cancel", {
-          profile_id: profileId,
-          session_id: sessionId,
-          turn_id: turnId,
+        const result = await this.turnCoordinator.requestStop(
+          {
+            connectionId,
+            profileId,
+            sessionId,
+            turnId,
+            executionGeneration,
+          },
+          async ({ turnId: tId, executionGeneration: execGen }) => {
+            const rpcPayload = {
+              profile_id: profileId,
+              session_id: sessionId,
+              turn_id: tId,
+              ...(execGen > 0 ? { execution_generation: execGen } : {}),
+            };
+            if (usedRpcMethod === "session.interrupt") {
+              try {
+                return await entry.client.call<Record<string, unknown>>(
+                  "session.interrupt",
+                  rpcPayload,
+                );
+              } catch (err) {
+                if (isJsonRpcMethodNotFound(err)) {
+                  usedRpcMethod = "prompt.cancel";
+                  return entry.client.call<Record<string, unknown>>("prompt.cancel", rpcPayload);
+                }
+                throw err;
+              }
+            }
+            return entry.client.call<Record<string, unknown>>("prompt.cancel", rpcPayload);
+          },
+        );
+
+        if (result.status === "stopped") {
+          this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
+            type: "turn_state",
+            sessionId,
+            activeTurnId: null,
+            turnStopping: false,
+            executionGeneration: result.executionGeneration,
+            stopState: "stopped",
+            status: "stopped",
+          });
+          this.syncProfileAndConnectionProjections(connectionId);
+          this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+            connectionId,
+            profileId,
+            sessionId,
+            turnId,
+            executionGeneration: result.executionGeneration,
+            kind: "stopped",
+          } satisfies PromptEventPayload);
+          return {
+            stopped: true,
+            status: "stopped",
+            sessionId,
+            turnId,
+            executionGeneration: result.executionGeneration,
+          };
+        }
+
+        if (result.status === "cancel_outcome_unknown") {
+          this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
+            type: "turn_state",
+            sessionId,
+            activeTurnId: turnId,
+            turnStopping: false,
+            executionGeneration: result.executionGeneration,
+            stopState: "cancel_outcome_unknown",
+          });
+          this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+            connectionId,
+            profileId,
+            sessionId,
+            turnId,
+            executionGeneration: result.executionGeneration,
+            kind: "cancel_outcome_unknown",
+          } satisfies PromptEventPayload);
+          return {
+            stopped: false,
+            status: "cancel_outcome_unknown",
+            sessionId,
+            turnId,
+            executionGeneration: result.executionGeneration,
+          };
+        }
+
+        this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
+          type: "turn_state",
+          sessionId,
+          activeTurnId: turnId,
+          turnStopping: true,
+          executionGeneration: result.executionGeneration,
+          stopState: "stopping",
         });
+        this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+          connectionId,
+          profileId,
+          sessionId,
+          turnId,
+          executionGeneration: result.executionGeneration,
+          kind: "stopping",
+        } satisfies PromptEventPayload);
+        return {
+          stopped: false,
+          status: "stopping",
+          sessionId,
+          turnId,
+          executionGeneration: result.executionGeneration,
+        };
       } catch (err) {
+        const viewAfter = this.turnCoordinator.getSessionView({
+          connectionId,
+          profileId,
+          sessionId,
+        });
+        if (viewAfter?.stopState === "cancel_outcome_unknown") {
+          this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
+            type: "turn_state",
+            sessionId,
+            activeTurnId: turnId,
+            turnStopping: false,
+            executionGeneration: viewAfter.executionGeneration,
+            stopState: "cancel_outcome_unknown",
+          });
+          this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+            connectionId,
+            profileId,
+            sessionId,
+            turnId,
+            executionGeneration: viewAfter.executionGeneration,
+            kind: "cancel_outcome_unknown",
+          } satisfies PromptEventPayload);
+          return {
+            stopped: false,
+            status: "cancel_outcome_unknown",
+            sessionId,
+            turnId,
+            executionGeneration: viewAfter.executionGeneration,
+          };
+        }
+
         this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
           type: "turn_state",
           sessionId,
           activeTurnId: turnId,
           turnStopping: false,
+          stopState: "idle",
         });
         this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
           connectionId,
@@ -5454,50 +6295,246 @@ export class ConnectionSupervisor {
           turnId,
           kind: "stop_failed",
         } satisfies PromptEventPayload);
-        this.translateRpcFailure(entry, err, "promptCancel", "prompt.cancel", profileId);
+        this.translateRpcFailure(entry, err, "promptCancel", usedRpcMethod, profileId);
       }
-
-      if (res?.stopped === false) {
-        this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
-          type: "turn_state",
-          sessionId,
-          activeTurnId: turnId,
-          turnStopping: false,
-        });
-        this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
-          connectionId,
-          profileId,
-          sessionId,
-          turnId,
-          kind: "stop_failed",
-        } satisfies PromptEventPayload);
-        throw makeBridgeError("internal", "Gateway 未确认停止 Turn");
-      }
-
-      this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
-        type: "turn_state",
-        sessionId,
-        activeTurnId: null,
-        turnStopping: false,
-        status: "stopped",
-      });
-      this.syncProfileAndConnectionProjections(connectionId);
-      this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
-        connectionId,
-        profileId,
-        sessionId,
-        turnId,
-        kind: "stopped",
-      } satisfies PromptEventPayload);
-      return { stopped: true, sessionId, turnId };
     },
 
-    "prompts.steer": async (payload, scope) => {
+    "prompts.resolveUnknown": async (payload, scope) => {
       this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
-      const turnId = typeof payload.turnId === "string" ? payload.turnId : "";
+      if (!sessionId) {
+        throw makeBridgeError("invalid_request", "缺少目标 Session");
+      }
+      const entry = this.requireTransport(connectionId, profileId);
+      const admissionId =
+        typeof payload.admissionId === "string" && payload.admissionId.trim()
+          ? payload.admissionId.trim()
+          : undefined;
+      const executionGeneration =
+        typeof payload.executionGeneration === "number" ? payload.executionGeneration : undefined;
+
+      try {
+        const result = await this.turnCoordinator.resolveUnknown(
+          {
+            connectionId,
+            profileId,
+            sessionId,
+            admissionId,
+            executionGeneration,
+          },
+          async ({ admission_id, execution_generation }) =>
+            entry.client.call<Record<string, unknown>>("prompt.resolve_unknown", {
+              profile_id: profileId,
+              session_id: sessionId,
+              admission_id,
+              execution_generation,
+            }),
+        );
+        this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
+          type: "turn_state",
+          sessionId,
+          activeTurnId: null,
+          turnStopping: false,
+          stopState: "stopped",
+        });
+        this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+          connectionId,
+          profileId,
+          sessionId,
+          turnId: "",
+          executionGeneration: result.executionGeneration,
+          kind: "unknown_resolved",
+        } satisfies PromptEventPayload);
+        return result;
+      } catch (err) {
+        if (err instanceof GatewayRpcError || err instanceof GatewayTransportError) {
+          this.translateRpcFailure(entry, err, undefined, "prompt.resolve_unknown", profileId);
+        }
+        throw err;
+      }
+    },
+
+    "prompts.queue": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const text = typeof payload.text === "string" ? payload.text.trim() : "";
+      if (!sessionId || !text) {
+        throw makeBridgeError("invalid_request", "请输入内容后再排队");
+      }
+      const existing = this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
+      if (existing?.queuePaused || existing?.unknownTurn) {
+        throw makeBridgeError("conflict", getCopy("turn.queue.pausedNotice"));
+      }
+      return this.submitQueuedPromptOverGateway({
+        connectionId,
+        profileId,
+        sessionId,
+        text,
+        submissionId:
+          typeof payload.submissionId === "string" ? payload.submissionId.trim() : undefined,
+      });
+    },
+
+    "prompts.checkQueueReceipt": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const submissionId =
+        typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
+      if (!sessionId || !submissionId) {
+        throw makeBridgeError("invalid_request", "缺少 submissionId");
+      }
+      const entry = this.requireTransport(connectionId, profileId);
+      return this.turnCoordinator.checkQueueReceipt(
+        { connectionId, profileId, sessionId, submissionId },
+        async (subId) => {
+          try {
+            const receiptRes = await entry.client.call<Record<string, unknown>>("prompt.receipt", {
+              profile_id: profileId,
+              session_id: sessionId,
+              submission_id: subId,
+            });
+            const rawList = Array.isArray(
+              receiptRes.queued_admissions ?? receiptRes.queuedAdmissions ?? receiptRes.queue,
+            )
+              ? ((receiptRes.queued_admissions ??
+                  receiptRes.queuedAdmissions ??
+                  receiptRes.queue) as RawGatewayQueueItem[])
+              : undefined;
+            const admission =
+              receiptRes.admission && typeof receiptRes.admission === "object"
+                ? (receiptRes.admission as RawGatewayQueueItem)
+                : typeof (receiptRes.admission_id ?? receiptRes.admissionId) === "string"
+                  ? (receiptRes as RawGatewayQueueItem)
+                  : undefined;
+            return {
+              found: Boolean(receiptRes.found ?? admission),
+              ...(admission ? { admission } : {}),
+              ...(rawList ? { queuedAdmissions: rawList } : {}),
+            };
+          } catch (err) {
+            if (!isJsonRpcMethodNotFound(err)) {
+              this.translateRpcFailure(entry, err, undefined, "prompt.receipt", profileId);
+            }
+            const listRes = await entry.client.call<Record<string, unknown>>("session.resume", {
+              profile_id: profileId,
+              session_id: sessionId,
+            });
+            const rawList = Array.isArray(
+              listRes.queued_admissions ?? listRes.queuedAdmissions ?? listRes.queue,
+            )
+              ? ((listRes.queued_admissions ??
+                  listRes.queuedAdmissions ??
+                  listRes.queue) as RawGatewayQueueItem[])
+              : [];
+            const match = rawList.find(
+              (item) => (item.submission_id ?? item.submissionId) === subId,
+            );
+            return {
+              found: Boolean(match),
+              ...(match ? { admission: match } : {}),
+              queuedAdmissions: rawList,
+            };
+          }
+        },
+      );
+    },
+
+    "prompts.retryQueue": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const submissionId =
+        typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
+      if (!sessionId || !submissionId) {
+        throw makeBridgeError("invalid_request", "缺少 submissionId");
+      }
+      const entry = this.requireTransport(connectionId, profileId);
+      if (!entry.supportedActions.promptSubmit) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
+      }
+      try {
+        const res = await this.turnCoordinator.retryQueued(
+          { connectionId, profileId, sessionId, submissionId, online: true },
+          async (rpcPayload) =>
+            entry.client.call<Record<string, unknown>>("prompt.submit", {
+              profile_id: profileId,
+              session_id: sessionId,
+              ...rpcPayload,
+            }),
+        );
+        if (res.status === "admitted" && res.admission) {
+          this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+            connectionId,
+            profileId,
+            sessionId,
+            turnId: "",
+            kind: "queued",
+          } satisfies PromptEventPayload);
+        }
+        return res;
+      } catch (err) {
+        if (err instanceof GatewayRpcError) {
+          this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit", profileId);
+        }
+        throw err;
+      }
+    },
+
+    "prompts.cancelQueued": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const admissionId =
+        typeof payload.admissionId === "string" ? payload.admissionId.trim() : "";
+      if (!sessionId || !admissionId) {
+        throw makeBridgeError("invalid_request", "缺少排队 admissionId");
+      }
+      const entry = this.requireTransport(connectionId, profileId);
+      if (!entry.supportedActions.promptCancel) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持取消排队");
+      }
+      try {
+        const res = await this.turnCoordinator.cancelQueued(
+          { connectionId, profileId, sessionId, admissionId },
+          async ({ admission_id }) =>
+            entry.client.call<Record<string, unknown>>("prompt.cancel", {
+              profile_id: profileId,
+              session_id: sessionId,
+              admission_id,
+            }),
+        );
+        this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+          connectionId,
+          profileId,
+          sessionId,
+          turnId: res.admission.turnId ?? "",
+          kind: "queue_cancelled",
+        } satisfies PromptEventPayload);
+        return res;
+      } catch (err) {
+        if (err instanceof GatewayRpcError) {
+          this.translateRpcFailure(entry, err, "promptCancel", "prompt.cancel", profileId);
+        }
+        throw err;
+      }
+    },
+
+    "prompts.steer": async (payload, scope): Promise<PromptSteerResult> => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const turnId = typeof payload.turnId === "string" ? payload.turnId.trim() : "";
+      const executionGeneration =
+        typeof payload.executionGeneration === "number" ? payload.executionGeneration : undefined;
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
         throw makeBridgeError("invalid_request", "缺少补充指令内容");
@@ -5506,16 +6543,140 @@ export class ConnectionSupervisor {
       if (!entry.supportedActions.promptSteer) {
         throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持中途纠偏");
       }
+
+      const hasTurnHistory = this.turnCoordinator.hasTurnHistory({
+        connectionId,
+        profileId,
+        sessionId,
+      });
+      if (hasTurnHistory || executionGeneration !== undefined) {
+        const precheck = this.turnCoordinator.evaluateSteerPrecheck({
+          connectionId,
+          profileId,
+          sessionId,
+          ...(turnId ? { turnId } : {}),
+          ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+          text,
+          requireRunning: true,
+        });
+        if (!precheck.allowed) {
+          return this.turnCoordinator.recordSteerFailure({
+            connectionId,
+            profileId,
+            sessionId,
+            ...(turnId ? { turnId } : {}),
+            ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+            text,
+            reason: precheck.reason,
+            message: precheck.message,
+          });
+        }
+      }
+
+      const currentView = this.turnCoordinator.getSessionView({
+        connectionId,
+        profileId,
+        sessionId,
+      });
+      const effectiveTurnId = turnId || currentView?.activeTurnId || "";
+      const effectiveGen =
+        executionGeneration ??
+        (currentView && currentView.executionGeneration > 0
+          ? currentView.executionGeneration
+          : undefined);
+
       try {
-        return await entry.client.call("session.steer", {
+        const res = await entry.client.call<Record<string, unknown>>("session.steer", {
           profile_id: profileId,
           session_id: sessionId,
-          ...(turnId ? { turn_id: turnId } : {}),
+          ...(effectiveTurnId ? { turn_id: effectiveTurnId } : {}),
+          ...(effectiveGen !== undefined ? { execution_generation: effectiveGen } : {}),
           text,
         });
+        if (res?.steered === false) {
+          const reasonRaw = asString(res.reason, "rejected");
+          const reason =
+            reasonRaw === "turn_finished" ||
+            reasonRaw === "generation_mismatch" ||
+            reasonRaw === "not_running" ||
+            reasonRaw === "rejected" ||
+            reasonRaw === "unreachable" ||
+            reasonRaw === "timeout"
+              ? reasonRaw
+              : "rejected";
+          this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
+            connectionId,
+            profileId,
+            sessionId,
+            turnId: effectiveTurnId,
+            ...(effectiveGen !== undefined ? { executionGeneration: effectiveGen } : {}),
+            kind: "steer_failed",
+          } satisfies PromptEventPayload);
+          return this.turnCoordinator.recordSteerFailure({
+            connectionId,
+            profileId,
+            sessionId,
+            ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+            ...(effectiveGen !== undefined ? { executionGeneration: effectiveGen } : {}),
+            text,
+            reason,
+            message: asString(res.message, getCopy("turn.steer.fallbackBody")),
+          });
+        }
+        return this.turnCoordinator.recordSteerSuccess({
+          connectionId,
+          profileId,
+          sessionId,
+          ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+          ...(effectiveGen !== undefined ? { executionGeneration: effectiveGen } : {}),
+        });
       } catch (err) {
+        if (isJsonRpcMethodNotFound(err) || isRpcAuthError(err) || isProfileUnavailableRpcError(err)) {
+          this.translateRpcFailure(entry, err, "promptSteer", "session.steer", profileId);
+        }
+        if (err instanceof GatewayTransportError) {
+          return this.turnCoordinator.recordSteerFailure({
+            connectionId,
+            profileId,
+            sessionId,
+            ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+            ...(effectiveGen !== undefined ? { executionGeneration: effectiveGen } : {}),
+            text,
+            reason: err.code === "timeout" ? "timeout" : "unreachable",
+            message: getCopy("turn.steer.fallbackBody"),
+          });
+        }
+        if (err instanceof GatewayRpcError) {
+          const msgLower = err.message.toLowerCase();
+          const reason = msgLower.includes("generation")
+            ? "generation_mismatch"
+            : msgLower.includes("finish") || msgLower.includes("ended")
+              ? "turn_finished"
+              : "rejected";
+          return this.turnCoordinator.recordSteerFailure({
+            connectionId,
+            profileId,
+            sessionId,
+            ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+            ...(effectiveGen !== undefined ? { executionGeneration: effectiveGen } : {}),
+            text,
+            reason,
+            message: getCopy("turn.steer.fallbackBody"),
+          });
+        }
         this.translateRpcFailure(entry, err, "promptSteer", "session.steer", profileId);
       }
+    },
+
+    "prompts.dismissSteerFallback": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      if (sessionId) {
+        this.turnCoordinator.clearSteerFallback({ connectionId, profileId, sessionId });
+      }
+      return { ok: true };
     },
 
     "chatState.get": async () => {
@@ -6400,6 +7561,100 @@ export class ConnectionSupervisor {
     return { gateway, main };
   }
 
+  private async submitQueuedPromptOverGateway(input: {
+    connectionId: string;
+    profileId: string;
+    sessionId: string;
+    text: string;
+    submissionId?: string;
+  }) {
+    const entry = this.requireTransport(input.connectionId, input.profileId);
+    if (!entry.supportedActions.promptSubmit) {
+      throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
+    }
+    try {
+      const res = await this.turnCoordinator.submitQueued(
+        {
+          connectionId: input.connectionId,
+          profileId: input.profileId,
+          sessionId: input.sessionId,
+          text: input.text,
+          online: true,
+          ...(input.submissionId ? { submissionId: input.submissionId } : {}),
+        },
+        async (rpcPayload) =>
+          entry.client.call<Record<string, unknown>>("prompt.submit", {
+            profile_id: input.profileId,
+            session_id: input.sessionId,
+            ...rpcPayload,
+          }),
+      );
+      if (res.status === "admitted" && res.admission) {
+        this.emitTopic(
+          "prompt",
+          {
+            connectionId: input.connectionId,
+            profileId: input.profileId,
+            sessionId: input.sessionId,
+          },
+          "patch",
+          {
+            connectionId: input.connectionId,
+            profileId: input.profileId,
+            sessionId: input.sessionId,
+            turnId: "",
+            kind: "queued",
+          } satisfies PromptEventPayload,
+        );
+      }
+      return res;
+    } catch (err) {
+      if (err instanceof GatewayRpcError) {
+        this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit", input.profileId);
+      }
+      throw err;
+    }
+  }
+
+  private syncTurnRecoveryToSessions(snap: TurnRecoveryTopicSnapshot): void {
+    const queuedScopes = new Set<string>();
+    for (const view of snap.sessions) {
+      if (view.queuedAdmissions.some((q) => q.state === "queued" || q.state === "cancelling" || q.state === "cancel_unknown")) {
+        queuedScopes.add(transcriptKey(view.connectionId, view.profileId, view.sessionId));
+      }
+    }
+
+    const updatedConnections = new Set<string>();
+    const updatedProfileScopes = new Set<string>();
+    for (const [sKey, list] of this.sessionsByScope.entries()) {
+      let scopeChanged = false;
+      const nextList = list.map((s) => {
+        const tk = transcriptKey(s.connectionId, s.profileId, s.sessionId);
+        const nextQueued = queuedScopes.has(tk);
+        if (Boolean(s.queuedAdmission) !== nextQueued) {
+          scopeChanged = true;
+          updatedConnections.add(s.connectionId);
+          updatedProfileScopes.add(sKey);
+          return { ...s, queuedAdmission: nextQueued };
+        }
+        return s;
+      });
+      if (scopeChanged) {
+        this.sessionsByScope.set(sKey, nextList);
+      }
+    }
+
+    for (const sKey of updatedProfileScopes) {
+      const [cid, pid] = sKey.split("::");
+      if (cid && pid) {
+        this.emitSessions(cid, pid);
+      }
+    }
+    for (const cid of updatedConnections) {
+      this.emitFleet(cid);
+    }
+  }
+
   private syncApprovalNeedsInputToSessions(snap: ApprovalTopicSnapshot): void {
     const pendingScopes = new Set<string>();
     for (const item of snap.approvals) {
@@ -6792,6 +8047,7 @@ export class ConnectionSupervisor {
 
     for (const cid of connectionIds) {
       this.approvalCoordinator.onConnectionOffline(cid);
+      this.turnCoordinator.onConnectionOffline(cid);
       this.syncProfileAndConnectionProjections(cid);
       this.emitProfiles(cid);
     }

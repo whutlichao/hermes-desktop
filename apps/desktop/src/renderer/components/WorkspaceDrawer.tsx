@@ -286,7 +286,7 @@ export function WorkspaceDrawer({
     <aside className="workspace-drawer" aria-label={getCopy("workspace.title")}>
       <div className="workspace-header">
         <strong>{getCopy("workspace.title")}</strong>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <div className="workspace-header-actions">
           <button
             type="button"
             className="button button-secondary"
@@ -384,7 +384,7 @@ export function WorkspaceDrawer({
                           style={{
                             marginLeft: 8,
                             fontFamily: "var(--font-mono)",
-                            fontSize: 11,
+                            fontSize: "0.84615rem",
                             color: "var(--muted)",
                           }}
                         >
@@ -403,7 +403,7 @@ export function WorkspaceDrawer({
                         </button>
                         <span
                           data-testid="workspace-artifact-zoom"
-                          style={{ fontFamily: "var(--font-mono)", fontSize: 11.5 }}
+                          style={{ fontFamily: "var(--font-mono)", fontSize: "0.88462rem" }}
                         >
                           {chatView.zoom}%
                         </span>
@@ -428,7 +428,7 @@ export function WorkspaceDrawer({
                     <pre
                       className="workspace-preview-content"
                       data-testid="workspace-artifact-preview"
-                      style={{ fontSize: `${Math.round((12 * chatView.zoom) / 100)}px` }}
+                      style={{ fontSize: `${12 * chatView.zoom / 1300}rem` }}
                       onScroll={(event) => onArtifactScroll(event.currentTarget.scrollTop)}
                     >
                       {selectedArtifact.content}
@@ -506,7 +506,7 @@ export function WorkspaceDrawer({
                             data-testid="workspace-annotation-item"
                           >
                             <div className="workspace-annotation-header">
-                              <span style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>
+                              <span style={{ fontFamily: "var(--font-mono)", fontSize: "0.84615rem" }}>
                                 ({ann.xPct}%, {ann.yPct}%) · v{ann.artifactVersion}
                               </span>
                               {ann.outdatedVersion && (
@@ -1000,7 +1000,7 @@ export function WorkspaceDrawer({
                           <span
                             style={{
                               marginLeft: 8,
-                              fontSize: 11.5,
+                              fontSize: "0.88462rem",
                               color: "var(--muted)",
                             }}
                           >
@@ -1008,7 +1008,7 @@ export function WorkspaceDrawer({
                           </span>
                         )}
                       </div>
-                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                         {canDiffCheckpoint && (
                           <button
                             type="button"
@@ -1056,7 +1056,7 @@ export function WorkspaceDrawer({
                           <div
                             style={{
                               fontFamily: "var(--font-mono)",
-                              fontSize: 11,
+                              fontSize: "0.84615rem",
                               marginBottom: 8,
                             }}
                             data-testid="workspace-checkpoint-confirm-binding"
@@ -1141,7 +1141,7 @@ export function WorkspaceDrawer({
                       <div className="workspace-preview-toolbar">
                         <strong>{getCopy("workspace.checkpoints.diffTitle")}</strong>
                         {selectedCheckpointDiff && (
-                          <span style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                          <span style={{ fontSize: "0.88462rem", color: "var(--muted)" }}>
                             {selectedCheckpointDiff.summary}
                           </span>
                         )}
@@ -1192,7 +1192,7 @@ export function WorkspaceDrawer({
               </div>
 
               <div className="terminal-meta-row">
-                <span style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                <span style={{ fontSize: "0.88462rem", color: "var(--muted)" }}>
                   {getCopy("workspace.terminal.scopeHint")}
                 </span>
                 {terminalSnapshot.terminalId && (
@@ -1302,6 +1302,7 @@ export function WorkspaceDrawer({
                 aria-label={getCopy("workspace.terminal.busyConfirmTitle")}
                 data-testid="workspace-terminal-busy-confirm"
                 onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing) return;
                   if (e.key === "Escape") {
                     e.preventDefault();
                     e.stopPropagation();
@@ -1375,7 +1376,7 @@ export function WorkspaceDrawer({
                     <label htmlFor={terminalInputId}>
                       {getCopy("workspace.terminal.inputLabel")}
                     </label>
-                    <div style={{ display: "flex", gap: 6 }}>
+                    <div style={{ display: "flex", gap: 8 }}>
                       <input
                         id={terminalInputId}
                         type="text"

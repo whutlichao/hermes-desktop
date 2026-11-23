@@ -1,8 +1,113 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
+async function collectTargetSizeIssues(page: import("@playwright/test").Page) {
+  return page.evaluate(() => {
+    const selector = [
+      "button:not([disabled])",
+      "a[href]",
+      "select:not([disabled])",
+      'input:not([disabled]):not([type="hidden"])',
+      "textarea:not([disabled])",
+      '[role="button"]',
+      '[role="option"]',
+    ].join(", ");
+    const issues: string[] = [];
+    for (const element of Array.from(document.querySelectorAll<HTMLElement>(selector))) {
+      if (element.closest("[inert]")) continue;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (
+        rect.width <= 0 ||
+        rect.height <= 0 ||
+        style.display === "none" ||
+        style.visibility === "hidden"
+      ) {
+        continue;
+      }
+      const text = (element.innerText || element.textContent || "").trim();
+      const hasIcon = Boolean(element.querySelector("svg"));
+      const iconOnly = text.length === 0 && hasIcon;
+      const critical =
+        element.classList.contains("button") ||
+        element.classList.contains("sidebar-new-btn") ||
+        element.classList.contains("icon-button") ||
+        /approval-choice|approval-inspect|composer-send|composer-stop|send-message|workspace-terminal-(open|send|close)/.test(
+          element.getAttribute("data-testid") ?? "",
+        );
+      const minimum = critical ? 32 : iconOnly ? 28 : 24;
+      if (rect.width + 0.01 < minimum || rect.height + 0.01 < minimum) {
+        const label =
+          element.getAttribute("aria-label") ||
+          element.getAttribute("data-testid") ||
+          text.slice(0, 48) ||
+          element.tagName;
+        issues.push(
+          `${label}: ${Math.round(rect.width * 10) / 10}x${Math.round(rect.height * 10) / 10} < ${minimum}x${minimum}`,
+        );
+      }
+    }
+    return issues;
+  });
+}
+
+async function collectFocusReachabilityIssues(page: import("@playwright/test").Page) {
+  return page.evaluate(() => {
+    const selector = [
+      "button:not([disabled])",
+      "a[href]",
+      "select:not([disabled])",
+      'input:not([disabled]):not([type="hidden"])',
+      "textarea:not([disabled])",
+      '[role="button"]',
+    ].join(", ");
+    const issues: string[] = [];
+    for (const element of Array.from(document.querySelectorAll<HTMLElement>(selector))) {
+      if (element.closest("[inert]")) continue;
+      const style = getComputedStyle(element);
+      const before = element.getBoundingClientRect();
+      if (
+        before.width <= 0 ||
+        before.height <= 0 ||
+        style.display === "none" ||
+        style.visibility === "hidden"
+      ) {
+        continue;
+      }
+      const label =
+        element.getAttribute("aria-label") ||
+        element.getAttribute("data-testid") ||
+        (element.innerText || element.textContent || "").trim().slice(0, 48) ||
+        element.tagName;
+      element.focus();
+      if (document.activeElement !== element) {
+        issues.push(`${label}: not focusable`);
+        continue;
+      }
+      const rect = element.getBoundingClientRect();
+      const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1);
+      const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1);
+      const hit = document.elementFromPoint(x, y) as HTMLElement | null;
+      if (
+        rect.top < -1 ||
+        rect.left < -1 ||
+        rect.bottom > window.innerHeight + 1 ||
+        rect.right > window.innerWidth + 1
+      ) {
+        issues.push(
+          `${label}: clipped outside viewport (${Math.round(rect.left)},${Math.round(rect.top)} ${Math.round(rect.width)}x${Math.round(rect.height)})`,
+        );
+      }
+      if (!hit || !(hit === element || element.contains(hit) || hit.contains(element))) {
+        issues.push(`${label}: obscured or not hit-testable`);
+      }
+    }
+    return issues;
+  });
+}
+
 test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
-  test("passes axe-core serious/critical = 0 on shell, palette, settings, capabilities, workspace, and 1280 popover", async ({
+  test("E2E-A11Y-01: passes axe-core serious/critical = 0 on shell, palette, settings, capabilities, workspace, and 1280 popover", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -70,13 +175,16 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("1280 sessions popover");
     await page.keyboard.press("Escape");
 
-    // Local Remote/SSH escape hatch modal
-    await page.getByRole("button", { name: "改连 Remote / SSH" }).click();
-    await expect(page.getByRole("dialog", { name: "改连 Remote / SSH" })).toBeVisible();
-    await checkAxe("remote escape modal");
+    // Onboarding empty state: add a Remote/SSH connection through Settings
+    await page.getByRole("button", { name: "添加 SSH" }).click();
+    await expect(settingsDialog).toBeVisible();
+    await expect(settingsDialog.getByLabel("SSH 主机")).toBeVisible();
+    await checkAxe("settings ssh add form from onboarding");
+    await page.keyboard.press("Escape");
+    await expect(settingsDialog).toBeHidden();
   });
 
-  test("passes axe-core serious/critical = 0 on populated session rail, route banner, 1280 popover, and session_missing recovery card", async ({
+  test("E2E-A11Y-02: passes axe-core serious/critical = 0 on populated session rail, route banner, 1280 popover, and session_missing recovery card", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {
@@ -230,7 +338,7 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("session_missing read-only recovery card");
   });
 
-  test("passes axe-core serious/critical = 0 on populated Workspace Artifacts, Annotations, Files, Git, Agents, and Terminal tabs", async ({
+  test("E2E-A11Y-03: passes axe-core serious/critical = 0 on populated Workspace Artifacts, Annotations, Files, Git, Agents, and Terminal tabs", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {
@@ -376,7 +484,7 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("workspace terminal tab");
   });
 
-  test("passes axe-core serious/critical = 0 on Extensions drawer, Settings Plugins section, and transcript attribution/approval cards", async ({
+  test("E2E-A11Y-04: passes axe-core serious/critical = 0 on Extensions drawer, Settings Plugins section, and transcript attribution/approval cards", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {
@@ -562,7 +670,7 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
   });
 
 
-  test("passes axe-core serious/critical = 0 on background attention badges, mark-read action, route attention chips, and 1280 popover (Ticket #37)", async ({
+  test("E2E-A11Y-02 & E2E-A11Y-04: passes axe-core serious/critical = 0 on background attention badges, mark-read action, route attention chips, and 1280 popover (Ticket #37)", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {
@@ -699,7 +807,7 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
   });
 
 
-  test("Ticket #39: passes axe-core serious/critical = 0 on actionable, context_incomplete, orphaned Approval cards, rail badge, and inspect modal", async ({
+  test("E2E-A11Y-05: Ticket #39 passes axe-core serious/critical = 0 on actionable, context_incomplete, orphaned Approval cards, rail badge, and inspect modal", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {
@@ -859,8 +967,649 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
   });
 });
 
+test.describe("E2E-A11Y-01 read-only domains", () => {
+  test("E2E-A11Y-01: Memory, Messaging, and Cron drawers pass axe-core serious/critical = 0", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y-domains",
+              title: "Domain A11y",
+              preview: "Ready",
+              updatedAt: "2026-11-23T12:20:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-a11y-domains",
+          },
+          activeSessionId: "sess-a11y-domains",
+        },
+        chatState: {
+          lastActiveChat: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-a11y-domains",
+          },
+          lastSessionByScope: { "local::default": "sess-a11y-domains" },
+          activeStatus: "ready",
+          sessionSummaries: {},
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-a11y-domains": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-a11y-domains",
+            messages: [
+              {
+                messageId: "m-a11y-domains",
+                sessionId: "sess-a11y-domains",
+                role: "assistant",
+                text: "Domain inventory ready",
+                createdAt: "2026-11-23T12:20:00.000Z",
+                status: "complete",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        capabilities: {
+          memory: {
+            outcome: "ok",
+            rawPayload: {
+              total_tokens: 1200,
+              max_tokens: 128000,
+              sections: [{ id: "system", label: "系统提示词", tokens: 1200 }],
+            },
+          },
+          messaging: {
+            outcome: "ok",
+            rawPayload: {
+              connectors: [
+                { id: "slack", platform: "Slack", label: "Slack", status: "connected" },
+              ],
+            },
+          },
+          cron: {
+            outcome: "ok",
+            rawPayload: {
+              jobs: [
+                {
+                  id: "cron-a11y",
+                  name: "A11y job",
+                  schedule: "0 7 * * *",
+                  prompt: "Check accessibility",
+                  status: "scheduled",
+                },
+              ],
+            },
+          },
+        },
+      };
+    });
+
+    const checkAxe = async (label: string) => {
+      const results = await new AxeBuilder({ page }).analyze();
+      const severe = results.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(severe, `axe serious/critical violations on ${label}`).toEqual([]);
+    };
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    await page.getByTestId("cap-action-memory-inspect").click();
+    const inspect = page.getByRole("dialog", { name: "只读域与 Cron 管理" });
+    await expect(inspect).toBeVisible();
+    await checkAxe("domain inspect memory");
+    await inspect.getByRole("tab", { name: "Messaging 通道" }).click();
+    await checkAxe("domain inspect messaging");
+    await inspect.getByRole("tab", { name: "Cron 定时任务" }).click();
+    await checkAxe("domain inspect cron");
+  });
+});
+
+test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
+  test("E2E-MOTION-01: reduced motion removes animation and exposes static streaming status text", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-motion",
+              title: "Streaming Session",
+              preview: "Working",
+              updatedAt: "2026-11-23T12:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-motion-1",
+              status: "running",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-motion",
+          },
+          activeSessionId: "sess-motion",
+        },
+        chatState: {
+          lastActiveChat: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-motion",
+          },
+          lastSessionByScope: { "local::default": "sess-motion" },
+          activeStatus: "ready",
+          sessionSummaries: {},
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-motion": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-motion",
+            messages: [
+              {
+                messageId: "m-motion",
+                sessionId: "sess-motion",
+                role: "assistant",
+                text: "Generating the response",
+                createdAt: "2026-11-23T12:00:00.000Z",
+                turnId: "turn-motion-1",
+                streaming: true,
+                status: "streaming",
+              },
+            ],
+            activeTurnId: "turn-motion-1",
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+      };
+    });
+
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await expect(page.locator(".transcript-list").getByText("正在输出")).toBeVisible();
+    await expect(page.locator(".streaming-caret, .spinner, .skeleton, .pulse").first()).toHaveCount(0);
+
+    const motion = await page.evaluate(() => {
+      const animated = Array.from(document.querySelectorAll<HTMLElement>("*"))
+        .map((el) => {
+          const style = getComputedStyle(el);
+          return {
+            animationName: style.animationName,
+            animationDuration: style.animationDuration,
+            transitionDuration: style.transitionDuration,
+            scrollBehavior: style.scrollBehavior,
+          };
+        })
+        .filter(
+          (item) =>
+            item.animationName !== "none" ||
+            Number.parseFloat(item.transitionDuration) > 0 ||
+            Number.parseFloat(item.animationDuration) > 0 ||
+            item.scrollBehavior === "smooth",
+        );
+      return animated;
+    });
+    expect(motion).toEqual([]);
+  });
+
+  test("E2E-ZOOM-01: 200% root font keeps 1440/1280/1120 free of page-level horizontal overflow and preserves the 720px column", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      const longUrl = `https://example.com/reports/${"a".repeat(220)}`;
+      const longPath = `/Users/example/workspaces/${"deep-segment/".repeat(20)}artifact.json`;
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-zoom",
+              title: "Zoom Session",
+              preview: "Long content",
+              updatedAt: "2026-11-23T12:10:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-zoom",
+          },
+          activeSessionId: "sess-zoom",
+        },
+        chatState: {
+          lastActiveChat: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-zoom",
+          },
+          lastSessionByScope: { "local::default": "sess-zoom" },
+          activeStatus: "ready",
+          sessionSummaries: {},
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-zoom": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-zoom",
+            messages: [
+              {
+                messageId: "m-zoom-1",
+                sessionId: "sess-zoom",
+                role: "assistant",
+                text: `Report URL: ${longUrl}`,
+                createdAt: "2026-11-23T12:10:00.000Z",
+                status: "complete",
+              },
+              {
+                messageId: "m-zoom-2",
+                sessionId: "sess-zoom",
+                role: "assistant",
+                text: `Artifact path: ${longPath}`,
+                createdAt: "2026-11-23T12:10:01.000Z",
+                status: "complete",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        approvals: [
+          {
+            gateway: {
+              approvalId: "apr-zoom",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-zoom",
+              turnId: "turn-zoom",
+              executionGeneration: 1,
+              command: `cat ${longPath}`,
+              description: "Verify long-path wrapping in Approval context",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Zoom Session",
+              cwd: longPath,
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+        ],
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await page.evaluate(() => {
+      document.documentElement.style.fontSize = "26px";
+    });
+
+    for (const viewport of [
+      { width: 1440, height: 900 },
+      { width: 1280, height: 800 },
+      { width: 1120, height: 700 },
+    ]) {
+      await page.setViewportSize(viewport);
+      await page.waitForTimeout(60);
+
+      const metrics = await page.evaluate(() => {
+        const column = document.querySelector<HTMLElement>(".thread-column");
+        const root = getComputedStyle(document.documentElement);
+        const heading = document.querySelector<HTMLElement>(".transcript-message, .empty-relay-card h1");
+        return {
+          rootFont: root.fontSize,
+          pageOverflow:
+            document.documentElement.scrollWidth > window.innerWidth ||
+            document.body.scrollWidth > document.body.clientWidth,
+          columnWidth: column?.getBoundingClientRect().width ?? 0,
+          headingFont: heading ? Number.parseFloat(getComputedStyle(heading).fontSize) : 0,
+          railVisible: Boolean(document.querySelector("nav.sidebar")),
+        };
+      });
+      expect(metrics.rootFont).toBe("26px");
+      expect(metrics.pageOverflow, `page overflow at ${viewport.width}x${viewport.height}`).toBe(false);
+      expect(metrics.columnWidth, `column at ${viewport.width}`).toBeLessThanOrEqual(721);
+      expect(metrics.columnWidth, `column at ${viewport.width}`).toBeGreaterThan(680);
+      expect(metrics.headingFont).toBeGreaterThanOrEqual(24);
+      expect(metrics.railVisible).toBe(viewport.width > 1340);
+
+      const messageOverflow = await page.evaluate(() =>
+        Array.from(document.querySelectorAll<HTMLElement>(".transcript-message")).map(
+          (el) => el.scrollWidth > el.clientWidth + 1,
+        ),
+      );
+      expect(messageOverflow).not.toContain(true);
+
+      expect(
+        await collectTargetSizeIssues(page),
+        `shell target sizes at ${viewport.width}x${viewport.height}`,
+      ).toEqual([]);
+      expect(
+        await collectFocusReachabilityIssues(page),
+        `shell focus reachability at ${viewport.width}x${viewport.height}`,
+      ).toEqual([]);
+
+      await page.keyboard.press("Control+k");
+      const palette = page.getByRole("dialog", { name: "命令面板" });
+      await expect(palette).toBeVisible();
+      expect(await collectTargetSizeIssues(page), `palette targets at ${viewport.width}`).toEqual([]);
+      expect(
+        await collectFocusReachabilityIssues(page),
+        `palette reachability at ${viewport.width}`,
+      ).toEqual([]);
+      const paletteOverflow = await palette.evaluate(
+        (el) => el.scrollWidth > el.clientWidth + 1,
+      );
+      expect(paletteOverflow, `palette internal overflow at ${viewport.width}`).toBe(false);
+      await page.keyboard.press("Escape");
+      await expect(palette).toBeHidden();
+
+      await page.keyboard.press("Control+,");
+      const settings = page.getByRole("dialog", { name: "Settings" });
+      await expect(settings).toBeVisible();
+      const settingsBox = await settings.boundingBox();
+      expect((settingsBox?.width ?? 0) + 32).toBeLessThanOrEqual(viewport.width);
+      expect(
+        await collectTargetSizeIssues(page),
+        `settings targets at ${viewport.width}`,
+      ).toEqual([]);
+      expect(
+        await collectFocusReachabilityIssues(page),
+        `settings reachability at ${viewport.width}`,
+      ).toEqual([]);
+      const settingsOverflow = await settings.evaluate(
+        (el) => el.scrollWidth > el.clientWidth + 1,
+      );
+      expect(settingsOverflow, `settings internal overflow at ${viewport.width}`).toBe(false);
+      await page.keyboard.press("Escape");
+      await expect(settings).toBeHidden();
+
+      await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+      const capabilities = page.getByRole("dialog", { name: "能力目录" });
+      await expect(capabilities).toBeVisible();
+      expect(
+        await collectTargetSizeIssues(page),
+        `capabilities targets at ${viewport.width}`,
+      ).toEqual([]);
+      expect(
+        await collectFocusReachabilityIssues(page),
+        `capabilities reachability at ${viewport.width}`,
+      ).toEqual([]);
+      const capabilitiesOverflow = await capabilities.evaluate(
+        (el) => el.scrollWidth > el.clientWidth + 1,
+      );
+      expect(capabilitiesOverflow, `capabilities internal overflow at ${viewport.width}`).toBe(false);
+      await page.keyboard.press("Escape");
+      await expect(capabilities).toBeHidden();
+
+      await page.getByRole("button", { name: "Workspace ⌘B" }).click();
+      const workspace = page.getByRole("complementary", { name: "Workspace" });
+      await expect(workspace).toBeVisible();
+      const workspaceBox = await workspace.boundingBox();
+      expect((workspaceBox?.width ?? 0) + 32).toBeLessThanOrEqual(viewport.width);
+      expect(
+        await collectTargetSizeIssues(page),
+        `Workspace targets at ${viewport.width}`,
+      ).toEqual([]);
+      expect(
+        await collectFocusReachabilityIssues(page),
+        `Workspace reachability at ${viewport.width}`,
+      ).toEqual([]);
+      const workspaceOverflow = await workspace.evaluate(
+        (el) => el.scrollWidth > el.clientWidth + 1,
+      );
+      expect(workspaceOverflow, `Workspace internal overflow at ${viewport.width}`).toBe(false);
+      await page.keyboard.press("Control+b");
+      await expect(workspace).toBeHidden();
+    }
+  });
+
+  test("E2E-CONTRAST-01: control-line and focus ring tokens, focus not obscured, forced colors, targets, landmarks and live region", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await expect(page.locator("header.window-titlebar")).toBeVisible();
+    await expect(page.locator("main#main-content")).toBeVisible();
+    await expect(page.locator("nav.sidebar")).toBeVisible();
+    await expect(page.locator("footer.status-footer")).toBeVisible();
+    const liveRegion = page.locator('[aria-live="polite"]');
+    await expect(liveRegion).toHaveAttribute("aria-atomic", "false");
+    await expect(liveRegion).toHaveText("");
+
+    const tokenValues = await page.evaluate(() => {
+      const style = getComputedStyle(document.documentElement);
+      return {
+        controlLine: style.getPropertyValue("--control-line").trim(),
+        focusRing: style.getPropertyValue("--focus-ring-color").trim(),
+      };
+    });
+    expect(tokenValues.controlLine).toBe("#8a8a80");
+    expect(tokenValues.focusRing).toBe("#c8442e");
+
+    const paletteButton = page.getByRole("button", { name: /命令面板/ });
+    await paletteButton.focus();
+    const focusStyle = await paletteButton.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return {
+        outlineColor: style.outlineColor,
+        outlineWidth: style.outlineWidth,
+        outlineOffset: style.outlineOffset,
+        borderColor: style.borderColor,
+        height: el.getBoundingClientRect().height,
+      };
+    });
+    expect(focusStyle.outlineColor).toBe("rgb(200, 68, 46)");
+    expect(focusStyle.outlineWidth).toBe("2px");
+    expect(focusStyle.outlineOffset).toBe("2px");
+    expect(focusStyle.borderColor).toBe("rgb(138, 138, 128)");
+    expect(focusStyle.height).toBeGreaterThanOrEqual(28);
+
+    expect(await collectTargetSizeIssues(page), "shell/onboarding target sizes").toEqual([]);
+
+    await page.keyboard.press("Control+k");
+    const palette = page.getByRole("dialog", { name: "命令面板" });
+    await expect(palette).toBeVisible();
+    expect(await collectTargetSizeIssues(page), "command palette target sizes").toEqual([]);
+    await page.keyboard.press("Escape");
+    await expect(palette).toBeHidden();
+
+    await page.keyboard.press("Control+,");
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    await expect(settings).toBeVisible();
+    expect(await collectTargetSizeIssues(page), "settings target sizes").toEqual([]);
+    for (let i = 0; i < 10; i += 1) {
+      await page.keyboard.press("Tab");
+      const rect = await page.evaluate(() => {
+        const el = document.activeElement as HTMLElement | null;
+        const box = el?.getBoundingClientRect();
+        return box
+          ? {
+              top: box.top,
+              bottom: box.bottom,
+              left: box.left,
+              right: box.right,
+            }
+          : null;
+      });
+      if (!rect) continue;
+      expect(rect.top).toBeGreaterThanOrEqual(-1);
+      expect(rect.left).toBeGreaterThanOrEqual(-1);
+      expect(rect.bottom).toBeLessThanOrEqual(901);
+      expect(rect.right).toBeLessThanOrEqual(1441);
+    }
+
+    await page.keyboard.press("Escape");
+    await expect(settings).toBeHidden();
+
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const capabilities = page.getByRole("dialog", { name: "能力目录" });
+    await expect(capabilities).toBeVisible();
+    expect(await collectTargetSizeIssues(page), "capabilities target sizes").toEqual([]);
+    await page.keyboard.press("Escape");
+    await expect(capabilities).toBeHidden();
+
+    await page.getByRole("button", { name: "Workspace ⌘B" }).click();
+    const workspace = page.getByRole("complementary", { name: "Workspace" });
+    await expect(workspace).toBeVisible();
+    expect(await collectTargetSizeIssues(page), "Workspace target sizes").toEqual([]);
+    await page.keyboard.press("Control+b");
+    await expect(workspace).toBeHidden();
+
+    await page.emulateMedia({ forcedColors: "active" });
+    await page.keyboard.press("Tab");
+    await paletteButton.focus();
+    await expect(paletteButton).toBeFocused();
+    const forcedStyle = await paletteButton.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return { outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth };
+    });
+    expect(forcedStyle.outlineStyle).toBe("solid");
+    expect(forcedStyle.outlineWidth).toBe("2px");
+  });
+});
+
 test.describe("Ticket #38 Drafts A11y", () => {
-  test("Ticket #38 draft alerts, expired attachment chips, and Settings -> Data orphaned drafts have zero critical/serious axe violations", async ({
+  test("E2E-A11Y-04: Ticket #38 draft alerts, expired attachment chips, and Settings -> Data orphaned drafts have zero critical/serious axe violations", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {

@@ -178,7 +178,7 @@ test.describe("Electron hardened smoke", () => {
       await expect(page.locator("body")).not.toContainText("SIMULATED DATA");
 
       // Verify Settings -> Gateways runs real read-only Test before Save, writes 0600 registry file without leaking secret across bridge
-      await page.getByRole("button", { name: "打开 Settings" }).click();
+      await page.getByRole("button", { name: "管理连接" }).click();
       const settings = page.getByRole("dialog", { name: "Settings" });
       await expect(settings).toBeVisible();
       await settings.getByRole("button", { name: "添加连接" }).click();
@@ -266,7 +266,7 @@ test.describe("Electron hardened smoke", () => {
       const page = await electronApp.firstWindow();
       await page.waitForLoadState("domcontentloaded");
 
-      const localCard = page.locator("section.local-repair-card");
+      const localCard = page.locator("section.onboarding-empty-card");
       await expect(localCard).toContainText("This device");
       await expect(localCard).toContainText("连接受阻");
       await expect(localCard).toContainText("发生了什么");
@@ -274,7 +274,10 @@ test.describe("Electron hardened smoke", () => {
       await expect(localCard).not.toContainText(sandbox.rootDir);
       await expect(localCard).not.toContainText("secret-dir");
 
-      const diagBtn = localCard.getByRole("button", { name: "导出脱敏诊断" });
+      await page.getByRole("button", { name: "管理连接" }).click();
+      const settings = page.getByRole("dialog", { name: "Settings" });
+      await expect(settings).toBeVisible();
+      const diagBtn = settings.getByRole("button", { name: "打开完整诊断视图" });
       await expect(diagBtn).toBeVisible();
       await diagBtn.click();
 
@@ -795,7 +798,7 @@ test.describe("Electron hardened smoke", () => {
       await page.setViewportSize({ width: 1440, height: 900 });
       await expect(page.locator("nav.sidebar")).toBeVisible();
 
-      await page.getByRole("button", { name: "打开 Settings" }).click();
+      await page.getByRole("button", { name: "管理连接" }).click();
       const settings = page.getByRole("dialog", { name: "Settings" });
       await expect(settings).toBeVisible();
       await settings.getByRole("button", { name: "添加连接" }).click();
@@ -1250,7 +1253,7 @@ test.describe("Electron hardened smoke", () => {
         }) as typeof dialog.showMessageBox;
       });
 
-      await page.getByRole("button", { name: /Workspace/ }).click();
+      await page.locator(".route-strip").getByRole("button", { name: "Workspace ⌘B" }).click();
       const drawer = page.getByRole("complementary", { name: "Workspace" });
       await drawer.getByRole("tab", { name: "Terminal" }).click();
 
@@ -1298,7 +1301,7 @@ test.describe("Electron hardened smoke", () => {
       await page.reload();
       await page.waitForLoadState("domcontentloaded");
       await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
-      await page.getByRole("button", { name: /Workspace/ }).click();
+      await page.locator(".route-strip").getByRole("button", { name: "Workspace ⌘B" }).click();
       const drawerAfterReload = page.getByRole("complementary", { name: "Workspace" });
       await drawerAfterReload.getByRole("tab", { name: "Terminal" }).click();
       await expect(drawerAfterReload.getByTestId("workspace-terminal-id")).toHaveText(realTerminalId, {

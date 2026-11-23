@@ -1,6 +1,78 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const FORBIDDEN_PROTOTYPE_TEXT = ["Homelab", "SIMULATED DATA", "Bot Mode", "Memory Graph", "Kanban"];
+
+async function readActiveFocusAudit(page: Page) {
+  return page.evaluate(() => {
+    const active = document.activeElement as HTMLElement | null;
+    if (!active || active === document.body || active === document.documentElement) {
+      return {
+        found: false,
+        tag: active?.tagName ?? "none",
+        label: "",
+        inViewport: false,
+        notObscured: false,
+        hitTag: "",
+      };
+    }
+    const rect = active.getBoundingClientRect();
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1);
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1);
+    const hit = document.elementFromPoint(x, y) as HTMLElement | null;
+    const label =
+      active.getAttribute("aria-label") ??
+      active.getAttribute("data-testid") ??
+      active.textContent?.trim().slice(0, 80) ??
+      "";
+    return {
+      found: true,
+      tag: active.tagName,
+      label,
+      inViewport:
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.top >= -1 &&
+        rect.left >= -1 &&
+        rect.bottom <= window.innerHeight + 1 &&
+        rect.right <= window.innerWidth + 1,
+      notObscured: Boolean(
+        hit && (hit === active || active.contains(hit) || hit.contains(active)),
+      ),
+      hitTag: hit?.tagName ?? "none",
+    };
+  });
+}
+
+async function expectFocusAudit(page: Page, label: string) {
+  const audit = await readActiveFocusAudit(page);
+  expect(audit.found, `${label}: focus must land on a real element`).toBe(true);
+  expect(audit.inViewport, `${label}: focused ${audit.tag} "${audit.label}" must be fully visible`).toBe(
+    true,
+  );
+  expect(
+    audit.notObscured,
+    `${label}: focused ${audit.tag} "${audit.label}" is covered by ${audit.hitTag}`,
+  ).toBe(true);
+}
+
+async function expectFocusableTargetsAudit(
+  page: Page,
+  root: Locator,
+  label: string,
+  limit = 12,
+) {
+  const targets = root.locator(
+    'button:not([disabled]):visible, a[href]:visible, input:not([type="hidden"]):not([disabled]):visible, select:not([disabled]):visible, textarea:not([disabled]):visible',
+  );
+  const count = Math.min(await targets.count(), limit);
+  expect(count, `${label}: expected at least one focusable target`).toBeGreaterThan(0);
+  for (let index = 0; index < count; index += 1) {
+    const target = targets.nth(index);
+    await target.focus();
+    await expect(target).toBeFocused();
+    await expectFocusAudit(page, `${label} control ${index + 1}`);
+  }
+}
 
 test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
   test("E2E-SHELL-01: 1440x900 shows 232px rail, 720px column, route strip, and real empty state without overflow", async ({
@@ -79,7 +151,7 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await expect(composer).toBeFocused();
 
     // Verify visible focus ring on focused button
-    const paletteBtn = page.getByRole("button", { name: "打开命令面板" });
+    const paletteBtn = page.getByRole("button", { name: /命令面板/ });
     await paletteBtn.focus();
     const ring = await paletteBtn.evaluate((el) => {
       const style = getComputedStyle(el);
@@ -122,45 +194,52 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     expect(Number.parseFloat(transitionDuration)).toBeLessThanOrEqual(0.001);
   });
 
-  test("E2E-KB-01 & E2E-FAKE-01: Local first-run blocked card exposes reachable repair actions and zero fake buttons", async ({
+  test("E2E-KB-01 & E2E-FAKE-01: Onboarding empty state exposes at most three reachable actions and zero fake buttons", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/");
 
-    const localCard = page.locator("section.local-repair-card");
-    await expect(localCard).toBeVisible();
-    await expect(localCard).toContainText("This device");
-    await expect(localCard).toContainText("连接受阻");
-    await expect(localCard).toContainText("发生了什么");
-    await expect(localCard).toContainText("可能原因");
-    await expect(localCard).toContainText("下一步");
+    const onboarding = page.locator("section.onboarding-empty-card");
+    await expect(onboarding).toBeVisible();
+    await expect(onboarding.getByRole("heading", { name: "尚未连接到 Hermes Gateway" })).toBeVisible();
+    await expect(onboarding).toContainText("发生了什么");
+    await expect(onboarding).toContainText("可能原因");
+    await expect(onboarding).toContainText("下一步");
+    await expect(onboarding).toContainText("Cron");
 
-    // E2E-KB-01: repair actions and Remote/SSH escape hatch are keyboard reachable
-    const chooseBtn = localCard.getByRole("button", { name: "选择本机 CLI" });
-    const docsBtn = localCard.getByRole("button", { name: "查看安装文档" });
-    const retryBtn = localCard.getByRole("button", { name: "重新检测" });
-    const escapeBtn = localCard.getByRole("button", { name: "改连 Remote / SSH" });
+    // E2E-KB-01: onboarding is limited to three actions and all are keyboard reachable
+    const onboardingActions = onboarding.locator(".empty-relay-actions button");
+    await expect(onboardingActions).toHaveCount(3);
+    const repairBtn = onboarding.getByRole("button", { name: "修复 Local" });
+    const remoteBtn = onboarding.getByRole("button", { name: "添加 Remote" });
+    const sshBtn = onboarding.getByRole("button", { name: "添加 SSH" });
+    await expect(repairBtn).toBeVisible();
+    await expect(remoteBtn).toBeVisible();
+    await expect(sshBtn).toBeVisible();
 
-    await expect(chooseBtn).toBeVisible();
-    await expect(docsBtn).toBeVisible();
-    await expect(retryBtn).toBeVisible();
-    await expect(escapeBtn).toBeVisible();
-
-    await chooseBtn.focus();
+    await repairBtn.focus();
     await page.keyboard.press("Enter");
     await expect(page.locator('[role="status"]')).toContainText("已取消选择 CLI");
 
-    await retryBtn.focus();
+    // Adding a Remote goes through Settings and returns focus on Esc
+    await remoteBtn.focus();
     await page.keyboard.press("Enter");
-
-    await escapeBtn.focus();
-    await page.keyboard.press("Enter");
-    const escapeDialog = page.getByRole("dialog", { name: "改连 Remote / SSH" });
-    await expect(escapeDialog).toBeVisible();
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    await expect(settings).toBeVisible();
+    await expect(settings.getByLabel("Gateway 地址")).toBeVisible();
     await page.keyboard.press("Escape");
-    await expect(escapeDialog).toBeHidden();
-    await expect(escapeBtn).toBeFocused();
+    await expect(settings).toBeHidden();
+    await expect(remoteBtn).toBeFocused();
+
+    // Adding an SSH connection goes through Settings with the SSH form preselected
+    await sshBtn.focus();
+    await page.keyboard.press("Enter");
+    await expect(settings).toBeVisible();
+    await expect(settings.getByLabel("SSH 主机")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(settings).toBeHidden();
+    await expect(sshBtn).toBeFocused();
 
     // E2E-FAKE-01: zero fake runtime install, fake health, or fake chat buttons
     const bodyText = await page.locator("body").innerText();
@@ -266,7 +345,8 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/");
 
-    await page.getByRole("button", { name: "打开 Settings" }).click();
+    await expect(page.getByRole("heading", { name: "尚未连接到 Hermes Gateway" })).toBeVisible();
+    await page.keyboard.press("Control+,");
     const settings = page.getByRole("dialog", { name: "Settings" });
     await expect(settings).toBeVisible();
 
@@ -330,7 +410,8 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/");
 
-    await page.getByRole("button", { name: "打开 Settings" }).click();
+    await expect(page.getByRole("heading", { name: "尚未连接到 Hermes Gateway" })).toBeVisible();
+    await page.keyboard.press("Control+,");
     const settings = page.getByRole("dialog", { name: "Settings" });
     await expect(settings).toBeVisible();
     await expect(settings).toContainText("Hermes Desktop 0.1.0 (dev+");
@@ -355,7 +436,7 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await expect(scopeBtn).toBeFocused();
   });
 
-  test("⌘K Command Palette uses WAI-ARIA combobox/listbox keyboard navigation sourced from CapabilityRegistry with zero deferred entries", async ({
+  test("E2E-KB-02: ⌘K Command Palette uses WAI-ARIA combobox/listbox keyboard navigation sourced from CapabilityRegistry with zero deferred entries and ignores IME composition", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -403,6 +484,18 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     expect(lastId).toBeTruthy();
     await page.keyboard.press("Home");
     expect(await combobox.getAttribute("aria-activedescendant")).toBe(firstId);
+
+    // IME composition must not move the active option or execute on Enter
+    await combobox.evaluate((el) => {
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowDown", isComposing: true, bubbles: true }),
+      );
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true }),
+      );
+    });
+    expect(await combobox.getAttribute("aria-activedescendant")).toBe(firstId);
+    await expect(palette).toBeVisible();
 
     // Filter to capabilities.open and press Enter to open Capabilities drawer
     await combobox.fill("查看能力目录");
@@ -452,7 +545,7 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
 });
 
 test.describe("Ticket #31 Session rail, recovery, route banner, and transcript resync", () => {
-  test("1440 session rail & 1280 Sessions popover support search, keyboard nav, aria-current, mouse focus retention, New Chat, and Session Details", async ({
+  test("E2E-KB-03: 1440 session rail & 1280 Sessions popover support search, keyboard nav, IME composition, aria-current, mouse focus retention, New Chat, and Session Details", async ({
     page,
   }) => {
     await page.addInitScript(() => {
@@ -597,8 +690,21 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await page.keyboard.press("Enter");
     await expect(gammaBtn).toHaveAttribute("aria-current", "page");
 
+    // IME composition must not be intercepted by Home/End/Arrow navigation
+    await betaBtn.focus();
+    await sidebar.locator("ul.session-list").evaluate((el) => {
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "ArrowDown",
+          isComposing: true,
+          bubbles: true,
+        }),
+      );
+    });
+    await expect(betaBtn).toBeFocused();
+
     // Search filter
-    const searchInput = sidebar.getByPlaceholder("搜索 Session...");
+    const searchInput = sidebar.getByPlaceholder("搜索 Session……");
     await searchInput.fill("Beta");
     await expect(betaBtn).toBeVisible();
     await expect(alphaBtn).toHaveCount(0);
@@ -617,7 +723,7 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     expect(popBox?.width).toBeLessThanOrEqual(400);
     expect(popBox?.height).toBeGreaterThanOrEqual(420);
 
-    await expect(popDialog.getByPlaceholder("搜索 Session...")).toBeVisible();
+    await expect(popDialog.getByPlaceholder("搜索 Session……")).toBeVisible();
     await expect(popDialog.locator(".session-details-card")).toContainText("local / default / sess-3");
 
     await popDialog.getByRole("button", { name: /新建 Session/ }).click();
@@ -961,7 +1067,8 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/");
 
-    await page.getByRole("button", { name: "打开 Settings" }).click();
+    await expect(page.getByRole("heading", { name: "尚未连接到 Hermes Gateway" })).toBeVisible();
+    await page.keyboard.press("Control+,");
     const settings = page.getByRole("dialog", { name: "Settings" });
     await expect(settings).toBeVisible();
 
@@ -1035,7 +1142,7 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await page.locator("#composer-input").fill("ping remote gateway");
     await page.getByRole("button", { name: "发送消息" }).click();
     await expect(page.locator(".transcript-list")).toContainText("ping remote gateway");
-    await expect(page.locator(".transcript-list")).toContainText("SSH Mock Gateway");
+    await expect(page.locator(".transcript-list")).toContainText("Mock Gateway (gpu-node)");
   });
 
   test("Ticket #35: Workspace shell bindings, 448/408 overlay geometry, Artifacts/Files preview & stale, annotations version, Hide vs Close, and FocusReturnController", async ({
@@ -1213,8 +1320,8 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await drawer.getByRole("button", { name: "放大预览" }).click();
     await expect(drawer.getByTestId("workspace-artifact-zoom")).toHaveText("125%");
 
-    await drawer.getByLabel("标注 X 坐标 (%)").fill("30");
-    await drawer.getByLabel("标注 Y 坐标 (%)").fill("70");
+    await drawer.getByLabel("标注 X 坐标（%）").fill("30");
+    await drawer.getByLabel("标注 Y 坐标（%）").fill("70");
     await drawer.getByLabel("标注内容").fill("Check section header");
     await drawer.getByRole("button", { name: "添加标注到 Draft" }).click();
 
@@ -1869,7 +1976,7 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await expect(routeStrip).toContainText("Gateway 连接已中断，正在等待退避重连。");
 
     // Check Settings -> Gateways row shows health, latencyUnknown, nextRetryAt, profile exception, safe error, and Retry
-    await page.getByRole("button", { name: "打开 Settings" }).click();
+    await page.keyboard.press("Control+,");
     const settings = page.getByRole("dialog", { name: "Settings" });
     const localRow = settings.locator('[data-connection-id="local"]');
     await expect(localRow).toContainText("正在重连");
@@ -1881,10 +1988,10 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
 
     await page.keyboard.press("Escape");
 
-    // Open Scope Popover to verify Profile exceptions & Pinned badges are visible
+    // Open Scope Popover to verify Profile exceptions & 已固定 badges are visible
     await routeStrip.getByRole("button", { name: /正在重连/ }).click();
     const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
-    await expect(scopeDialog).toContainText("Pinned");
+    await expect(scopeDialog).toContainText("已固定");
     await expect(scopeDialog).toContainText("该 Profile 未在当前 Gateway 启用");
     await page.keyboard.press("Escape");
 
@@ -2247,6 +2354,343 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
 
     await orphanCard.getByTestId("approval-dismiss-orphaned-btn").click();
     await expect(orphanedSection).toHaveCount(0);
+  });
+});
+
+test.describe("Ticket #45 approval keyboard safety", () => {
+  test("E2E-KB-05: approval never auto-focuses Approve, ignores repeat and global keys, Esc does not resolve, and native-sheet cancel is not deny", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local-control-socket",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-kb05",
+              title: "Approval Keyboard Session",
+              preview: "awaiting approval",
+              updatedAt: "2026-11-23T09:30:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: true,
+              activeTurnId: "turn-kb05",
+              status: "running",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-kb05",
+          },
+          activeSessionId: "sess-kb05",
+        },
+        approvals: [
+          {
+            gateway: {
+              approvalId: "apr-kb05-sudo",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-kb05",
+              turnId: "turn-kb05",
+              executionGeneration: 1,
+              command: "sudo systemctl reload nginx",
+              description: "Reload reverse proxy",
+              choices: ["once", "always", "deny"],
+              persistentGrant: {
+                pattern: "sudo systemctl reload *",
+                scope: "local/default",
+                revokeHint: "hermes approvals revoke apr-kb05-sudo",
+              },
+              riskCategories: ["sudo"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Approval Keyboard Session",
+              cwd: "/srv/app/current",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+        ],
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const card = page
+      .locator('[data-testid="approval-card"]')
+      .filter({ hasText: "sudo systemctl reload nginx" });
+    const approve = card.getByTestId("approval-choice-once");
+    await expect(card).toHaveAttribute("data-approval-state", "actionable");
+    await expect(approve).toBeVisible();
+    await expect(approve).not.toBeFocused();
+    expect(await card.getAttribute("role")).toBeNull();
+
+    const approvedCount = () =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __HERMES_E2E_COUNTS__: { approvalRespondCalls: number } })
+            .__HERMES_E2E_COUNTS__.approvalRespondCalls,
+      );
+
+    // Opening the owning Session must not move focus onto an Approve action.
+    await page
+      .locator("nav.sidebar")
+      .getByRole("button", { name: /Approval Keyboard Session/ })
+      .click();
+    await expect(card).toHaveAttribute("data-approval-state", "actionable");
+    await expect(approve).not.toBeFocused();
+
+    // No bare-key or modifier global approve/deny shortcut may resolve the Approval.
+    for (const key of ["Enter", "Space", "a", "y", "n", "d", "Control+Enter", "Meta+Enter"]) {
+      await page.keyboard.press(key);
+    }
+    expect(await approvedCount()).toBe(0);
+    await expect(card).toHaveAttribute("data-approval-state", "actionable");
+
+    await page.keyboard.press("Control+Shift+/");
+    const shortcuts = page.getByRole("dialog", { name: "键盘快捷键" });
+    await expect(shortcuts).toBeVisible();
+    await expect(shortcuts).not.toContainText("Approval");
+    await page.keyboard.press("Escape");
+    await expect(shortcuts).toBeHidden();
+    expect(await approvedCount()).toBe(0);
+
+    // Repeated Enter keydown is cancelled before native activation can re-fire.
+    await approve.focus();
+    const repeatPrevented = await approve.evaluate((el) => {
+      const event = new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        repeat: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      el.dispatchEvent(event);
+      return event.defaultPrevented;
+    });
+    expect(repeatPrevented).toBe(true);
+    expect(await approvedCount()).toBe(0);
+
+    // Esc never resolves; it only dismisses the topmost non-Approval surface.
+    await page.keyboard.press("Escape");
+    expect(await approvedCount()).toBe(0);
+    await expect(card).toHaveAttribute("data-approval-state", "actionable");
+
+    // Cancelling the native high-risk sheet leaves the Approval actionable, not denied.
+    await page.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_HIGH_RISK_CONFIRM__ = () => false;
+    });
+    await approve.click();
+    await expect(card).toHaveAttribute("data-approval-state", "actionable");
+    await expect(card.getByTestId("approval-cancelled-notice")).toContainText(
+      "已取消高风险确认，Approval 仍保持待处理。",
+    );
+    expect(await approvedCount()).toBe(1);
+
+    await page.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_HIGH_RISK_CONFIRM__ = () => true;
+    });
+    await approve.focus();
+    await page.keyboard.press("Enter");
+    await expect(card).toHaveAttribute("data-approval-state", "settled");
+    expect(await approvedCount()).toBe(2);
+
+    await page.keyboard.press("Enter");
+    expect(await approvedCount()).toBe(2);
+  });
+});
+
+test.describe("Ticket #45 focus visibility and modal layering", () => {
+  test("E2E-KB-06: shell, onboarding, Settings, palette, Capabilities, Workspace, and pending Approval keep focus visible, inert and topmost-only", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // Onboarding is the first focus surface before a connection exists.
+    const onboarding = page.locator("section.onboarding-empty-card");
+    await expect(onboarding).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expectFocusAudit(page, "onboarding first Tab");
+    await expectFocusableTargetsAudit(page, onboarding, "onboarding");
+
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local-control-socket",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-kb06",
+              title: "Focus Audit Session",
+              preview: "keyboard audit",
+              updatedAt: "2026-11-23T09:40:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: true,
+              activeTurnId: "turn-kb06",
+              status: "running",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-kb06",
+          },
+          activeSessionId: "sess-kb06",
+        },
+        approvals: [
+          {
+            gateway: {
+              approvalId: "apr-kb06",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-kb06",
+              turnId: "turn-kb06",
+              executionGeneration: 1,
+              command: "git status --short",
+              description: "Inspect working tree",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Focus Audit Session",
+              cwd: "/srv/app/current",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+        ],
+      };
+    });
+    await page.goto("/");
+
+    const shell = page.locator(".app-window");
+    const composer = page.locator("#composer-input");
+    await expect(composer).toBeVisible();
+    await composer.focus();
+    await expectFocusAudit(page, "shell composer");
+    await expectFocusableTargetsAudit(page, shell, "shell", 16);
+
+    await page.keyboard.press("Control+,");
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    await expect(settings).toBeVisible();
+    await expect(shell).toHaveAttribute("inert", "");
+    for (let index = 0; index < 16; index += 1) {
+      await page.keyboard.press("Tab");
+      await expect(settings.locator(":focus")).toHaveCount(1);
+      await expectFocusAudit(page, `Settings Tab ${index + 1}`);
+    }
+    for (let index = 0; index < 5; index += 1) {
+      await page.keyboard.press("Shift+Tab");
+      await expect(settings.locator(":focus")).toHaveCount(1);
+      await expectFocusAudit(page, `Settings Shift+Tab ${index + 1}`);
+    }
+
+    // A second modal stacks above Settings; Esc closes only the topmost one.
+    await page.keyboard.press("Control+k");
+    const palette = page.getByRole("dialog", { name: "命令面板" });
+    await expect(palette).toBeVisible();
+    await expect(settings).toBeVisible();
+    for (let index = 0; index < 8; index += 1) {
+      await page.keyboard.press("Tab");
+      await expect(palette.locator(":focus")).toHaveCount(1);
+      await expectFocusAudit(page, `palette Tab ${index + 1}`);
+    }
+    await page.keyboard.press("Escape");
+    await expect(palette).toBeHidden();
+    await expect(settings).toBeVisible();
+    await expect(settings.locator(":focus")).toHaveCount(1);
+    await expect(shell).toHaveAttribute("inert", "");
+    await page.keyboard.press("Escape");
+    await expect(settings).toBeHidden();
+    await expect(shell).not.toHaveAttribute("inert", "");
+
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const capabilities = page.getByRole("dialog", { name: "能力目录" });
+    await expect(capabilities).toBeVisible();
+    await expect(shell).toHaveAttribute("inert", "");
+    for (let index = 0; index < 12; index += 1) {
+      await page.keyboard.press("Tab");
+      await expect(capabilities.locator(":focus")).toHaveCount(1);
+      await expectFocusAudit(page, `Capabilities Tab ${index + 1}`);
+    }
+    await page.keyboard.press("Escape");
+    await expect(capabilities).toBeHidden();
+    await expect(shell).not.toHaveAttribute("inert", "");
+
+    await page.getByRole("button", { name: "Workspace ⌘B" }).click();
+    const workspace = page.getByRole("complementary", { name: "Workspace" });
+    await expect(workspace).toBeVisible();
+    await expect(shell).not.toHaveAttribute("inert", "");
+    await workspace.getByRole("button").first().focus();
+    await expectFocusAudit(page, "Workspace first control");
+    await expectFocusableTargetsAudit(page, workspace, "Workspace");
+    await page.keyboard.press("Control+b");
+    await expect(workspace).toBeHidden();
+
+    const approve = page.getByTestId("approval-choice-once");
+    await expect(approve).toBeVisible();
+    await expectFocusableTargetsAudit(
+      page,
+      page.locator('[data-testid="approval-card"]'),
+      "pending Approval",
+      6,
+    );
   });
 });
 
@@ -3396,7 +3840,7 @@ test.describe("Ticket #40 Terminal PTY lifecycle & Git CLI deep links", () => {
     await page.goto("/");
 
     // Open Workspace -> Terminal tab
-    await page.getByRole("button", { name: /Workspace/ }).click();
+    await page.getByRole("button", { name: /^Workspace/ }).click();
     const drawer = page.getByRole("complementary", { name: "Workspace" });
     await expect(drawer).toBeVisible();
     await drawer.getByRole("tab", { name: "Terminal" }).click();
@@ -3449,7 +3893,7 @@ test.describe("Ticket #40 Terminal PTY lifecycle & Git CLI deep links", () => {
 
     // 3. Reload preserves terminalId + bounded scrollback
     await page.reload();
-    await page.getByRole("button", { name: /Workspace/ }).click();
+    await page.getByRole("button", { name: "Workspace ⌘B" }).click();
     const drawerAfterReload = page.getByRole("complementary", { name: "Workspace" });
     await drawerAfterReload.getByRole("tab", { name: "Terminal" }).click();
     await expect(drawerAfterReload.getByTestId("workspace-terminal-id")).toHaveText(firstTerminalId);
@@ -3575,7 +4019,7 @@ test.describe("Ticket #40 Terminal PTY lifecycle & Git CLI deep links", () => {
       };
     });
     await page.goto("/");
-    await page.getByRole("button", { name: /Workspace/ }).click();
+    await page.getByRole("button", { name: "Workspace ⌘B" }).click();
     const drawerUnknown = page.getByRole("complementary", { name: "Workspace" });
     await drawerUnknown.getByRole("tab", { name: "Terminal" }).click();
     const unknownAttr = drawerUnknown.getByTestId("workspace-terminal-attribution");
@@ -3931,5 +4375,886 @@ test.describe("Ticket #38 Drafts and OrphanedDrafts", () => {
     await composer.fill("Offline saved local draft + updated locally");
     await expect(page.locator(".composer-hint")).toContainText("离线 · 仅保存本地 Draft");
     await expect(page.getByRole("button", { name: "发送消息" })).toBeDisabled();
+  });
+
+});
+
+test.describe("Ticket #43 Turn & queue recovery", () => {
+  test("Ticket #43: unknown turn pauses Session/queue, never auto-discards, and Discard sends admission_id + execution_generation", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-43",
+              title: "Recovery Session",
+              preview: "Deploy the staging build",
+              updatedAt: "2026-11-23T10:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-43" },
+          activeSessionId: "sess-43",
+        },
+        chatState: {
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-43" },
+          lastSessionByScope: { "local::default": "sess-43" },
+          activeStatus: "ready",
+          sessionSummaries: {},
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-43": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-43",
+            messages: [
+              {
+                messageId: "m-43-user",
+                sessionId: "sess-43",
+                role: "user",
+                text: "Deploy the staging build",
+                createdAt: "2026-11-23T10:00:00.000Z",
+                turnId: "turn-lost-1",
+                status: "complete",
+              },
+              {
+                messageId: "m-43-assistant",
+                sessionId: "sess-43",
+                role: "assistant",
+                text: "Deployment started...",
+                createdAt: "2026-11-23T10:00:01.000Z",
+                turnId: "turn-lost-1",
+                streaming: false,
+                status: "interrupted",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        turnRecovery: {
+          sessions: [
+            {
+              sessionId: "sess-43",
+              activeTurnId: null,
+              executionGeneration: 3,
+              ownerGeneration: 2,
+              unknownTurns: [
+                {
+                  admissionId: "adm-lost-1",
+                  executionGeneration: 3,
+                  turnId: "turn-lost-1",
+                  originalInput: "Deploy the staging build",
+                  lostReason: "owner_restarted",
+                },
+              ],
+              queuedAdmissions: [
+                {
+                  admissionId: "adm-lost-follow",
+                  submissionId: "sub-lost-follow",
+                  text: "Follow-up after restart",
+                  position: 1,
+                  state: "queued",
+                },
+              ],
+            },
+          ],
+          autoFollowerOnDiscard: { text: "Follow-up after restart", turnId: "turn-follower-1" },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const unknown = page.getByTestId("unknown-turn-card");
+    await expect(unknown).toBeVisible();
+    await expect(unknown).toContainText("Turn lost during restart");
+    await expect(unknown).toContainText("Session 已暂停");
+    await expect(unknown).toContainText("不会自动重发或继续后续排队");
+    await expect(unknown.getByRole("button")).toHaveCount(1);
+    await expect(unknown.getByRole("button", { name: "放弃丢失 Turn" })).toBeVisible();
+    await expect(page.locator(".transcript-list")).toContainText("Deploy the staging build");
+    await expect(page.getByTestId("queue-item-adm-lost-follow")).toBeVisible();
+
+    await page.waitForTimeout(400);
+    const beforeDiscard = await page.evaluate(
+      () =>
+        (window as unknown as { __HERMES_E2E_COUNTS__: { resolveUnknownCalls: number } })
+          .__HERMES_E2E_COUNTS__.resolveUnknownCalls,
+    );
+    expect(beforeDiscard).toBe(0);
+
+    await unknown.getByText("查看详情").click();
+    await expect(unknown).toContainText("adm-lost-1");
+    await expect(unknown).toContainText("Execution 代际");
+    await expect(unknown).toContainText("执行进程已重启");
+    await expect(unknown).toContainText("Deploy the staging build");
+
+    await unknown.getByRole("button", { name: "放弃丢失 Turn" }).click();
+    await expect(unknown).toHaveCount(0);
+    const discardPayloads = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HERMES_E2E_COUNTS__: {
+            resolveUnknownPayloads: Array<{
+              admission_id: string;
+              execution_generation: number;
+            }>;
+          };
+        }).__HERMES_E2E_COUNTS__.resolveUnknownPayloads,
+    );
+    expect(discardPayloads).toEqual([{ admission_id: "adm-lost-1", execution_generation: 3 }]);
+    await expect(page.getByTestId("queue-item-adm-lost-follow")).toContainText("已开始执行");
+    await expect(page.locator(".transcript-list")).toContainText("Deploy the staging build");
+  });
+
+  test("Ticket #43: Stop reaches at most 'stopping', ACK loss becomes cancel_outcome_unknown, and never auto-resends across generations", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-43-stop",
+              title: "Stop Session",
+              preview: "Long running turn",
+              updatedAt: "2026-11-23T10:10:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-stop-1",
+              status: "running",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-43-stop",
+          },
+          activeSessionId: "sess-43-stop",
+        },
+        chatState: {
+          lastActiveChat: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-43-stop",
+          },
+          lastSessionByScope: { "local::default": "sess-43-stop" },
+          activeStatus: "ready",
+          sessionSummaries: {},
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-43-stop": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-43-stop",
+            messages: [
+              {
+                messageId: "m-43-stop",
+                sessionId: "sess-43-stop",
+                role: "assistant",
+                text: "Still running the migration",
+                createdAt: "2026-11-23T10:10:00.000Z",
+                turnId: "turn-stop-1",
+                streaming: true,
+                status: "streaming",
+              },
+            ],
+            activeTurnId: "turn-stop-1",
+            turnStopping: false,
+            executionGeneration: 4,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        turnRecovery: {
+          sessions: [
+            {
+              sessionId: "sess-43-stop",
+              activeTurnId: "turn-stop-1",
+              executionGeneration: 4,
+              ownerGeneration: 2,
+            },
+          ],
+          stopMode: "ack_loss",
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: "停止 Turn" }).click();
+    const stopUnknown = page.getByTestId("stop-outcome-unknown-card");
+    await expect(stopUnknown).toBeVisible();
+    await expect(stopUnknown).toContainText("停止结果待确认");
+    await expect(stopUnknown).toContainText("不会跨代际自动重发");
+    await expect(page.locator(".transcript-list")).toContainText("Still running the migration");
+    await expect(page.getByRole("button", { name: "已停止" })).toHaveCount(0);
+
+    await page.waitForTimeout(500);
+    const stopPayloads = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HERMES_E2E_COUNTS__: {
+            promptsStopCalls: number;
+            stopPayloads: Array<{ turnId?: string; executionGeneration?: number }>;
+          };
+        }).__HERMES_E2E_COUNTS__,
+    );
+    expect(stopPayloads.promptsStopCalls).toBe(1);
+    expect(stopPayloads.stopPayloads).toEqual([
+      { turnId: "turn-stop-1", executionGeneration: 4 },
+    ]);
+  });
+
+  test("Ticket #43: queue shows only admitted receipt, reconciles delivery_unknown with the same submissionId, cancels by admissionId, and steer failure requires an explicit fallback", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-43-queue",
+              title: "Queue Session",
+              preview: "Running and queued",
+              updatedAt: "2026-11-23T10:20:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-queue-1",
+              status: "running",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-43-queue",
+          },
+          activeSessionId: "sess-43-queue",
+        },
+        chatState: {
+          lastActiveChat: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-43-queue",
+          },
+          lastSessionByScope: { "local::default": "sess-43-queue" },
+          activeStatus: "ready",
+          sessionSummaries: {},
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-43-queue": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-43-queue",
+            messages: [
+              {
+                messageId: "m-43-queue",
+                sessionId: "sess-43-queue",
+                role: "assistant",
+                text: "Working on the release",
+                createdAt: "2026-11-23T10:20:00.000Z",
+                turnId: "turn-queue-1",
+                streaming: true,
+                status: "streaming",
+              },
+            ],
+            activeTurnId: "turn-queue-1",
+            turnStopping: false,
+            executionGeneration: 5,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        turnRecovery: {
+          sessions: [
+            {
+              sessionId: "sess-43-queue",
+              activeTurnId: "turn-queue-1",
+              executionGeneration: 5,
+              ownerGeneration: 2,
+            },
+          ],
+          queueAckMode: "ack_loss_unadmitted",
+          steerMode: "turn_finished",
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const composer = page.locator("#composer-input");
+    await composer.fill("Queued receipt prompt");
+    await page.getByRole("button", { name: "加入排队" }).click();
+
+    const deliveryUnknown = page.getByTestId("queue-delivery-unknown");
+    await expect(deliveryUnknown).toBeVisible();
+    await expect(page.getByTestId("queue-card")).toHaveCount(0);
+    const firstSubmissionId = await deliveryUnknown.locator("code").first().innerText();
+    await expect(deliveryUnknown).toContainText("未收到 Gateway 排队确认");
+
+    await deliveryUnknown.getByRole("button", { name: "检查回执" }).click();
+    await expect(deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" })).toBeVisible();
+    await deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" }).click();
+
+    const queueCard = page.getByTestId("queue-card");
+    await expect(queueCard).toBeVisible();
+    await expect(queueCard.locator(".turn-recovery-row")).toHaveCount(1);
+    await expect(queueCard).toContainText("Queued receipt prompt");
+    const queueCounts = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HERMES_E2E_COUNTS__: { queueSubmittedIds: string[] };
+        }).__HERMES_E2E_COUNTS__,
+    );
+    expect(queueCounts.queueSubmittedIds).toHaveLength(2);
+    expect(queueCounts.queueSubmittedIds[0]).toBe(firstSubmissionId);
+    expect(queueCounts.queueSubmittedIds[1]).toBe(firstSubmissionId);
+
+    await page.evaluate(() => {
+      const fixture = (window as unknown as { __HERMES_E2E_FIXTURE__: { turnRecovery: { queueCancelOutcome: string } } })
+        .__HERMES_E2E_FIXTURE__;
+      fixture.turnRecovery.queueCancelOutcome = "already_started";
+    });
+    await queueCard.getByRole("button", { name: "取消排队" }).click();
+    await expect(queueCard).toContainText("已开始执行");
+    await expect(queueCard.getByRole("button", { name: "取消排队" })).toHaveCount(0);
+
+    await page.locator("#turn-steer-input").fill("Prefer staging only");
+    await page.getByRole("button", { name: "发送纠偏" }).click();
+    const fallback = page.getByTestId("steer-fallback-card");
+    await expect(fallback).toBeVisible();
+    await expect(fallback).toContainText("纠偏未送达当前 Turn");
+    await expect(fallback).toContainText("Turn 已结束");
+    await expect(fallback.getByRole("button")).toHaveCount(3);
+    const countsBeforeFallback = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HERMES_E2E_COUNTS__: {
+            promptsSendCalls: number;
+            steerPayloads: Array<{ turnId?: string; executionGeneration?: number; text?: string }>;
+          };
+        }).__HERMES_E2E_COUNTS__,
+    );
+    expect(countsBeforeFallback.promptsSendCalls).toBe(0);
+    expect(countsBeforeFallback.steerPayloads).toEqual([
+      { turnId: "turn-queue-1", executionGeneration: 5, text: "Prefer staging only" },
+    ]);
+
+    await fallback.getByRole("button", { name: "作为新 Turn 发送" }).click();
+    await expect(fallback).toHaveCount(0);
+    const countsAfterFallback = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HERMES_E2E_COUNTS__: { promptsSendCalls: number };
+        }).__HERMES_E2E_COUNTS__,
+    );
+    expect(countsAfterFallback.promptsSendCalls).toBe(1);
+  });
+});
+
+test.describe("Ticket #44 read-only domains, Cron & capability completeness", () => {
+  const SERVED_WITH_CRON = [
+    "prompt.submit",
+    "prompt.cancel",
+    "session.steer",
+    "approval.list",
+    "session.create",
+    "session.list",
+    "session.resume",
+    "profiles.list",
+    "config.get",
+    "config.update",
+    "session.context_breakdown",
+    "messaging.status",
+    "cron.status",
+    "cron.submit",
+    "cron.cancel",
+    "cron.recover",
+  ];
+
+  test("Ticket #44 & E2E-FAKE-01 & E2E-KB-04: Memory and Messaging are read-only, Cron submits/cancels/recovers, tabs support arrows/Home/End/IME, and 17 reachable / 4 deferred stays disclosed", async ({
+    page,
+  }) => {
+    await page.addInitScript(
+      (servedMethods) => {
+        (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+          fleet: {
+            connections: [
+              {
+                connectionId: "local",
+                kind: "local",
+                label: "This device",
+                originDisplay: "local://control-socket",
+                actual: "ready",
+                aggregateState: "ready",
+                degraded: false,
+                latencyMs: 4,
+                nextRetryAt: null,
+              },
+            ],
+            profiles: [
+              {
+                connectionId: "local",
+                profileId: "default",
+                displayName: "Default",
+                handle: "default",
+                isDefault: true,
+                actual: "ready",
+                degraded: false,
+              },
+            ],
+            sessions: [
+              {
+                connectionId: "local",
+                profileId: "default",
+                sessionId: "sess-44",
+                title: "Capability Session",
+                preview: "Ready",
+                updatedAt: "2026-11-23T11:00:00.000Z",
+                pinned: false,
+                unreadCount: 0,
+                needsInput: false,
+                activeTurnId: null,
+                status: "idle",
+              },
+            ],
+            activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-44" },
+            activeSessionId: "sess-44",
+          },
+          chatState: {
+            lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-44" },
+            lastSessionByScope: { "local::default": "sess-44" },
+            activeStatus: "ready",
+            sessionSummaries: {},
+            missingSession: null,
+            routeBanner: null,
+          },
+          transcripts: {
+            "local::default::sess-44": {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-44",
+              messages: [
+                {
+                  messageId: "m-44",
+                  sessionId: "sess-44",
+                  role: "assistant",
+                  text: "Capability inventory ready",
+                  createdAt: "2026-11-23T11:00:00.000Z",
+                  status: "complete",
+                },
+              ],
+              activeTurnId: null,
+              turnStopping: false,
+              chatAvailable: true,
+              supportedActions: {
+                promptSubmit: true,
+                promptCancel: true,
+                promptSteer: true,
+                sessionCreate: true,
+                sessionResume: true,
+              },
+              snapshotSeq: 0,
+            },
+          },
+          capabilities: {
+            servedMethods,
+            memory: {
+              outcome: "ok",
+              sourceMethod: "session.context_breakdown",
+              rawPayload: {
+                total_tokens: 18400,
+                max_tokens: 128000,
+                sections: [
+                  { id: "system", label: "系统提示词", tokens: 4000, percentage: 21.7 },
+                  { id: "tools", label: "工具结果", tokens: 14400, percentage: 78.3 },
+                ],
+                notes: ["Memory 预算健康"],
+              },
+            },
+            messaging: {
+              outcome: "ok",
+              rawPayload: {
+                connectors: [
+                  {
+                    id: "slack",
+                    platform: "Slack",
+                    label: "Slack",
+                    status: "connected",
+                    gateway_id: "gw-slack",
+                    detail: "已连接工作区",
+                  },
+                  {
+                    id: "email",
+                    platform: "Email",
+                    label: "Email",
+                    status: "disconnected",
+                  },
+                ],
+              },
+            },
+            cron: {
+              outcome: "ok",
+              rawPayload: {
+                jobs: [
+                  {
+                    id: "cron-daily",
+                    name: "Daily digest",
+                    schedule: "0 9 * * *",
+                    prompt: "Summarize the overnight build",
+                    status: "scheduled",
+                    next_run_at: "2026-11-24T01:00:00.000Z",
+                  },
+                ],
+                recent_run_summary: "今日 09:00 成功",
+              },
+            },
+          },
+        };
+      },
+      SERVED_WITH_CRON,
+    );
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const capabilitiesDrawer = page.getByRole("dialog", { name: "能力目录" });
+    await expect(capabilitiesDrawer).toBeVisible();
+    await expect(capabilitiesDrawer.getByTestId("capabilities-counts-summary")).toContainText(
+      "能力 17 可达 4 延期",
+    );
+
+    // Memory: real read-only context from session.context_breakdown, no write controls
+    await capabilitiesDrawer.getByTestId("cap-action-memory-inspect").click();
+    const inspect = page.getByRole("dialog", { name: "只读域与 Cron 管理" });
+    await expect(inspect).toBeVisible();
+    await expect(inspect.getByTestId("memory-sections").locator("li")).toHaveCount(2);
+    await expect(inspect.getByTestId("memory-sections")).toContainText("系统提示词");
+    await expect(inspect).toContainText("18400 / 128000");
+    await expect(inspect.getByTestId("memory-state-notice")).toHaveCount(0);
+    await expect(inspect.getByRole("button", { name: /编辑|删除|关闭 Memory|开启 Memory/ })).toHaveCount(0);
+
+    const memoryTab = inspect.getByRole("tab", { name: "Memory 上下文" });
+    const messagingTab = inspect.getByRole("tab", { name: "Messaging 通道" });
+    const cronTab = inspect.getByRole("tab", { name: "Cron 定时任务" });
+    await memoryTab.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(messagingTab).toBeFocused();
+    await expect(messagingTab).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("End");
+    await expect(cronTab).toBeFocused();
+    await page.keyboard.press("Home");
+    await expect(memoryTab).toBeFocused();
+    await inspect.getByRole("tablist").evaluate((el) => {
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowRight", isComposing: true, bubbles: true }),
+      );
+    });
+    await expect(memoryTab).toBeFocused();
+
+    // Messaging: connector state + attribution + official docs only; never a connect-account OAuth CTA
+    await messagingTab.click();
+    await expect(inspect.getByTestId("messaging-connectors").locator("li")).toHaveCount(2);
+    await expect(inspect.getByTestId("messaging-connectors")).toContainText("Slack");
+    await expect(inspect.getByTestId("messaging-connectors")).toContainText("已连接");
+    await expect(inspect.getByTestId("messaging-attribution-slack")).toContainText("外部提供");
+    await expect(inspect.getByTestId("messaging-attribution-slack")).toHaveAttribute(
+      "data-attribution-origin",
+      "external",
+    );
+    await expect(inspect.getByRole("button", { name: /连接账号|OAuth|授权/ })).toHaveCount(0);
+    await expect(inspect.getByRole("button", { name: "打开官方文档" })).toBeVisible();
+
+    // Cron: native submit/cancel/recover, Routines folded in, no fake task buttons when unsupported
+    await inspect.getByRole("tab", { name: "Cron 定时任务" }).click();
+    await expect(inspect.getByTestId("cron-jobs")).toContainText("Daily digest");
+    await expect(inspect).toContainText("Routines 已折叠归入 Cron");
+    await inspect.getByLabel("任务名称").fill("Nightly backup");
+    await inspect.getByLabel("Cron 表达式").fill("0 2 * * *");
+    await inspect.getByLabel("执行提示词").fill("Run the nightly backup");
+    await inspect.getByRole("button", { name: "新建任务" }).click();
+    await expect(inspect.getByTestId("cron-jobs")).toContainText("Nightly backup");
+    const cronCountsAfterSubmit = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HERMES_E2E_COUNTS__: { cronSubmitCalls: number };
+        }).__HERMES_E2E_COUNTS__,
+    );
+    expect(cronCountsAfterSubmit.cronSubmitCalls).toBe(1);
+
+    const dailyJob = inspect.getByTestId("cron-job-cron-daily");
+    await dailyJob.getByRole("button", { name: "取消任务" }).click();
+    await expect(dailyJob).toContainText("已取消");
+    await dailyJob.getByRole("button", { name: "恢复任务" }).click();
+    await expect(dailyJob).toContainText("已调度");
+    const cronCounts = await page.evaluate(
+      () =>
+        (window as unknown as {
+          __HERMES_E2E_COUNTS__: { cronCancelCalls: number; cronRecoverCalls: number };
+        }).__HERMES_E2E_COUNTS__,
+    );
+    expect(cronCounts.cronCancelCalls).toBe(1);
+    expect(cronCounts.cronRecoverCalls).toBe(1);
+
+    await page.keyboard.press("Escape");
+    await expect(inspect).toBeHidden();
+    await page.keyboard.press("Escape");
+    await expect(capabilitiesDrawer).toBeHidden();
+  });
+
+  test("Ticket #44 & E2E-FAKE-01: Cron without submit stays read-only, and missing cron.status exposes no fake create button", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-44-ro",
+              title: "Read-only Cron",
+              preview: "Ready",
+              updatedAt: "2026-11-23T11:10:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-44-ro",
+          },
+          activeSessionId: "sess-44-ro",
+        },
+        chatState: {
+          lastActiveChat: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-44-ro",
+          },
+          lastSessionByScope: { "local::default": "sess-44-ro" },
+          activeStatus: "ready",
+          sessionSummaries: {},
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-44-ro": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-44-ro",
+            messages: [
+              {
+                messageId: "m-44-ro",
+                sessionId: "sess-44-ro",
+                role: "assistant",
+                text: "Read-only inventory ready",
+                createdAt: "2026-11-23T11:10:00.000Z",
+                status: "complete",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        capabilities: {
+          servedMethods: [
+            "prompt.submit",
+            "prompt.cancel",
+            "session.create",
+            "session.list",
+            "session.resume",
+            "profiles.list",
+            "cron.status",
+          ],
+          cron: {
+            outcome: "ok",
+            rawPayload: {
+              jobs: [
+                {
+                  id: "cron-read-only",
+                  name: "Read-only job",
+                  schedule: "0 6 * * *",
+                  prompt: "List the corpus",
+                  status: "scheduled",
+                },
+              ],
+            },
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const capabilitiesDrawer = page.getByRole("dialog", { name: "能力目录" });
+    await capabilitiesDrawer.getByTestId("cap-action-cron-status").click();
+    const inspect = page.getByRole("dialog", { name: "只读域与 Cron 管理" });
+    await expect(inspect.getByTestId("cron-read-only-notice")).toContainText(
+      "已隐藏新建任务按钮",
+    );
+    await expect(inspect.getByTestId("cron-jobs")).toContainText("Read-only job");
+    await expect(inspect.getByRole("button", { name: "新建任务" })).toHaveCount(0);
+    await expect(inspect.getByRole("button", { name: /新建|添加 Cron|创建任务/ })).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await expect(inspect).toBeHidden();
   });
 });

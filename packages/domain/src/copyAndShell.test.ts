@@ -21,6 +21,10 @@ describe("zh-CN copy catalog & terminology lint", () => {
   it("catches banned translations, missing CJK-ASCII spacing, and bare ok/cancel buttons", () => {
     expect(validateTerminology("正在连接本地网关与工作区")).not.toEqual([]);
     expect(validateTerminology("新建Session并查看Workspace")).not.toEqual([]);
+    expect(validateTerminology("正在连接...")).not.toEqual([]);
+    expect(validateTerminology("搜索 Session...")).not.toEqual([]);
+    expect(validateTerminology("输入命令或文本后发送至 PTY（例如 pwd）...")).not.toEqual([]);
+    expect(validateTerminology("已连接到 Gateway,正在同步")).not.toEqual([]);
     expect(validateTerminology("确定")).not.toEqual([]);
     expect(validateTerminology("取消")).not.toEqual([]);
     expect(validateTerminology("在当前 Scope 新建 Session")).toEqual([]);
@@ -155,5 +159,57 @@ describe("Quiet Relay shell state & layout invariants", () => {
     state = shellReducer(state, { type: "CLOSE_TOPMOST_SURFACE" });
     expect(getTopmostSurface(state)).toBeNull();
     expect(state.inspectedApprovalKey).toBeNull();
+  });
+
+  it("tracks domainInspect overlay surface & tab and closes topmost cleanly (Ticket #44)", () => {
+    let state = createInitialShellState();
+    expect(state.domainInspectTab).toBe("memory");
+
+    state = shellReducer(state, { type: "OPEN_DOMAIN_INSPECT", tab: "cron" });
+    expect(getTopmostSurface(state)).toBe("domainInspect");
+    expect(state.domainInspectTab).toBe("cron");
+
+    state = shellReducer(state, { type: "OPEN_DOMAIN_INSPECT", tab: "messaging" });
+    expect(getTopmostSurface(state)).toBe("domainInspect");
+    expect(state.domainInspectTab).toBe("messaging");
+
+    state = shellReducer(state, { type: "CLOSE_TOPMOST_SURFACE" });
+    expect(getTopmostSurface(state)).toBeNull();
+
+    // New #44 copy keys pass terminology rules
+    expect(getCopy("empty.actionRepairLocal")).toBe("修复 Local");
+    expect(getCopy("empty.actionAddRemote")).toBe("添加 Remote");
+    expect(getCopy("empty.actionAddSsh")).toBe("添加 SSH");
+    expect(getCopy("chat.emptyContinueRecent")).toBe("继续最近 Session");
+    expect(getCopy("chat.emptyCapabilities")).toBe("能力目录 ⌘K");
+    expect(getCopy("chat.emptyOpenWorkspace")).toBe("打开 Workspace");
+    expect(getCopy("cron.title")).toBe("Cron 定时任务");
+  });
+
+  it("starts with an empty polite live region and dedupes the same event id without dropping new events", () => {
+    let state = createInitialShellState();
+    expect(state.liveAnnouncement).toBe("");
+    expect(state.liveAnnouncementEventId).toBeNull();
+
+    state = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "已复制本地 Draft 文本",
+      eventId: "copy-draft-1",
+    });
+    expect(state.liveAnnouncement).toBe("已复制本地 Draft 文本");
+
+    const duplicated = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "已复制本地 Draft 文本",
+      eventId: "copy-draft-1",
+    });
+    expect(duplicated).toBe(state);
+
+    state = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "已切换到当前 Scope",
+      eventId: "scope-switch-2",
+    });
+    expect(state.liveAnnouncement).toBe("已切换到当前 Scope");
   });
 });

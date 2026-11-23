@@ -176,7 +176,12 @@ export function ApprovalCard({
         </p>
       )}
 
-      <div className="approval-actions">
+      <div
+        className="approval-actions"
+        onKeyDown={(event) => {
+          if (event.repeat) event.preventDefault();
+        }}
+      >
         {visibleChoices.map((choice) => {
           const isDisabled =
             approval.inFlight || (choice === "deny" ? !approval.canDeny : !approval.canApprove);

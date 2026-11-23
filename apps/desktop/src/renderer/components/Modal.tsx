@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useId, useLayoutEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 
 interface ModalProps {
@@ -114,7 +115,7 @@ export function FocusDialog({
 
   if (!open) return null;
 
-  return (
+  return createPortal(
     <div
       className={["modal-scrim", scrimClassName].filter(Boolean).join(" ")}
       onMouseDown={(event) => {
@@ -150,6 +151,7 @@ export function FocusDialog({
         </div>
         <div className="dialog-body">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

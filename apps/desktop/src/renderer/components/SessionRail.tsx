@@ -67,7 +67,7 @@ export function SessionRailList({
   }, [query, sessions]);
 
   const handleListKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
-    if (filteredSessions.length === 0) return;
+    if (event.nativeEvent.isComposing || filteredSessions.length === 0) return;
     const currentIndex = rowRefs.current.findIndex((el) => el === document.activeElement);
     if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -275,22 +275,22 @@ export function SessionRailList({
               <div>
                 <dt>{getCopy("nav.sessionDetailsCliActions")}</dt>
                 <dd>
-                  <p className="session-cli-note" style={{ fontSize: 11.5, color: "var(--muted)", margin: "2px 0 6px" }}>
+                  <p className="session-cli-note" style={{ fontSize: "0.88462rem", color: "var(--muted)", margin: "2px 0 6px" }}>
                     {getCopy("session.cli.neverExecutedNotice")}
                   </p>
-                  <div className="session-cli-actions" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div className="session-cli-actions" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                     {cliDeepLinks.map((link) => (
                       <div
                         key={link.actionId}
                         style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}
                       >
-                        <code style={{ fontSize: 10.5, opacity: 0.85, wordBreak: "break-all" }}>{link.command}</code>
+                        <code style={{ fontSize: "0.80769rem", opacity: 0.85, wordBreak: "break-all" }}>{link.command}</code>
                         <button
                           type="button"
                           className="button button-secondary session-cli-btn"
                           data-cli-action={link.actionId}
                           data-cli-command={link.command}
-                          style={{ fontSize: 11, padding: "3px 8px", flexShrink: 0 }}
+                          style={{ fontSize: "0.84615rem", padding: "3px 8px", flexShrink: 0 }}
                           onClick={() => handleCopyCli(link.command)}
                         >
                           {getCopy(link.labelKey as CopyKey)}

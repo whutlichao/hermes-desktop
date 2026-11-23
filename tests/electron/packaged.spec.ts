@@ -77,7 +77,7 @@ test.describe("Packaged macOS .app smoke", () => {
       });
 
       // Open Settings via button and verify About & Updates copy
-      await page.getByRole("button", { name: "打开 Settings" }).click();
+      await page.getByRole("button", { name: "管理连接" }).click();
       const settingsDialog = page.getByRole("dialog", { name: "Settings" });
       await expect(settingsDialog).toBeVisible();
       await expect(settingsDialog).toContainText("Hermes Desktop 0.1.0 (");

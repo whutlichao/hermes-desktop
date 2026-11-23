@@ -26,6 +26,8 @@ interface GatewaysSettingsProps {
   fleetConnections?: ConnectionHealthSummary[];
   onSnapshotChange: (snapshot: RegistrySnapshotView) => void;
   onAnnounce: (message: string) => void;
+  addRequest?: { kind: ConnectionKind; nonce: number } | null;
+  onAddRequestConsumed?: () => void;
 }
 
 interface DraftFormState {
@@ -153,6 +155,8 @@ export function GatewaysSettings({
   fleetConnections = [],
   onSnapshotChange,
   onAnnounce,
+  addRequest = null,
+  onAddRequestConsumed,
 }: GatewaysSettingsProps) {
   const [draft, setDraft] = useState<DraftFormState>(INITIAL_DRAFT);
   const [initialEditSshSig, setInitialEditSshSig] = useState<string | null>(null);
@@ -228,7 +232,7 @@ export function GatewaysSettings({
     setPassedFingerprint(null);
   };
 
-  const openAddForm = () => {
+  const openAddForm = (kind: ConnectionKind = "remote") => {
     setConflict(null);
     setFormError(null);
     resetTestAndAuthState();
@@ -237,9 +241,15 @@ export function GatewaysSettings({
     setDraft({
       ...INITIAL_DRAFT,
       mode: "add",
-      kind: "remote",
+      kind,
     });
   };
+
+  useEffect(() => {
+    if (!addRequest) return;
+    openAddForm(addRequest.kind);
+    onAddRequestConsumed?.();
+  }, [addRequest?.nonce]);
 
   const openEditForm = (entry: ConnectionEntryDisplay, focusToken = false) => {
     setConflict(null);
@@ -724,7 +734,7 @@ export function GatewaysSettings({
             type="button"
             className="button button-primary"
             disabled={isReadOnly}
-            onClick={openAddForm}
+            onClick={() => openAddForm()}
           >
             {getCopy("gateways.addAction")}
           </button>

@@ -12,13 +12,14 @@ import type {
   SafeBackgroundNotification,
   DraftExportBundle,
   SessionTranscriptSnapshot,
+  TurnRecoveryTopicSnapshot,
 } from "@hermes/contracts";
 import { makeActiveChatDraftKey, makeNewChatDraftKey } from "@hermes/domain";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
 import { startFakeGatewayServer } from "../../../../tests/helpers/fakeGatewayServer";
 import { ChatSessionStateStore } from "./chatSessionStateStore";
 import { LocalBackendManager, createNodeLocalBackendPorts } from "./localBackendManager";
-import { LocalConnectionSupervisor } from "./connectionSupervisor";
+import { ConnectionSupervisor, LocalConnectionSupervisor } from "./connectionSupervisor";
 import { RegistryStore } from "./registryStore";
 import { SshTransportManager, createNodeSshTransportPorts } from "./sshTransport";
 
@@ -96,6 +97,37 @@ if (rest[0] === "gateway" && rest[1] === "attach") {
 process.exit(1);
 `;
   fs.writeFileSync(options.cliPath, script, { encoding: "utf8", mode: 0o755 });
+}
+
+async function bootFakeLocalSupervisor(input: {
+  sandbox: ReturnType<typeof createTestSandbox>;
+  wsUrl: string;
+  validTickets: Set<string>;
+}): Promise<ConnectionSupervisor> {
+  const cliPath = path.join(input.sandbox.rootDir, "hermes");
+  await writeFakeHermesCli({ cliPath, wsUrl: input.wsUrl });
+  const ports = createNodeLocalBackendPorts({
+    userDataDir: input.sandbox.userDataDir,
+    hermesHomeDir: input.sandbox.hermesHomeDir,
+    hermesHomeKind: "temp",
+    appVersion: "0.1.0",
+    buildMode: "dev",
+    pickCliFile: async () => ({ cancelled: true }),
+  });
+  await ports.writeOverridePath(cliPath);
+  const origRun = ports.runProcess;
+  ports.runProcess = async (req) => {
+    const res = await origRun(req);
+    if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+      const parsed = JSON.parse(res.stdout) as { ticket?: string };
+      if (parsed.ticket) input.validTickets.add(parsed.ticket);
+    }
+    return res;
+  };
+  const backend = new LocalBackendManager(ports);
+  const supervisor = new LocalConnectionSupervisor(backend);
+  await supervisor.connectLocal("default");
+  return supervisor;
 }
 
 describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)", () => {
@@ -3426,6 +3458,960 @@ process.exit(1);
       expect(
         afterDeleteOrphan.orphanedDrafts?.some((o) => o.orphanedId === opsOrphan!.orphanedId),
       ).toBe(false);
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("recovers Ticket #43 unknown turns, stop ACK loss, and steer outcomes over the S1 fake gateway", async () => {
+    const sandbox = createTestSandbox("hermes-s1-turn-recovery-");
+    let passed = false;
+    const validTickets = new Set<string>();
+
+    let activeTurnId: string | null = null;
+    let executionGeneration = 5;
+    let lastTurnOutcome: "completed" | "stopped" | "interrupted" | "error" | null = null;
+    let unknownTurns: Array<Record<string, unknown>> = [];
+    let interruptAckLoss = false;
+    let steerFailMode = false;
+    let steerCalls = 0;
+    let interruptCalls = 0;
+    let promptSubmitCalls = 0;
+    const promptSubmits: Array<Record<string, unknown>> = [];
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "sessions.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+        "prompt.submit",
+        "prompt.cancel",
+        "prompt.resolve_unknown",
+        "session.interrupt",
+        "session.steer",
+      ],
+      profiles: [{ profile_id: "default", display_name: "Default", handle: "default", is_default: true }],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-43", title: "Recovery Session", preview: "ready" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume" || method === "session.transcript") {
+          ctx.replyResult({
+            session_id: params.session_id,
+            messages: [
+              {
+                message_id: "msg-original-input",
+                role: "user",
+                text: "original input during restart",
+                created_at: "2026-11-23T12:00:00.000Z",
+              },
+            ],
+            active_turn_id: activeTurnId,
+            execution_generation: executionGeneration,
+            last_turn_outcome: lastTurnOutcome,
+            unknown_turns: unknownTurns,
+            queued_admissions: [],
+          });
+          return true;
+        }
+        if (method === "prompt.submit") {
+          promptSubmitCalls += 1;
+          promptSubmits.push({ ...params });
+          if (params.queued === true) {
+            ctx.replyError(-32600, "queued path not used in this test");
+            return true;
+          }
+          activeTurnId = "turn-running-1";
+          lastTurnOutcome = null;
+          ctx.replyResult({
+            accepted: true,
+            session_id: params.session_id,
+            turn_id: activeTurnId,
+            execution_generation: executionGeneration,
+            user_message_id: "msg-user-1",
+            assistant_message_id: "msg-assistant-1",
+          });
+          return true;
+        }
+        if (method === "session.interrupt") {
+          interruptCalls += 1;
+          if (interruptAckLoss) {
+            gw.closeAllClients();
+            return true;
+          }
+          activeTurnId = null;
+          lastTurnOutcome = "stopped";
+          ctx.replyResult({
+            stopped: true,
+            status: "stopped",
+            terminal: true,
+            turn_id: params.turn_id,
+            execution_generation: params.execution_generation,
+          });
+          return true;
+        }
+        if (method === "prompt.cancel") {
+          activeTurnId = null;
+          lastTurnOutcome = "stopped";
+          ctx.replyResult({ stopped: true, status: "stopped", terminal: true, turn_id: params.turn_id });
+          return true;
+        }
+        if (method === "prompt.resolve_unknown") {
+          ctx.replyResult({
+            settled: true,
+            status: "interrupted",
+            followers_released: true,
+            queued_admissions: [],
+          });
+          return true;
+        }
+        if (method === "session.steer") {
+          steerCalls += 1;
+          if (steerFailMode) {
+            ctx.replyResult({
+              steered: false,
+              reason: "generation_mismatch",
+              message: "Execution generation moved; choose how to continue.",
+            });
+            return true;
+          }
+          ctx.replyResult({ steered: true });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+      });
+      const scope = { connectionId: "local", profileId: "default", sessionId: "sess-43" };
+      const recoveryEvents: TurnRecoveryTopicSnapshot[] = [];
+      const unsub = supervisor.subscribe("turn.recovery", null, (event: BridgeEvent) => {
+        recoveryEvents.push(event.payload as TurnRecoveryTopicSnapshot);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const latestRecovery = () =>
+        recoveryEvents[recoveryEvents.length - 1]?.sessions.find(
+          (item) => item.sessionId === "sess-43",
+        ) ?? null;
+
+      // 1. Unknown turn after owner death: pause queue, no auto-discard, original input preserved.
+      const firstSend = (await supervisor.handlers["prompts.send"](
+        { sessionId: "sess-43", text: "original input during restart" },
+        scope,
+      )) as { accepted: boolean; turnId: string; executionGeneration: number };
+      expect(firstSend.accepted).toBe(true);
+      expect(firstSend.executionGeneration).toBe(executionGeneration);
+      expect(promptSubmitCalls).toBe(1);
+
+      activeTurnId = null;
+      lastTurnOutcome = "interrupted";
+      unknownTurns = [
+        {
+          admission_id: "adm-lost-1",
+          execution_generation: executionGeneration,
+          turn_id: firstSend.turnId,
+          original_input: "original input during restart",
+          reason: "owner_restarted",
+          message: "Turn lost during restart",
+        },
+      ];
+      const resumed = (await supervisor.handlers["sessions.resume"](
+        { sessionId: "sess-43", resync: true },
+        scope,
+      )) as { transcript: SessionTranscriptSnapshot };
+      expect(resumed.transcript.activeTurnId).toBeNull();
+      expect(resumed.transcript.messages.some((m) => m.text.includes("original input"))).toBe(true);
+
+      const pausedView = latestRecovery();
+      expect(pausedView?.queuePaused).toBe(true);
+      expect(pausedView?.unknownTurn).toMatchObject({
+        admissionId: "adm-lost-1",
+        executionGeneration,
+        message: "Turn lost during restart",
+      });
+      expect(
+        gw.rpcCalls.filter((call) => call.method === "prompt.resolve_unknown"),
+      ).toHaveLength(0);
+
+      await expect(
+        supervisor.handlers["prompts.send"]({ sessionId: "sess-43", text: "must not send" }, scope),
+      ).rejects.toMatchObject({ code: "conflict" });
+      await expect(
+        supervisor.handlers["prompts.queue"]({ sessionId: "sess-43", text: "must not queue" }, scope),
+      ).rejects.toMatchObject({ code: "conflict" });
+      expect(promptSubmitCalls).toBe(1);
+
+      const discard = (await supervisor.handlers["prompts.resolveUnknown"](
+        {
+          sessionId: "sess-43",
+          admissionId: "adm-lost-1",
+          executionGeneration,
+        },
+        scope,
+      )) as { resolved: boolean; status: string };
+      expect(discard).toMatchObject({ resolved: true, status: "interrupted" });
+      const resolveCall = gw.rpcCalls.find((call) => call.method === "prompt.resolve_unknown");
+      expect(resolveCall?.params).toEqual({
+        profile_id: "default",
+        session_id: "sess-43",
+        admission_id: "adm-lost-1",
+        execution_generation: executionGeneration,
+      });
+      expect(latestRecovery()?.unknownTurn).toBeNull();
+      expect(latestRecovery()?.queuePaused).toBe(false);
+
+      // 2. Stop: generation mismatch is rejected without a wire call; ACK loss becomes cancel_outcome_unknown.
+      const secondSend = (await supervisor.handlers["prompts.send"](
+        { sessionId: "sess-43", text: "second turn" },
+        scope,
+      )) as { turnId: string };
+      await expect(
+        supervisor.handlers["prompts.stop"](
+          { sessionId: "sess-43", turnId: secondSend.turnId, executionGeneration: executionGeneration - 1 },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "conflict" });
+      expect(interruptCalls).toBe(0);
+
+      interruptAckLoss = true;
+      const lostStop = (await supervisor.handlers["prompts.stop"](
+        { sessionId: "sess-43", turnId: secondSend.turnId, executionGeneration },
+        scope,
+      )) as { stopped: boolean; status: string; turnId: string; executionGeneration: number };
+      expect(lostStop).toMatchObject({
+        stopped: false,
+        status: "cancel_outcome_unknown",
+        turnId: secondSend.turnId,
+        executionGeneration,
+      });
+      expect(interruptCalls).toBe(1);
+      const interruptPayload = gw.rpcCalls.find((call) => call.method === "session.interrupt");
+      expect(interruptPayload?.params).toEqual({
+        profile_id: "default",
+        session_id: "sess-43",
+        turn_id: secondSend.turnId,
+        execution_generation: executionGeneration,
+      });
+      expect(latestRecovery()?.stopState).toBe("cancel_outcome_unknown");
+
+      // Reconnect and resume: the server says the turn is terminal; never auto-resend the stop.
+      await supervisor.handlers["connections.retry"]({ connectionId: "local" }, null);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (supervisor.getLocalHealth().actual === "ready") break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(supervisor.getLocalHealth().actual).toBe("ready");
+      interruptAckLoss = false;
+      activeTurnId = null;
+      lastTurnOutcome = "interrupted";
+      unknownTurns = [];
+      await supervisor.handlers["sessions.resume"]({ sessionId: "sess-43", resync: true }, scope);
+      expect(interruptCalls).toBe(1);
+      expect(latestRecovery()?.stopState).toBe("stopped");
+
+      // 3. Steer: success, explicit failure fallback, and a precheck-only turn_finished refusal.
+      const thirdSend = (await supervisor.handlers["prompts.send"](
+        { sessionId: "sess-43", text: "third turn" },
+        scope,
+      )) as { turnId: string; executionGeneration: number };
+      const steerOk = (await supervisor.handlers["prompts.steer"](
+        {
+          sessionId: "sess-43",
+          turnId: thirdSend.turnId,
+          executionGeneration: thirdSend.executionGeneration,
+          text: "focus on the failing test",
+        },
+        scope,
+      )) as { steered: boolean; status: string };
+      expect(steerOk).toMatchObject({ steered: true, status: "steered" });
+      const steerCall = gw.rpcCalls.filter((call) => call.method === "session.steer").at(-1);
+      expect(steerCall?.params).toEqual({
+        profile_id: "default",
+        session_id: "sess-43",
+        turn_id: thirdSend.turnId,
+        execution_generation: thirdSend.executionGeneration,
+        text: "focus on the failing test",
+      });
+
+      const submitCountBeforeFailedSteer = promptSubmitCalls;
+      steerFailMode = true;
+      const steerFailed = (await supervisor.handlers["prompts.steer"](
+        {
+          sessionId: "sess-43",
+          turnId: thirdSend.turnId,
+          executionGeneration: thirdSend.executionGeneration,
+          text: "do not silently resend",
+        },
+        scope,
+      )) as {
+        status: string;
+        steered: boolean;
+        requiresExplicitFallback: boolean;
+        allowedFallbacks: string[];
+        reason: string;
+      };
+      expect(steerFailed).toMatchObject({
+        status: "failed",
+        steered: false,
+        requiresExplicitFallback: true,
+        allowedFallbacks: ["new_turn", "queue"],
+        reason: "generation_mismatch",
+      });
+      expect(promptSubmitCalls).toBe(submitCountBeforeFailedSteer);
+
+      steerFailMode = false;
+      const stopped = (await supervisor.handlers["prompts.stop"](
+        { sessionId: "sess-43", turnId: thirdSend.turnId, executionGeneration },
+        scope,
+      )) as { status: string };
+      expect(stopped.status).toBe("stopped");
+      const steerCallsBeforePrecheck = steerCalls;
+      const steerFinished = (await supervisor.handlers["prompts.steer"](
+        {
+          sessionId: "sess-43",
+          turnId: thirdSend.turnId,
+          executionGeneration,
+          text: "late steer",
+        },
+        scope,
+      )) as {
+        status: string;
+        steered: boolean;
+        requiresExplicitFallback: boolean;
+        reason: string;
+      };
+      expect(steerFinished).toMatchObject({
+        status: "failed",
+        steered: false,
+        requiresExplicitFallback: true,
+        reason: "turn_finished",
+      });
+      expect(steerCalls).toBe(steerCallsBeforePrecheck);
+
+      // No implicit fallback ever calls prompt.submit.
+      expect(promptSubmitCalls).toBe(3);
+      expect(promptSubmits.every((call) => call.queued !== true)).toBe(true);
+
+      unsub();
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("requires an admitted Ticket #43 queue receipt before showing the queue card, retries only the same submissionId after reconciliation, and cancels by admissionId", async () => {
+    const sandbox = createTestSandbox("hermes-s1-queue-recovery-");
+    let passed = false;
+    const validTickets = new Set<string>();
+
+    let admissionSeq = 0;
+    let deliveryUnknownSubmissionId: string | null = "sub-q-2";
+    let receiptFound = false;
+    const queueAdmissions: Array<Record<string, unknown>> = [];
+    const cancelStatuses = new Map<string, string>();
+    const promptSubmits: Array<Record<string, unknown>> = [];
+    const promptCancels: Array<Record<string, unknown>> = [];
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "sessions.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+        "prompt.submit",
+        "prompt.receipt",
+        "prompt.cancel",
+      ],
+      profiles: [{ profile_id: "default", display_name: "Default", handle: "default", is_default: true }],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-queue", title: "Queue Session", preview: "ready" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume" || method === "session.transcript") {
+          ctx.replyResult({
+            session_id: params.session_id,
+            messages: [],
+            active_turn_id: null,
+            execution_generation: 5,
+            queued_admissions: queueAdmissions,
+          });
+          return true;
+        }
+        if (method === "prompt.submit") {
+          promptSubmits.push({ ...params });
+          const submissionId = String(params.submission_id ?? "");
+          if (params.queued === true && deliveryUnknownSubmissionId === submissionId) {
+            deliveryUnknownSubmissionId = null;
+            ctx.replyResult({
+              admitted: true,
+              status: "queued",
+              submission_id: submissionId,
+            });
+            return true;
+          }
+          if (params.queued !== true) {
+            ctx.replyError(-32600, "this S1 test only queues prompts");
+            return true;
+          }
+          admissionSeq += 1;
+          const admissionId = `adm-q-${admissionSeq}`;
+          queueAdmissions.push({
+            admission_id: admissionId,
+            submission_id: submissionId,
+            text: params.text,
+            position: admissionSeq,
+            status: "queued",
+            execution_generation: 5,
+          });
+          ctx.replyResult({
+            admitted: true,
+            admission_id: admissionId,
+            submission_id: submissionId,
+            position: admissionSeq,
+            execution_generation: 5,
+            status: "queued",
+          });
+          return true;
+        }
+        if (method === "prompt.receipt") {
+          const match = queueAdmissions.find(
+            (item) => item.submission_id === params.submission_id,
+          );
+          ctx.replyResult({
+            found: receiptFound && Boolean(match),
+            ...(match ? { admission: match } : {}),
+            queued_admissions: queueAdmissions,
+          });
+          return true;
+        }
+        if (method === "prompt.cancel") {
+          promptCancels.push({ ...params });
+          const admissionId = String(params.admission_id ?? "");
+          if (!admissionId) {
+            ctx.replyResult({ stopped: true, status: "stopped" });
+            return true;
+          }
+          const status = cancelStatuses.get(admissionId) ?? "cancelled";
+          const row = queueAdmissions.find((item) => item.admission_id === admissionId);
+          if (row) row.status = status;
+          ctx.replyResult({
+            status,
+            admission_id: admissionId,
+            ...(status === "cancelled" ? { cancelled: true } : {}),
+            ...(status === "stopped" ? { stopped: true } : {}),
+            ...(status === "already_started" ? { already_started: true, turn_id: "turn-started" } : {}),
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+      });
+      const scope = { connectionId: "local", profileId: "default", sessionId: "sess-queue" };
+      const recoveryEvents: TurnRecoveryTopicSnapshot[] = [];
+      const unsub = supervisor.subscribe("turn.recovery", null, (event: BridgeEvent) => {
+        recoveryEvents.push(event.payload as TurnRecoveryTopicSnapshot);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const latestRecovery = () =>
+        recoveryEvents[recoveryEvents.length - 1]?.sessions.find(
+          (item) => item.sessionId === "sess-queue",
+        ) ?? null;
+
+      // 1. Only an admitted receipt with a server admission_id creates a queue card.
+      const admitted = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-queue", text: "queued first", submissionId: "sub-q-1" },
+        scope,
+      )) as { status: string; admission?: { admissionId: string; submissionId: string } };
+      expect(admitted).toMatchObject({
+        status: "admitted",
+        admission: { admissionId: "adm-q-1", submissionId: "sub-q-1" },
+      });
+      expect(promptSubmits[0]).toEqual({
+        profile_id: "default",
+        session_id: "sess-queue",
+        text: "queued first",
+        queued: true,
+        submission_id: "sub-q-1",
+      });
+      expect(latestRecovery()?.queuedAdmissions).toHaveLength(1);
+      expect(latestRecovery()?.queuedAdmissions[0]).toMatchObject({
+        admissionId: "adm-q-1",
+        state: "queued",
+        position: 1,
+      });
+
+      // 2. Missing admission_id => delivery_unknown, no queue card, no automatic retry.
+      const missingReceipt = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-queue", text: "receipt missing", submissionId: "sub-q-2" },
+        scope,
+      )) as {
+        status: string;
+        deliveryUnknown: { submissionId: string; canRetrySameSubmission: boolean };
+      };
+      expect(missingReceipt.status).toBe("delivery_unknown");
+      expect(missingReceipt.deliveryUnknown).toMatchObject({
+        submissionId: "sub-q-2",
+        canRetrySameSubmission: false,
+      });
+      expect(latestRecovery()?.queuedAdmissions).toHaveLength(1);
+      expect(latestRecovery()?.pendingDeliveryUnknown).toHaveLength(1);
+      expect(promptSubmits).toHaveLength(2);
+
+      // 3. Receipt/queue snapshot confirms absence -> only then can the same submissionId retry.
+      const receipt = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-queue", submissionId: "sub-q-2" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(receipt).toMatchObject({ found: false, canRetrySameSubmission: true });
+      expect(latestRecovery()?.pendingDeliveryUnknown[0]).toMatchObject({
+        submissionId: "sub-q-2",
+        state: "retry_ready",
+        canRetrySameSubmission: true,
+      });
+      expect(latestRecovery()?.queuedAdmissions).toHaveLength(1);
+
+      const retried = (await supervisor.handlers["prompts.retryQueue"](
+        { sessionId: "sess-queue", submissionId: "sub-q-2" },
+        scope,
+      )) as { status: string; admission?: { admissionId: string; submissionId: string } };
+      expect(retried).toMatchObject({
+        status: "admitted",
+        admission: { admissionId: "adm-q-2", submissionId: "sub-q-2" },
+      });
+      const retriedSubmits = promptSubmits.filter((call) => call.submission_id === "sub-q-2");
+      expect(retriedSubmits).toHaveLength(2);
+      expect(retriedSubmits[1]).toEqual(retriedSubmits[0]);
+      expect(latestRecovery()?.pendingDeliveryUnknown).toHaveLength(0);
+      expect(latestRecovery()?.queuedAdmissions.map((item) => item.admissionId)).toEqual([
+        "adm-q-1",
+        "adm-q-2",
+      ]);
+
+      // 4. Cancel by admissionId; server terminal states win and are never inferred locally.
+      cancelStatuses.set("adm-q-1", "already_started");
+      const startedCancel = (await supervisor.handlers["prompts.cancelQueued"](
+        { sessionId: "sess-queue", admissionId: "adm-q-1" },
+        scope,
+      )) as { outcome: string; admission: { state: string; turnId?: string } };
+      expect(startedCancel.outcome).toBe("already_started");
+      expect(startedCancel.admission).toMatchObject({
+        state: "already_started",
+        turnId: "turn-started",
+      });
+
+      cancelStatuses.set("adm-q-2", "cancelled");
+      const cancelled = (await supervisor.handlers["prompts.cancelQueued"](
+        { sessionId: "sess-queue", admissionId: "adm-q-2" },
+        scope,
+      )) as { outcome: string; admission: { state: string } };
+      expect(cancelled).toMatchObject({ outcome: "cancelled", admission: { state: "cancelled" } });
+      expect(promptCancels).toEqual([
+        { profile_id: "default", session_id: "sess-queue", admission_id: "adm-q-1" },
+        { profile_id: "default", session_id: "sess-queue", admission_id: "adm-q-2" },
+      ]);
+      expect(latestRecovery()?.queuedAdmissions.find((q) => q.admissionId === "adm-q-2")?.state).toBe(
+        "cancelled",
+      );
+
+      unsub();
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("keeps Memory and Messaging read-only, exposes native Ticket #44 Cron actions, discloses 17 reachable / 4 deferred, and degrades to read-only or unavailable on missing methods", async () => {
+    const sandbox = createTestSandbox("hermes-s1-readonly-domains-");
+    let passed = false;
+    const validTickets = new Set<string>();
+
+    let memoryMode: "breakdown" | "info" | "unsupported" = "breakdown";
+    let messagingMode: "ok" | "missing" = "ok";
+    let cronStatusMissing = false;
+    let cronSubmitMissing = false;
+    const cronJobs: Array<Record<string, unknown>> = [
+      {
+        id: "cron-daily",
+        name: "Daily digest",
+        schedule: "0 9 * * *",
+        prompt: "Summarize the overnight build",
+        status: "scheduled",
+        next_run_at: "2026-11-24T01:00:00.000Z",
+      },
+      {
+        id: "cron-hourly",
+        name: "Hourly cleanup",
+        schedule: "0 * * * *",
+        prompt: "Clean caches",
+        status: "failed",
+      },
+    ];
+    const cronCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+
+    const memoryBreakdown = {
+      total_tokens: 18400,
+      max_tokens: 128000,
+      sections: [
+        { id: "system", label: "系统提示词", tokens: 4000, percentage: 21.7 },
+        { id: "tools", label: "工具结果", tokens: 14400, percentage: 78.3 },
+      ],
+      notes: ["Memory 预算健康"],
+    };
+    const sessionInfo = {
+      context_tokens: 9200,
+      context_window: 128000,
+      breakdown: [
+        { id: "history", label: "历史消息", tokens: 9200, percentage: 100 },
+      ],
+      notes: ["来自 session.info 的只读上下文"],
+    };
+    const messagingPayload = {
+      connectors: [
+        {
+          id: "slack",
+          platform: "Slack",
+          label: "Slack",
+          status: "connected",
+          gateway_id: "gw-slack",
+          detail: "已连接工作区",
+        },
+        { id: "email", platform: "Email", label: "Email", status: "disconnected" },
+      ],
+    };
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "sessions.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+        "prompt.submit",
+        "session.info",
+        "session.context_breakdown",
+        "messaging.status",
+        "cron.status",
+        "cron.submit",
+        "cron.cancel",
+        "cron.recover",
+      ],
+      profiles: [{ profile_id: "default", display_name: "Default", handle: "default", is_default: true }],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-domains", title: "Domains Session", preview: "ready" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume" || method === "session.transcript") {
+          ctx.replyResult({
+            session_id: params.session_id,
+            messages: [],
+            active_turn_id: null,
+          });
+          return true;
+        }
+        if (method === "session.info") {
+          if (memoryMode === "unsupported") {
+            ctx.replyError(-32601, "Method not found: session.info");
+          } else {
+            ctx.replyResult(sessionInfo);
+          }
+          return true;
+        }
+        if (method === "session.context_breakdown") {
+          if (memoryMode === "breakdown") {
+            ctx.replyResult(memoryBreakdown);
+          } else {
+            ctx.replyError(-32601, "Method not found: session.context_breakdown");
+          }
+          return true;
+        }
+        if (method === "messaging.status") {
+          if (messagingMode === "ok") {
+            ctx.replyResult(messagingPayload);
+          } else {
+            ctx.replyError(-32601, "Method not found: messaging.status");
+          }
+          return true;
+        }
+        if (method === "cron.status") {
+          if (cronStatusMissing) {
+            ctx.replyError(-32601, "Method not found: cron.status");
+          } else {
+            ctx.replyResult({
+              jobs: cronJobs,
+              recent_run_summary: "今日 09:00 成功",
+            });
+          }
+          return true;
+        }
+        if (method === "cron.submit" || method === "cron.cancel" || method === "cron.recover") {
+          cronCalls.push({ method, params: { ...params } });
+          if (method === "cron.submit" && cronSubmitMissing) {
+            ctx.replyError(-32601, "Method not found: cron.submit");
+            return true;
+          }
+          if (method === "cron.submit") {
+            cronJobs.push({
+              id: "cron-new-1",
+              name: params.name,
+              schedule: params.schedule,
+              prompt: params.prompt,
+              status: "scheduled",
+            });
+            ctx.replyResult({ ok: true, job_id: "cron-new-1" });
+          } else if (method === "cron.cancel") {
+            const row = cronJobs.find((job) => job.id === params.job_id);
+            if (row) row.status = "cancelled";
+            ctx.replyResult({ ok: true, job_id: params.job_id });
+          } else {
+            const row = cronJobs.find((job) => job.id === params.job_id);
+            if (row) row.status = "scheduled";
+            ctx.replyResult({ ok: true, job_id: params.job_id });
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+      });
+      const scope = { connectionId: "local", profileId: "default", sessionId: "sess-domains" };
+
+      const memorySnap = (await supervisor.handlers["capabilities.describe"](
+        { domain: "memory" },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(memorySnap.memory).toMatchObject({
+        status: "available",
+        readOnly: true,
+        sourceMethod: "session.context_breakdown",
+        totalTokens: 18400,
+        maxTokens: 128000,
+      });
+      expect(memorySnap.memory.sections).toHaveLength(2);
+      expect(memorySnap.domains.find((domain) => domain.domain === "memory")).toMatchObject({
+        classification: "read_only",
+        runtimeStatus: "read_only",
+      });
+      const memoryEntries = memorySnap.entries.filter((entry) => entry.domain === "memory");
+      expect(memoryEntries).toHaveLength(1);
+      expect(memoryEntries[0]).toMatchObject({
+        actionId: "memory.inspect",
+        classification: "read_only",
+        handlerId: "surface.openMemoryInspect",
+        evidenceTestId: "cap-action-memory-inspect",
+      });
+      expect(JSON.stringify(memorySnap.memory)).not.toMatch(/memory_graph|delete|edit|toggle/i);
+
+      const messagingSnap = (await supervisor.handlers["capabilities.describe"](
+        { domain: "messaging" },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(messagingSnap.messaging).toMatchObject({
+        status: "available",
+        readOnly: true,
+      });
+      expect(messagingSnap.messaging.connectors).toHaveLength(2);
+      expect(messagingSnap.messaging.connectors[0]?.attribution.origin).toBe("external");
+      expect(messagingSnap.messaging.connectors[1]?.attribution.sourceLabel).toBe("来源未知");
+      const messagingEntries = messagingSnap.entries.filter((entry) => entry.domain === "messaging");
+      expect(messagingEntries).toHaveLength(1);
+      expect(messagingEntries[0]).toMatchObject({
+        actionId: "messaging.status",
+        classification: "read_only",
+        handlerId: "surface.openMessagingInspect",
+      });
+      expect(JSON.stringify(messagingSnap.messaging)).not.toMatch(/连接账号|oauth|client_secret/i);
+
+      // Memory fallback: context_breakdown is missing, session.info still supplies read-only context.
+      memoryMode = "info";
+      const memoryFallback = (await supervisor.handlers["capabilities.describe"](
+        { domain: "memory", refresh: true },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(memoryFallback.memory).toMatchObject({
+        status: "available",
+        readOnly: true,
+        sourceMethod: "session.info",
+      });
+      expect(memoryFallback.memory.sections.length).toBeGreaterThan(0);
+
+      // No Memory read methods => unsupported, zero invented Memory Graph rows.
+      memoryMode = "unsupported";
+      const memoryUnsupported = (await supervisor.handlers["capabilities.describe"](
+        { domain: "memory", refresh: true },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(memoryUnsupported.memory.status).toBe("unsupported");
+      expect(memoryUnsupported.memory.sections).toEqual([]);
+      expect(memoryUnsupported.memory.degradation?.reason).toBe("method_not_found");
+
+      messagingMode = "missing";
+      const messagingUnsupported = (await supervisor.handlers["capabilities.describe"](
+        { domain: "messaging", refresh: true },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(messagingUnsupported.messaging.status).toBe("unsupported");
+      expect(messagingUnsupported.messaging.connectors).toEqual([]);
+
+      // Cron native: status + submit + cancel + recover and Routines folded into Cron.
+      const cronSnap = (await supervisor.handlers["capabilities.describe"](
+        { domain: "cron", refresh: true },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(cronSnap.cron).toMatchObject({
+        status: "available",
+        mode: "interactive",
+        routinesFoldedIntoCron: true,
+        supportedActions: {
+          canStatus: true,
+          canSubmit: true,
+          canCancel: true,
+          canRecover: true,
+        },
+      });
+      expect(cronSnap.cron.jobs.map((job) => job.jobId)).toEqual(["cron-daily", "cron-hourly"]);
+      expect(cronSnap.cron.recentRunSummary).toContain("09:00");
+
+      const submitted = (await supervisor.handlers["cron.submit"](
+        { name: "Nightly backup", schedule: "0 2 * * *", prompt: "Run the nightly backup" },
+        scope,
+      )) as { ok: boolean; jobId: string; cron: { jobs: Array<{ jobId: string }> } };
+      expect(submitted).toMatchObject({ ok: true, jobId: "cron-new-1" });
+      expect(submitted.cron.jobs.some((job) => job.jobId === "cron-new-1")).toBe(true);
+      expect(cronCalls[0]).toEqual({
+        method: "cron.submit",
+        params: {
+          profile_id: "default",
+          name: "Nightly backup",
+          schedule: "0 2 * * *",
+          prompt: "Run the nightly backup",
+        },
+      });
+
+      const cancelled = (await supervisor.handlers["cron.cancel"](
+        { jobId: "cron-daily" },
+        scope,
+      )) as { ok: boolean; cron: { jobs: Array<{ jobId: string; status: string }> } };
+      expect(cancelled.ok).toBe(true);
+      expect(cancelled.cron.jobs.find((job) => job.jobId === "cron-daily")?.status).toBe("cancelled");
+      expect(cronCalls[1]).toEqual({
+        method: "cron.cancel",
+        params: { profile_id: "default", job_id: "cron-daily" },
+      });
+
+      const recovered = (await supervisor.handlers["cron.recover"](
+        { jobId: "cron-daily" },
+        scope,
+      )) as { ok: boolean; cron: { jobs: Array<{ jobId: string; status: string }> } };
+      expect(recovered.ok).toBe(true);
+      expect(recovered.cron.jobs.find((job) => job.jobId === "cron-daily")?.status).toBe("scheduled");
+      expect(cronCalls[2]).toEqual({
+        method: "cron.recover",
+        params: { profile_id: "default", job_id: "cron-daily" },
+      });
+
+      // Missing cron.submit -> capability_unavailable, never a fake local task.
+      cronSubmitMissing = true;
+      await expect(
+        supervisor.handlers["cron.submit"](
+          { name: "Must not fake", schedule: "0 3 * * *", prompt: "no" },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "capability_unavailable" });
+      const readOnlyCron = (await supervisor.handlers["capabilities.describe"](
+        { domain: "cron", refresh: true },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(readOnlyCron.cron.mode).toBe("read_only");
+      expect(readOnlyCron.cron.supportedActions.canSubmit).toBe(false);
+      expect(readOnlyCron.cron.supportedActions.canStatus).toBe(true);
+      expect(readOnlyCron.cron.jobs.length).toBeGreaterThan(0);
+
+      // Missing cron.status -> unavailable with no status/submit/cancel/recover affordance.
+      cronStatusMissing = true;
+      const unavailableCron = (await supervisor.handlers["capabilities.describe"](
+        { domain: "cron", refresh: true },
+        scope,
+      )) as CapabilitySnapshot;
+      expect(unavailableCron.cron.status).toBe("unsupported");
+      expect(unavailableCron.cron.mode).toBe("unavailable");
+      expect(unavailableCron.cron.supportedActions).toEqual({
+        canStatus: false,
+        canSubmit: false,
+        canCancel: false,
+        canRecover: false,
+      });
+      const callsBeforeUnavailableSubmit = cronCalls.length;
+      await expect(
+        supervisor.handlers["cron.submit"](
+          { name: "No status", schedule: "0 4 * * *", prompt: "no" },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "capability_unavailable" });
+      expect(cronCalls).toHaveLength(callsBeforeUnavailableSubmit);
+
+      // 21-domain inventory with fixed counts and zero deferred actions on every surface.
+      const finalSnap = (await supervisor.handlers["capabilities.describe"]({}, scope)) as CapabilitySnapshot;
+      expect(finalSnap.counts).toEqual({
+        total: 21,
+        native: 13,
+        readOnly: 3,
+        deepLink: 1,
+        reachable: 17,
+        deferred: 4,
+      });
+      expect(finalSnap.domains).toHaveLength(21);
+      expect(finalSnap.domains.filter((domain) => domain.classification === "deferred")).toHaveLength(4);
+      expect(
+        finalSnap.entries.filter(
+          (entry) =>
+            entry.classification === "deferred" ||
+            ["voice", "bots", "memory_graph", "kanban"].includes(entry.domain),
+        ),
+      ).toEqual([]);
+      expect(finalSnap.entries.every((entry) => Boolean(entry.handlerId && entry.evidenceTestId))).toBe(
+        true,
+      );
 
       await supervisor.dispose();
       passed = true;

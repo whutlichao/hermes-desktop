@@ -48,13 +48,13 @@ export function DiagnosticsModal({
         <>
           <div className="diagnostics-grid">
             <div>
-              <span>App</span>
+              <span>{getCopy("diagnostics.field.app")}</span>
               <strong>
                 {report.appName} {report.appVersion}
               </strong>
             </div>
             <div>
-              <span>Mode</span>
+              <span>{getCopy("diagnostics.field.mode")}</span>
               <strong>
                 {report.buildMode} · {report.arch}
               </strong>
@@ -64,8 +64,8 @@ export function DiagnosticsModal({
               <strong>{report.hermesHomeKind}</strong>
             </div>
             <div>
-              <span>Failure</span>
-              <strong>{report.typedFailureCode ?? "none"}</strong>
+              <span>{getCopy("diagnostics.field.failure")}</span>
+              <strong>{report.typedFailureCode ?? getCopy("diagnostics.none")}</strong>
             </div>
           </div>
 

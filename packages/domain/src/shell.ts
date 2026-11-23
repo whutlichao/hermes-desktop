@@ -6,11 +6,13 @@ import type {
   CapabilitySnapshot,
   ChatSessionProjection,
   ConnectionHealthSummary,
+  DomainInspectTab,
   LocalInspectResult,
   ProfileSummary,
   SanitizedDiagnosticsPayload,
   SessionSummary,
   SessionTranscriptSnapshot,
+  TurnRecoveryTopicSnapshot,
   WorkspaceMode,
   WorkspaceTab,
 } from "@hermes/contracts";
@@ -24,6 +26,7 @@ export type OverlaySurface =
   | "settings"
   | "capabilities"
   | "extensions"
+  | "domainInspect"
   | "shortcuts"
   | "sessionsPopover"
   | "scopePopover"
@@ -46,13 +49,16 @@ export interface ShellState {
   diagnosticsReport: SanitizedDiagnosticsPayload | null;
   capabilities: CapabilitySnapshot;
   approvals: ApprovalTopicSnapshot;
+  turnRecovery: TurnRecoveryTopicSnapshot;
   inspectedApprovalKey: string | null;
+  domainInspectTab: DomainInspectTab;
   workspace: {
     mode: WorkspaceMode;
     activeTab: WorkspaceTab;
   };
   surfaceStack: OverlaySurface[];
   liveAnnouncement: string;
+  liveAnnouncementEventId: string | null;
 }
 
 export type ShellAction =
@@ -75,15 +81,18 @@ export type ShellAction =
   | { type: "APPLY_DIAGNOSTICS_REPORT"; report: SanitizedDiagnosticsPayload }
   | { type: "APPLY_CAPABILITIES_SNAPSHOT"; snapshot: CapabilitySnapshot }
   | { type: "APPLY_APPROVAL_SNAPSHOT"; snapshot: ApprovalTopicSnapshot }
+  | { type: "APPLY_TURN_RECOVERY_SNAPSHOT"; snapshot: TurnRecoveryTopicSnapshot }
   | { type: "OPEN_APPROVAL_INSPECT"; approvalKey: string }
   | { type: "CLOSE_APPROVAL_INSPECT" }
+  | { type: "OPEN_DOMAIN_INSPECT"; tab: DomainInspectTab }
+  | { type: "SET_DOMAIN_INSPECT_TAB"; tab: DomainInspectTab }
   | { type: "OPEN_SURFACE"; surface: OverlaySurface }
   | { type: "CLOSE_TOPMOST_SURFACE" }
   | { type: "CLOSE_SURFACE"; surface: OverlaySurface }
   | { type: "TOGGLE_WORKSPACE" }
   | { type: "SET_WORKSPACE_MODE"; mode: WorkspaceMode }
   | { type: "SET_WORKSPACE_TAB"; tab: WorkspaceTab }
-  | { type: "ANNOUNCE"; message: string };
+  | { type: "ANNOUNCE"; message: string; eventId?: string };
 
 export function deriveViewportMode(width: number): ViewportMode {
   return width <= 1340 ? "popover" : "rail";
@@ -109,13 +118,18 @@ export function createInitialShellState(): ShellState {
       pendingCount: 0,
       orphanedCount: 0,
     },
+    turnRecovery: {
+      sessions: [],
+    },
     inspectedApprovalKey: null,
+    domainInspectTab: "memory",
     workspace: {
       mode: "closed",
       activeTab: "artifacts",
     },
     surfaceStack: [],
     liveAnnouncement: "",
+    liveAnnouncementEventId: null,
   };
 }
 
@@ -197,6 +211,11 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         ...state,
         approvals: action.snapshot,
       };
+    case "APPLY_TURN_RECOVERY_SNAPSHOT":
+      return {
+        ...state,
+        turnRecovery: action.snapshot,
+      };
     case "OPEN_APPROVAL_INSPECT": {
       const filtered = state.surfaceStack.filter((item) => item !== "approvalInspect");
       return {
@@ -210,6 +229,19 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         ...state,
         surfaceStack: state.surfaceStack.filter((item) => item !== "approvalInspect"),
         inspectedApprovalKey: null,
+      };
+    case "OPEN_DOMAIN_INSPECT": {
+      const filtered = state.surfaceStack.filter((item) => item !== "domainInspect");
+      return {
+        ...state,
+        domainInspectTab: action.tab,
+        surfaceStack: [...filtered, "domainInspect"],
+      };
+    }
+    case "SET_DOMAIN_INSPECT_TAB":
+      return {
+        ...state,
+        domainInspectTab: action.tab,
       };
     case "OPEN_SURFACE": {
       const filtered = state.surfaceStack.filter((item) => item !== action.surface);
@@ -258,9 +290,13 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         },
       };
     case "ANNOUNCE":
+      if (action.eventId && state.liveAnnouncementEventId === action.eventId) {
+        return state;
+      }
       return {
         ...state,
         liveAnnouncement: action.message,
+        liveAnnouncementEventId: action.eventId ?? null,
       };
   }
 }
