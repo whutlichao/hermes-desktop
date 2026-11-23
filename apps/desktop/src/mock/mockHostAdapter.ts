@@ -6,6 +6,8 @@ import {
   type BridgeEvent,
   type BridgeResult,
   type BridgeScope,
+  type ConnectionMutationInput,
+  type ConnectionMutationResponse,
   type FleetSnapshot,
   type HermesHost,
   type HostCommand,
@@ -13,12 +15,23 @@ import {
   type LocalInspectResult,
   type LocalSelectCliResult,
   type SanitizedDiagnosticsPayload,
+  type LaunchMode,
+  type RegistryDiff,
+  type RegistrySnapshotView,
 } from "@hermes/contracts";
 import {
   createBridgeDispatcher,
+  createEmptyRegistryDocument,
+  diffRegistries,
   formatDisplaySafeCliSummary,
   mapLocalFailure,
+  normalizeRegistryDocument,
+  projectRegistrySnapshot,
   sanitizeDiagnosticsPayload,
+  validateClientAddConnection,
+  validateClientRemoveConnection,
+  validateClientUpdateConnection,
+  type NormalizedRegistryResult,
 } from "@hermes/domain";
 
 const VALID_TOPICS = new Set<string>(HOST_TOPICS);
@@ -63,6 +76,15 @@ export function createMockHostBridge(): HermesHost {
   const commandListeners = new Set<(cmd: AppCommand) => void>();
   const currentInspection = createInitialMockInspection();
 
+  const registryListeners = new Set<
+    (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void
+  >();
+
+  let currentNorm: NormalizedRegistryResult = normalizeRegistryDocument(
+    createEmptyRegistryDocument(),
+  );
+  let registrySeq = 0;
+
   const buildMockDiagnostics = (): SanitizedDiagnosticsPayload =>
     sanitizeDiagnosticsPayload({
       generatedAt: "2026-11-23T06:00:00.000Z",
@@ -74,7 +96,7 @@ export function createMockHostBridge(): HermesHost {
       platform: "web",
       arch: "wasm",
       hermesHomeKind: "mock",
-      connectionsCount: 0,
+      connectionsCount: currentNorm.doc.connections.length,
       cliSummary: currentInspection.cli,
       typedFailureCode: currentInspection.failure?.code ?? null,
       failurePhase: currentInspection.failure?.phase ?? null,
@@ -87,6 +109,44 @@ export function createMockHostBridge(): HermesHost {
       notes: ["浏览器 Mock 模式：未读取真实 HERMES_HOME 或执行本机进程。"],
     });
 
+  function emitRegistryPatch(prevNorm: NormalizedRegistryResult): RegistrySnapshotView {
+    registrySeq += 1;
+    const snapshot = projectRegistrySnapshot(currentNorm);
+    const diff = diffRegistries(prevNorm, currentNorm);
+    const event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }> = {
+      topic: "registry",
+      scope: null,
+      kind: "patch",
+      seq: registrySeq,
+      revision: snapshot.revision,
+      payload: { snapshot, diff },
+    };
+    for (const listener of registryListeners) {
+      listener(event);
+    }
+    return snapshot;
+  }
+
+  function asInput(payload: Record<string, unknown>): ConnectionMutationInput {
+    return {
+      kind: payload.kind as ConnectionMutationInput["kind"],
+      label: typeof payload.label === "string" ? payload.label : "",
+      url: typeof payload.url === "string" ? payload.url : undefined,
+      authMode: payload.authMode === "oauth" ? "oauth" : payload.authMode === "token" ? "token" : undefined,
+      token: typeof payload.token === "string" ? payload.token : undefined,
+      clearToken: Boolean(payload.clearToken),
+      host: typeof payload.host === "string" ? payload.host : undefined,
+      user: typeof payload.user === "string" ? payload.user : undefined,
+      port: typeof payload.port === "number" ? payload.port : undefined,
+      keyPath: typeof payload.keyPath === "string" ? payload.keyPath : undefined,
+      remoteHermesPath:
+        typeof payload.remoteHermesPath === "string" ? payload.remoteHermesPath : undefined,
+      remoteProfile: typeof payload.remoteProfile === "string" ? payload.remoteProfile : undefined,
+      org: typeof payload.org === "string" ? payload.org : undefined,
+      name: typeof payload.name === "string" ? payload.name : undefined,
+    };
+  }
+
   const dispatcher = createBridgeDispatcher({
     "bridge.hello": async (): Promise<AppInfo> => ({
       bridgeVersion: HOST_BRIDGE_VERSION,
@@ -97,7 +157,200 @@ export function createMockHostBridge(): HermesHost {
       arch: "wasm",
       capabilitiesReady: false,
     }),
-    "connections.list": async () => ({ connections: EMPTY_FLEET.connections }),
+    "connections.list": async () => {
+      const registry = projectRegistrySnapshot(currentNorm);
+      return { connections: registry.connections, registry };
+    },
+    "connections.add": async (payload): Promise<ConnectionMutationResponse> => {
+      const check = validateClientAddConnection(currentNorm.doc, asInput(payload));
+      if (!check.ok) {
+        return {
+          committed: false,
+          snapshot: projectRegistrySnapshot(currentNorm),
+          warnings: [],
+          rejectedIssue: check.issue,
+          conflict: check.conflict,
+        };
+      }
+      const prev = currentNorm;
+      currentNorm = normalizeRegistryDocument({
+        ...currentNorm.doc,
+        revision: currentNorm.doc.revision + 1,
+        connections: [...currentNorm.doc.connections, check.connection],
+      });
+      return {
+        committed: true,
+        snapshot: emitRegistryPatch(prev),
+        warnings: [],
+      };
+    },
+    "connections.update": async (payload): Promise<ConnectionMutationResponse> => {
+      const connectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      const check = validateClientUpdateConnection(currentNorm.doc, connectionId, asInput(payload));
+      if (!check.ok) {
+        return {
+          committed: false,
+          snapshot: projectRegistrySnapshot(currentNorm),
+          warnings: [],
+          rejectedIssue: check.issue,
+          conflict: check.conflict,
+        };
+      }
+      const prev = currentNorm;
+      currentNorm = normalizeRegistryDocument({
+        ...currentNorm.doc,
+        revision: currentNorm.doc.revision + 1,
+        connections: currentNorm.doc.connections.map((c) =>
+          c.id === connectionId ? check.connection : c,
+        ),
+      });
+      return {
+        committed: true,
+        snapshot: emitRegistryPatch(prev),
+        warnings: [],
+      };
+    },
+    "connections.remove": async (payload): Promise<ConnectionMutationResponse> => {
+      const connectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      const check = validateClientRemoveConnection(currentNorm.doc, connectionId);
+      if (!check.ok) {
+        return {
+          committed: false,
+          snapshot: projectRegistrySnapshot(currentNorm),
+          warnings: [],
+          rejectedIssue: check.issue,
+        };
+      }
+      const prev = currentNorm;
+      currentNorm = normalizeRegistryDocument({
+        ...currentNorm.doc,
+        revision: currentNorm.doc.revision + 1,
+        primary: currentNorm.doc.primary === connectionId ? "local" : currentNorm.doc.primary,
+        lastUsed: currentNorm.doc.lastUsed === connectionId ? undefined : currentNorm.doc.lastUsed,
+        connections: currentNorm.doc.connections.filter((c) => c.id !== connectionId),
+      });
+      return {
+        committed: true,
+        snapshot: emitRegistryPatch(prev),
+        warnings: [],
+      };
+    },
+    "connections.setPrimary": async (payload): Promise<ConnectionMutationResponse> => {
+      const connectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      const exists = currentNorm.doc.connections.some((c) => c.id === connectionId);
+      if (!exists || currentNorm.duplicateIds.has(connectionId)) {
+        return {
+          committed: false,
+          snapshot: projectRegistrySnapshot(currentNorm),
+          warnings: [],
+          rejectedIssue: {
+            code: "registry_invalid",
+            severity: "error",
+            connectionId,
+            messageKey: "registry.issue.invalidPrimary",
+          },
+        };
+      }
+      const prev = currentNorm;
+      currentNorm = normalizeRegistryDocument({
+        ...currentNorm.doc,
+        revision: currentNorm.doc.revision + 1,
+        primary: connectionId,
+      });
+      return {
+        committed: true,
+        snapshot: emitRegistryPatch(prev),
+        warnings: [],
+      };
+    },
+    "connections.setLaunchMode": async (payload): Promise<ConnectionMutationResponse> => {
+      const launchMode = payload.launchMode as LaunchMode;
+      if (launchMode !== "primary" && launchMode !== "last-used") {
+        return {
+          committed: false,
+          snapshot: projectRegistrySnapshot(currentNorm),
+          warnings: [],
+          rejectedIssue: {
+            code: "registry_invalid",
+            severity: "error",
+            messageKey: "registry.issue.invalidInput",
+          },
+        };
+      }
+      const prev = currentNorm;
+      currentNorm = normalizeRegistryDocument({
+        ...currentNorm.doc,
+        revision: currentNorm.doc.revision + 1,
+        launchMode,
+      });
+      return {
+        committed: true,
+        snapshot: emitRegistryPatch(prev),
+        warnings: [],
+      };
+    },
+    "connections.setLastUsed": async (payload): Promise<ConnectionMutationResponse> => {
+      const connectionId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      const exists = currentNorm.doc.connections.some((c) => c.id === connectionId);
+      if (!exists || currentNorm.duplicateIds.has(connectionId)) {
+        return {
+          committed: false,
+          snapshot: projectRegistrySnapshot(currentNorm),
+          warnings: [],
+          rejectedIssue: {
+            code: "registry_invalid",
+            severity: "error",
+            connectionId,
+            messageKey: "registry.issue.notFound",
+          },
+        };
+      }
+      const prev = currentNorm;
+      currentNorm = normalizeRegistryDocument({
+        ...currentNorm.doc,
+        revision: currentNorm.doc.revision + 1,
+        lastUsed: connectionId,
+      });
+      return {
+        committed: true,
+        snapshot: emitRegistryPatch(prev),
+        warnings: [],
+      };
+    },
+    "connections.backupAndRepair": async (): Promise<ConnectionMutationResponse> => {
+      return {
+        committed: true,
+        snapshot: projectRegistrySnapshot(currentNorm),
+        warnings: [],
+      };
+    },
+    "connections.exportSafeSummary": async () => {
+      const snap = projectRegistrySnapshot(currentNorm);
+      return {
+        exportedAt: new Date().toISOString(),
+        version: snap.version,
+        revision: snap.revision,
+        launchMode: snap.launchMode,
+        primary: snap.primary,
+        lastUsed: snap.lastUsed,
+        connectionCount: snap.connections.length,
+        quarantinedCount: snap.quarantinedCount,
+        readOnly: snap.readOnly,
+        issues: snap.issues,
+        connections: snap.connections.map((c) => ({
+          id: c.id,
+          kind: c.kind,
+          label: c.label,
+          dialable: c.dialable,
+          hasToken: c.hasToken,
+          originDisplay: c.originDisplay,
+          sshTargetDisplay: c.sshTargetDisplay,
+        })),
+      };
+    },
+    "registry.refresh": async () => ({
+      registry: projectRegistrySnapshot(currentNorm),
+    }),
     "profiles.list": async () => ({ profiles: EMPTY_FLEET.profiles }),
     "sessions.list": async () => ({ sessions: EMPTY_FLEET.sessions }),
     "local.inspect": async (): Promise<LocalInspectResult> => currentInspection,
@@ -157,6 +410,26 @@ export function createMockHostBridge(): HermesHost {
             payload: EMPTY_FLEET,
           });
         });
+      } else if (topic === "registry") {
+        registryListeners.add(
+          listener as (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void,
+        );
+        queueMicrotask(() => {
+          const snapshot = projectRegistrySnapshot(currentNorm);
+          listener({
+            topic: "registry",
+            scope: null,
+            kind: "snapshot",
+            seq: 0,
+            revision: snapshot.revision,
+            payload: { snapshot },
+          });
+        });
+        return () => {
+          registryListeners.delete(
+            listener as (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void,
+          );
+        };
       }
       return () => {
         // No background network resources in MockHostBridge

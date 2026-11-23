@@ -20,6 +20,8 @@ import {
   isAllowedExternalUrl,
   resolveSandboxPaths,
 } from "./security";
+import { createRegistryBridgeHandlers } from "./registryBridge";
+import { RegistryStore } from "./registryStore";
 
 const repoRoot = path.resolve(__dirname, "../../../..");
 const sandbox = resolveSandboxPaths({ repoRoot, env: process.env });
@@ -28,6 +30,14 @@ fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
 fs.mkdirSync(sandbox.hermesHomeDir, { recursive: true, mode: 0o700 });
 app.setPath("userData", sandbox.userDataDir);
 process.env.HERMES_HOME = sandbox.hermesHomeDir;
+
+const registryStore = new RegistryStore({
+  rootDir: sandbox.hermesHomeDir,
+  allowRealHome: sandbox.isRealHomeAllowed,
+});
+registryStore.startWatching();
+const registryBridge = createRegistryBridgeHandlers(registryStore);
+const activeSubscriptions = new Map<string, () => void>();
 
 const isDev = Boolean(process.env.ELECTRON_RENDERER_URL);
 let mainWindow: BrowserWindow | null = null;
@@ -119,13 +129,21 @@ const dispatcher = createBridgeDispatcher({
       capabilitiesReady: false,
     };
   },
-  "connections.list": async () => ({ connections: emptyFleetSnapshot.connections }),
+  ...registryBridge.handlers,
   "profiles.list": async () => ({ profiles: emptyFleetSnapshot.profiles }),
   "sessions.list": async () => ({ sessions: emptyFleetSnapshot.sessions }),
   "local.inspect": async () => localBackendManager.inspect(),
   "local.selectCli": async () => localBackendManager.selectCli(),
   "local.diagnose": async () => localBackendManager.diagnose(),
-  "diagnostics.export": async () => localBackendManager.diagnose(),
+  "diagnostics.export": async () => {
+    const base = await localBackendManager.diagnose();
+    return {
+      ...base,
+      sandboxed: !sandbox.isRealHomeAllowed,
+      connectionsCount: registryStore.snapshot().connections.length,
+      registry: registryStore.exportSafeSummary(),
+    };
+  },
   "links.openExternal": async (payload) => {
     const rawUrl = typeof payload.url === "string" ? payload.url : "";
     if (!isAllowedExternalUrl(rawUrl)) {
@@ -236,12 +254,27 @@ app.whenReady().then(() => {
           payload: emptyFleetSnapshot,
         };
         event.sender.send("hermes:event", args.subscriptionId, snapshotEvent);
+      } else if (args.topic === "registry") {
+        const existing = activeSubscriptions.get(args.subscriptionId);
+        existing?.();
+        const unsub = registryBridge.subscribeRegistry((registryEvent) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send("hermes:event", args.subscriptionId, registryEvent);
+          }
+        });
+        activeSubscriptions.set(args.subscriptionId, unsub);
       }
     },
   );
 
-  ipcMain.on("hermes:unsubscribe", () => {
-    // Subscription cleanup hook for streaming topics in subsequent tickets
+  ipcMain.on("hermes:unsubscribe", (_event, args?: { subscriptionId?: string }) => {
+    const subId = args?.subscriptionId;
+    if (!subId) return;
+    const unsub = activeSubscriptions.get(subId);
+    if (unsub) {
+      unsub();
+      activeSubscriptions.delete(subId);
+    }
   });
 
   mainWindow = createMainWindow();
@@ -255,6 +288,13 @@ app.whenReady().then(() => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  for (const unsub of activeSubscriptions.values()) {
+    unsub();
+  }
+  activeSubscriptions.clear();
+  void registryStore.flush(2000).finally(() => {
+    registryStore.close();
+  });
 });
 
 app.on("window-all-closed", () => {

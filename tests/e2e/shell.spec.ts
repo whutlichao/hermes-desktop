@@ -176,4 +176,74 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await expect(page.locator("#composer-input")).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByRole("button", { name: "发送消息" })).toBeDisabled();
   });
+
+  test("Settings -> Gateways supports Local row, rename, Remote/SSH add, Primary/launchMode/NEXT LAUNCH, duplicate conflict preserving draft, and zero fake Test/Update buttons", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "尚未连接到 Hermes Gateway" })).toBeVisible();
+
+    await page.keyboard.press("Control+,");
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    await expect(settings).toBeVisible();
+
+    // Zero fake Test / Update buttons
+    await expect(settings.getByRole("button", { name: /Test|测试|Update|检查更新/ })).toHaveCount(0);
+
+    // Local row is present, has NEXT LAUNCH, and has no Remove button
+    const localRow = settings.locator('[data-connection-id="local"]');
+    await expect(localRow).toBeVisible();
+    await expect(localRow).toContainText("This device");
+    await expect(localRow).toContainText("NEXT LAUNCH");
+    await expect(localRow.getByRole("button", { name: "移除连接" })).toHaveCount(0);
+
+    // Rename Local
+    await localRow.getByRole("button", { name: "编辑 / 改名" }).click();
+    await settings.getByLabel("设备名称").fill("MacBook Studio");
+    await settings.getByRole("button", { name: "保存连接" }).click();
+    await expect(localRow).toContainText("MacBook Studio");
+
+    // Add Remote connection with token (cleared after save, only hasToken shown)
+    await settings.getByRole("button", { name: "添加连接" }).click();
+    await settings.getByLabel("设备名称").fill("Prod VPS");
+    await settings.getByLabel("Gateway 地址").fill("https://vps.example.com/");
+    await settings.getByLabel("静态 Token（仅写入 Main）").fill("secret-token-should-not-echo");
+    await settings.getByRole("button", { name: "保存连接" }).click();
+
+    const prodRow = settings.locator('[data-connection-id="prod-vps"]');
+    await expect(prodRow).toBeVisible();
+    await expect(prodRow).toContainText("https://vps.example.com");
+    await expect(prodRow).toContainText("Main 已保存凭据（Main only）");
+    await expect(settings).not.toContainText("secret-token-should-not-echo");
+
+    // Set Primary to Prod VPS and verify NEXT LAUNCH moves immediately
+    await prodRow.getByRole("button", { name: "设为 Primary" }).click();
+    await expect(prodRow).toContainText("Primary");
+    await expect(prodRow).toContainText("NEXT LAUNCH");
+
+    // Mark Local as last-used and switch launchMode to last-used -> NEXT LAUNCH moves to Local
+    await localRow.getByRole("button", { name: "标记为上次使用" }).click();
+    await settings.getByRole("button", { name: /优先启动上次使用/ }).click();
+    await expect(localRow).toContainText("NEXT LAUNCH");
+
+    // Duplicate identity preserves draft and shows display-safe conflict summary
+    await settings.getByRole("button", { name: "添加连接" }).click();
+    await settings.getByLabel("设备名称").fill("Prod Mirror");
+    await settings.getByLabel("Gateway 地址").fill("HTTPS://VPS.EXAMPLE.COM");
+    await settings.getByRole("button", { name: "保存连接" }).click();
+
+    const conflictAlert = settings.getByRole("alert");
+    await expect(conflictAlert).toBeVisible();
+    await expect(conflictAlert).toContainText("Prod VPS");
+    await expect(conflictAlert).toContainText("Main 已保存凭据（Main only）");
+    await expect(settings.getByLabel("设备名称")).toHaveValue("Prod Mirror");
+    await expect(settings.getByLabel("Gateway 地址")).toHaveValue("HTTPS://VPS.EXAMPLE.COM");
+
+    // Remove Prod VPS cleanly
+    await settings.getByRole("button", { name: "保留既有连接" }).click();
+    await prodRow.getByRole("button", { name: "移除连接" }).click();
+    await expect(prodRow).toHaveCount(0);
+    await expect(localRow).toContainText("NEXT LAUNCH");
+  });
 });

@@ -31,10 +31,13 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("command palette");
     await page.keyboard.press("Escape");
 
-    // Settings
+    // Settings & Gateways form
     await page.keyboard.press("Control+,");
-    await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    const settingsDialog = page.getByRole("dialog", { name: "Settings" });
+    await expect(settingsDialog).toBeVisible();
     await checkAxe("settings modal");
+    await settingsDialog.getByRole("button", { name: "添加连接" }).click();
+    await checkAxe("settings gateways add form");
     await page.keyboard.press("Escape");
 
     // Capabilities drawer

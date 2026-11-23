@@ -194,6 +194,13 @@ describe("HostBridge v1 contracts & invariants", () => {
     expect(serialized).not.toContain("/Users/alice");
     expect(serialized).not.toContain("sk-live-secret-999");
     expect(redacted.nested.safeLabel).toBe("This device");
+
+    const originCheck = redactSensitiveData({
+      originDisplay: "https://user:pw@vps.example.com/v1?token=secret#frag",
+      hostDisplay: "wss://secret@raw-ws.example.com",
+    });
+    expect(originCheck.originDisplay).toBe("https://vps.example.com/v1");
+    expect(originCheck.hostDisplay).toBe("[REDACTED_URL]");
   });
 
   it("enforces snapshot (seq:0) -> monotonic seq patch -> gap resync_required", () => {

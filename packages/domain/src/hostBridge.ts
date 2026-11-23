@@ -197,6 +197,23 @@ export function redactString(input: string): string {
   return out;
 }
 
+function sanitizeDisplayOriginValue(value: string): string {
+  const trimmed = value.trim();
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return redactString(value);
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "[REDACTED_URL]";
+    }
+    const cleanPath = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${cleanPath}`;
+  } catch {
+    return "[REDACTED_URL]";
+  }
+}
+
 export function redactSensitiveData<T>(value: T): T {
   if (value === null || value === undefined) return value;
   if (typeof value === "string") return redactString(value) as T;
@@ -209,6 +226,8 @@ export function redactSensitiveData<T>(value: T): T {
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (SENSITIVE_KEYS.has(key.toLowerCase())) {
       out[key] = "[REDACTED]";
+    } else if ((key === "originDisplay" || key === "hostDisplay") && typeof entry === "string") {
+      out[key] = sanitizeDisplayOriginValue(entry);
     } else {
       out[key] = redactSensitiveData(entry);
     }

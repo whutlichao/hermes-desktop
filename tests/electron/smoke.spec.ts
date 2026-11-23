@@ -97,6 +97,22 @@ test.describe("Electron hardened smoke", () => {
       await expect(page.locator("body")).not.toContainText("Homelab");
       await expect(page.locator("body")).not.toContainText("SIMULATED DATA");
 
+      // Verify Settings -> Gateways writes 0600 registry file into sandboxed HERMES_HOME without leaking secret across bridge
+      await page.getByRole("button", { name: "打开 Settings" }).click();
+      const settings = page.getByRole("dialog", { name: "Settings" });
+      await expect(settings).toBeVisible();
+      await settings.getByRole("button", { name: "添加连接" }).click();
+      await settings.getByLabel("设备名称").fill("Electron Remote");
+      await settings.getByLabel("Gateway 地址").fill("https://electron-gw.example.com");
+      await settings.getByLabel("静态 Token（仅写入 Main）").fill("elec-secret-tok-123");
+      await settings.getByRole("button", { name: "保存连接" }).click();
+      await expect(settings.locator('[data-connection-id="electron-remote"]')).toBeVisible();
+      await expect(settings).not.toContainText("elec-secret-tok-123");
+
+      const regFile = path.join(sandbox.hermesHomeDir, "gateway-connections.json");
+      expect(fs.existsSync(regFile)).toBe(true);
+      expect(fs.statSync(regFile).mode & 0o777).toBe(0o600);
+
       passed = true;
     } finally {
       await electronApp.close();

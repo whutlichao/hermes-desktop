@@ -31,6 +31,11 @@ export const HOST_COMMANDS = [
   "connections.test",
   "connections.retry",
   "connections.setPrimary",
+  "connections.setLaunchMode",
+  "connections.setLastUsed",
+  "connections.backupAndRepair",
+  "connections.exportSafeSummary",
+  "registry.refresh",
   "profiles.list",
   "auth.start",
   "auth.cancel",
@@ -352,4 +357,159 @@ export interface SanitizedDiagnosticsPayload {
   failurePhase: LocalInspectionPhase | null;
   stages: DiagnosticsPhaseEntry[];
   notes: string[];
+}
+
+export type LaunchMode = "primary" | "last-used";
+
+export type RemoteAuthMode = "token" | "oauth";
+
+export type RegistryIssueCode =
+  | "registry_future_version"
+  | "registry_unsupported"
+  | "registry_corrupt"
+  | "registry_unavailable"
+  | "registry_conflict"
+  | "registry_invalid"
+  | "registry_reset"
+  | "registry_busy"
+  | "token_sync_failed"
+  | "local_not_removable"
+  | "duplicate_identity"
+  | "duplicate_label";
+
+export type RegistryIssueSeverity = "info" | "warning" | "error";
+
+export interface RegistryIssue {
+  code: RegistryIssueCode;
+  severity: RegistryIssueSeverity;
+  connectionId?: string;
+  entryIndex?: number;
+  identity?: string;
+  count?: number;
+  messageKey: string;
+}
+
+export interface ConnectionEntryDisplay {
+  id: string;
+  kind: ConnectionKind;
+  label: string;
+  isLocal: boolean;
+  isPrimary: boolean;
+  isLastUsed: boolean;
+  isNextLaunch: boolean;
+  dialable: boolean;
+  hasToken: boolean;
+  hasHeaders?: boolean;
+  authMode?: RemoteAuthMode;
+  originDisplay?: string;
+  sshTargetDisplay?: string;
+  sshHost?: string;
+  sshUser?: string;
+  sshPort?: number;
+  remoteProfile?: string;
+  org?: string;
+  name?: string;
+  duplicateOfId?: string;
+  issueCodes?: RegistryIssueCode[];
+}
+
+export interface DuplicateConflictSummary {
+  conflictKind: "duplicate_identity" | "duplicate_label";
+  existing: {
+    id: string;
+    label: string;
+    kind: ConnectionKind;
+    hostDisplay?: string;
+    hasToken: boolean;
+  };
+}
+
+export interface LaunchTargetResolution {
+  connectionId: string | null;
+  reason: "last_used" | "primary" | "local" | "empty";
+  launchMode: LaunchMode;
+}
+
+export interface RegistrySnapshotView {
+  version: number;
+  revision: number;
+  primary: string;
+  launchMode: LaunchMode;
+  lastUsed: string | null;
+  nextLaunch: LaunchTargetResolution;
+  connections: ConnectionEntryDisplay[];
+  issues: RegistryIssue[];
+  readOnly: boolean;
+  readOnlyReason?: "registry_corrupt" | "registry_unsupported" | "registry_unavailable";
+  quarantinedCount: number;
+  importNoticeCount: number;
+}
+
+export type RegistryConnectionChangeKind =
+  | "connection_added"
+  | "connection_removed"
+  | "connection_updated";
+
+export interface RegistryConnectionChange {
+  kind: RegistryConnectionChangeKind;
+  connectionId: string;
+  dialMaterialChanged: boolean;
+}
+
+export interface RegistryDiff {
+  changes: RegistryConnectionChange[];
+  dialMaterialChanged: boolean;
+  primaryChanged: boolean;
+  launchModeChanged: boolean;
+  issuesChanged: boolean;
+  credentialsChanged: boolean;
+}
+
+export interface ConnectionMutationInput {
+  kind: ConnectionKind;
+  label: string;
+  url?: string;
+  authMode?: RemoteAuthMode;
+  token?: string;
+  clearToken?: boolean;
+  headers?: Record<string, string>;
+  host?: string;
+  user?: string;
+  port?: number;
+  keyPath?: string;
+  remoteHermesPath?: string;
+  remoteProfile?: string;
+  org?: string;
+  name?: string;
+}
+
+export interface ConnectionMutationResponse {
+  committed: boolean;
+  snapshot: RegistrySnapshotView;
+  warnings: RegistryIssue[];
+  rejectedIssue?: RegistryIssue;
+  conflict?: DuplicateConflictSummary;
+}
+
+export interface RegistrySafeSummaryExport {
+  exportedAt: string;
+  version: number;
+  revision: number;
+  launchMode: LaunchMode;
+  primary: string;
+  lastUsed: string | null;
+  connectionCount: number;
+  quarantinedCount: number;
+  readOnly: boolean;
+  readOnlyReason?: "registry_corrupt" | "registry_unsupported" | "registry_unavailable";
+  issues: RegistryIssue[];
+  connections: Array<{
+    id: string;
+    kind: ConnectionKind;
+    label: string;
+    dialable: boolean;
+    hasToken: boolean;
+    originDisplay?: string;
+    sshTargetDisplay?: string;
+  }>;
 }
