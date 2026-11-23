@@ -3,6 +3,7 @@ import type {
   BridgeEvent,
   BridgeScope,
   CapabilitySnapshot,
+  ChatSessionProjection,
   ConnectionHealthSummary,
   LocalInspectResult,
   ProfileSummary,
@@ -35,6 +36,7 @@ export interface ShellState {
   activeScope: BridgeScope | null;
   activeSessionId: string | null;
   transcript: SessionTranscriptSnapshot | null;
+  chatState: ChatSessionProjection | null;
   stopError: string | null;
   chatBusy: boolean;
   localInspection: LocalInspectResult | null;
@@ -59,7 +61,9 @@ export type ShellAction =
       activeSessionId: string | null;
     }
   | { type: "APPLY_TRANSCRIPT_EVENT"; event: BridgeEvent }
+  | { type: "REPLACE_TRANSCRIPT_SNAPSHOT"; snapshot: SessionTranscriptSnapshot }
   | { type: "CLEAR_TRANSCRIPT" }
+  | { type: "APPLY_CHAT_STATE"; chatState: ChatSessionProjection }
   | { type: "SET_STOP_ERROR"; message: string | null }
   | { type: "SET_CHAT_BUSY"; busy: boolean }
   | { type: "APPLY_LOCAL_INSPECTION"; inspection: LocalInspectResult }
@@ -86,6 +90,7 @@ export function createInitialShellState(): ShellState {
     activeScope: null,
     activeSessionId: null,
     transcript: null,
+    chatState: null,
     stopError: null,
     chatBusy: false,
     localInspection: null,
@@ -126,11 +131,24 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         ...state,
         transcript: reduceTranscriptEvent(state.transcript, action.event),
       };
+    case "REPLACE_TRANSCRIPT_SNAPSHOT":
+      return {
+        ...state,
+        transcript: {
+          ...action.snapshot,
+          messages: [...action.snapshot.messages],
+        },
+      };
     case "CLEAR_TRANSCRIPT":
       return {
         ...state,
         transcript: null,
         stopError: null,
+      };
+    case "APPLY_CHAT_STATE":
+      return {
+        ...state,
+        chatState: action.chatState,
       };
     case "SET_STOP_ERROR":
       return {

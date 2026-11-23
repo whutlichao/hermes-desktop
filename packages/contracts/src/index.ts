@@ -64,6 +64,11 @@ export const HOST_COMMANDS = [
   "local.selectCli",
   "local.diagnose",
   "links.openExternal",
+  "chatState.get",
+  "chatState.dismissRouteBanner",
+  "chatState.saveDraft",
+  "chatState.exportMissingSession",
+  "chatState.dismissMissingSession",
 ] as const;
 
 export type HostCommand = (typeof HOST_COMMANDS)[number];
@@ -82,6 +87,7 @@ export const HOST_TOPICS = [
   "terminal",
   "registry",
   "auth.state",
+  "chat.state",
 ] as const;
 
 export type HostTopic = (typeof HOST_TOPICS)[number];
@@ -250,6 +256,9 @@ export interface SessionTranscriptSnapshot {
   chatAvailable: boolean;
   chatUnavailableReason?: string;
   supportedActions: SupportedChatActions;
+  snapshotSeq?: number;
+  resynced?: boolean;
+  lastKnownUnverified?: boolean;
 }
 
 export type TranscriptPatchPayload =
@@ -501,6 +510,53 @@ export interface WindowState {
   bounds: WindowBounds;
   theme: WindowTheme;
   panes: [PaneState];
+}
+
+export type ActiveChatStatus = "ready" | "unverified" | "session_missing" | "empty";
+
+export type RouteFallbackReason = "session_removed" | "profile_removed" | "connection_removed";
+
+export interface RouteBannerState {
+  id: string;
+  fromScope: BridgeScope;
+  toScope: BridgeScope;
+  reason: RouteFallbackReason;
+}
+
+export interface SessionRecoverySummary {
+  connectionId: string;
+  profileId: string;
+  sessionId: string;
+  title: string;
+  preview?: string;
+  updatedAt?: string;
+  hasDraft: boolean;
+  draftText?: string;
+  lastKnownMessages?: TranscriptMessage[];
+}
+
+export interface ChatSessionProjection {
+  windowId: "primary";
+  paneId: "main";
+  lastActiveChat: ActiveChatRef | null;
+  lastSessionByScope: Record<string, string>;
+  lastValidProfileByConnection: Record<string, string>;
+  lastValidScopes: Array<{ connectionId: string; profileId: string }>;
+  sessionSummaries: Record<string, SessionRecoverySummary>;
+  activeStatus: ActiveChatStatus;
+  lastKnownUnverified: boolean;
+  missingSession: SessionRecoverySummary | null;
+  routeBanner: RouteBannerState | null;
+}
+
+export interface MissingSessionExport {
+  exportedAt: string;
+  windowId: "primary";
+  paneId: "main";
+  scope: BridgeScope;
+  sessionTitle: string;
+  draftText: string;
+  messages: TranscriptMessage[];
 }
 
 export const LOCAL_FAILURE_CODES = [

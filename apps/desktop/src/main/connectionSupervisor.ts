@@ -1,9 +1,11 @@
 import type {
   ActivityEventPayload,
+  ActiveChatRef,
   BridgeEvent,
   BridgeScope,
   CapabilityDomainId,
   CapabilitySnapshot,
+  ChatSessionProjection,
   ConnectionHealthSummary,
   ErrorCode,
   FleetSnapshot,
@@ -31,6 +33,7 @@ import {
   type ClassifiedRuntimeCapabilities,
   type HostCommandHandler,
 } from "@hermes/domain";
+import type { ChatSessionStateStore } from "./chatSessionStateStore";
 import {
   GatewayClient,
   GatewayRpcError,
@@ -68,6 +71,7 @@ interface SubscriberRecord {
   topic: BridgeEvent["topic"];
   scope: BridgeScope | null;
   seq: number;
+  snapshotSent: boolean;
   listener: (event: BridgeEvent) => void;
 }
 
@@ -191,6 +195,7 @@ export class LocalConnectionSupervisor {
   private readonly getLocalLabel: () => string;
   private readonly probeTimeoutMs: number;
   private readonly capabilityRegistry = new CapabilityRegistry();
+  private readonly chatSessionStateStore: ChatSessionStateStore | null;
 
   private revision = 1;
   private subscriberSeq = 0;
@@ -214,11 +219,13 @@ export class LocalConnectionSupervisor {
     options?: {
       getLocalLabel?: () => string;
       probeTimeoutMs?: number;
+      chatSessionStateStore?: ChatSessionStateStore;
     },
   ) {
     this.localBackend = localBackend;
     this.getLocalLabel = options?.getLocalLabel ?? (() => "This device");
     this.probeTimeoutMs = options?.probeTimeoutMs ?? 1200;
+    this.chatSessionStateStore = options?.chatSessionStateStore ?? null;
     this.localHealth = {
       connectionId: "local",
       label: this.getLocalLabel(),
@@ -229,6 +236,15 @@ export class LocalConnectionSupervisor {
       latencyMs: null,
       nextRetryAt: null,
     };
+    const saved = this.chatSessionStateStore?.load();
+    if (saved?.lastActiveChat && saved.lastActiveChat.connectionId === "local") {
+      this.activeScope = {
+        connectionId: saved.lastActiveChat.connectionId,
+        profileId: saved.lastActiveChat.profileId,
+        ...(saved.lastActiveChat.sessionId ? { sessionId: saved.lastActiveChat.sessionId } : {}),
+      };
+      this.activeSessionId = saved.lastActiveChat.sessionId ?? null;
+    }
   }
 
   getCapabilitySnapshot(): CapabilitySnapshot {
@@ -281,6 +297,7 @@ export class LocalConnectionSupervisor {
     const rev = this.nextRevision();
     for (const sub of this.subscribers.values()) {
       if (sub.topic !== topic) continue;
+      if (!sub.snapshotSent) continue;
       if (matcher && !matcher(sub)) continue;
       sub.seq += 1;
       try {
@@ -298,9 +315,78 @@ export class LocalConnectionSupervisor {
     }
   }
 
+  private getAllSessions(): SessionSummary[] {
+    const allSessions: SessionSummary[] = [];
+    for (const list of this.sessionsByScope.values()) {
+      allSessions.push(...list);
+    }
+    return allSessions;
+  }
+
+  getChatStateProjection(): ChatSessionProjection {
+    if (this.chatSessionStateStore) {
+      return this.chatSessionStateStore.getProjection();
+    }
+    return {
+      windowId: "primary",
+      paneId: "main",
+      lastActiveChat: this.activeScope
+        ? {
+            connectionId: this.activeScope.connectionId,
+            profileId: this.activeScope.profileId ?? "default",
+            ...(this.activeSessionId ? { sessionId: this.activeSessionId } : {}),
+          }
+        : null,
+      lastSessionByScope: {},
+      lastValidProfileByConnection: {},
+      lastValidScopes: [],
+      sessionSummaries: {},
+      activeStatus: this.localHealth.actual === "ready" ? "ready" : "empty",
+      lastKnownUnverified:
+        this.localHealth.actual !== "ready" && Boolean(this.activeScope),
+      missingSession: null,
+      routeBanner: null,
+    };
+  }
+
+  private emitChatState(): void {
+    this.emitTopic(
+      "chat.state",
+      null,
+      "patch",
+      this.getChatStateProjection(),
+    );
+  }
+
+  private syncChatStateWithSnapshot(): void {
+    if (!this.chatSessionStateStore) return;
+    const allSessions = this.getAllSessions();
+    this.chatSessionStateStore.syncSessionSummaries(allSessions);
+    const connections =
+      this.localHealth.actual === "idle" &&
+      this.profiles.length === 0 &&
+      allSessions.length === 0 &&
+      !this.localHealth.errorCode
+        ? []
+        : [this.getLocalHealth()];
+    const resolved = this.chatSessionStateStore.resolveWithSnapshot({
+      connections,
+      profiles: this.profiles,
+      sessions: allSessions,
+    });
+    if (resolved.activeScope) {
+      this.activeScope = { ...resolved.activeScope };
+      this.activeSessionId = resolved.activeSessionId;
+    } else if (resolved.status === "empty") {
+      this.activeScope = null;
+      this.activeSessionId = null;
+    }
+    this.emitChatState();
+  }
+
   private emitFleet(): void {
     const snapshot = this.getFleetSnapshot();
-    this.emitTopic("fleet", null, "snapshot", snapshot);
+    this.emitTopic("fleet", null, "patch", snapshot);
     this.emitTopic(
       "connection.health",
       { connectionId: "local" },
@@ -314,7 +400,7 @@ export class LocalConnectionSupervisor {
     this.emitTopic(
       "profiles",
       { connectionId: "local" },
-      "snapshot",
+      "patch",
       { profiles: [...this.profiles] },
       (sub) => !sub.scope || sub.scope.connectionId === "local",
     );
@@ -329,7 +415,7 @@ export class LocalConnectionSupervisor {
     this.emitTopic(
       "sessions",
       { connectionId: "local", profileId },
-      "snapshot",
+      "patch",
       { sessions: [...list] },
       (sub) =>
         !sub.scope ||
@@ -423,6 +509,7 @@ export class LocalConnectionSupervisor {
       message: undefined,
       nextRetryAt: null,
     };
+    this.syncChatStateWithSnapshot();
     this.emitFleet();
 
     const startedAt = Date.now();
@@ -437,6 +524,7 @@ export class LocalConnectionSupervisor {
         errorCode: mapLocalFailureToErrorCode(dialResult.failure),
         message: getLocalFailureCopy(dialResult.failure.code).whatHappened,
       };
+      this.syncChatStateWithSnapshot();
       this.emitFleet();
       return {
         ok: false,
@@ -642,19 +730,54 @@ export class LocalConnectionSupervisor {
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
 
-    const currentScopeMatchesLocal = this.activeScope?.connectionId === "local";
-    if (!this.activeScope || !currentScopeMatchesLocal) {
-      const initialSessionId = sessions[0]?.sessionId ?? null;
-      this.activeScope = {
-        connectionId: "local",
-        profileId: dial.profileId,
-        ...(initialSessionId ? { sessionId: initialSessionId } : {}),
-      };
-      this.activeSessionId = initialSessionId;
+    const savedState = this.chatSessionStateStore?.load();
+    const savedActive = savedState?.lastActiveChat ?? null;
+    if (
+      savedActive &&
+      savedActive.connectionId === "local" &&
+      savedActive.profileId !== dial.profileId &&
+      this.profiles.some((p) => p.profileId === savedActive.profileId) &&
+      entry.transportMode === "shared-host-scope"
+    ) {
+      await this.refreshSessionsForProfile(entry, savedActive.profileId);
     }
 
-    if (this.activeSessionId && this.activeScope?.profileId === dial.profileId) {
-      await this.loadTranscriptSnapshot(entry, dial.profileId, this.activeSessionId);
+    if (this.chatSessionStateStore) {
+      const hasSessionForDialedScope =
+        savedActive &&
+        savedActive.connectionId === "local" &&
+        savedActive.profileId === dial.profileId &&
+        Boolean(savedActive.sessionId);
+      if (!savedActive || (!hasSessionForDialedScope && !savedActive.sessionId && sessions.length > 0)) {
+        const initialSessionId = sessions[0]?.sessionId ?? null;
+        this.chatSessionStateStore.recordActiveChat({
+          connectionId: "local",
+          profileId: dial.profileId,
+          ...(initialSessionId ? { sessionId: initialSessionId } : {}),
+        });
+      }
+      this.syncChatStateWithSnapshot();
+    } else {
+      const currentScopeMatchesLocal = this.activeScope?.connectionId === "local";
+      if (!this.activeScope || !currentScopeMatchesLocal) {
+        const initialSessionId = sessions[0]?.sessionId ?? null;
+        this.activeScope = {
+          connectionId: "local",
+          profileId: dial.profileId,
+          ...(initialSessionId ? { sessionId: initialSessionId } : {}),
+        };
+        this.activeSessionId = initialSessionId;
+      }
+    }
+
+    const projection = this.getChatStateProjection();
+    if (
+      projection.activeStatus === "ready" &&
+      this.activeSessionId &&
+      this.activeScope?.profileId
+    ) {
+      const targetEntry = this.getTransportForProfile(this.activeScope.profileId) ?? entry;
+      await this.loadTranscriptSnapshot(targetEntry, this.activeScope.profileId, this.activeSessionId);
     }
 
     this.emitFleet();
@@ -792,6 +915,7 @@ export class LocalConnectionSupervisor {
     entry: GatewayTransportEntry,
     profileId: string,
     sessionId: string,
+    options?: { replace?: boolean; resynced?: boolean },
   ): Promise<SessionTranscriptSnapshot> {
     const key = transcriptKey("local", profileId, sessionId);
     const existing = this.transcripts.get(key);
@@ -823,7 +947,10 @@ export class LocalConnectionSupervisor {
       }
     }
 
-    const base = existing ?? this.buildInitialTranscriptSnapshot(entry, profileId, sessionId);
+    const base =
+      options?.replace || !existing
+        ? this.buildInitialTranscriptSnapshot(entry, profileId, sessionId)
+        : existing;
     const gatewayMessagesRaw = Array.isArray(rawResult?.messages)
       ? (rawResult.messages as Array<Record<string, unknown>>)
       : [];
@@ -831,25 +958,32 @@ export class LocalConnectionSupervisor {
       .map((m) => mapRawMessage(m, sessionId))
       .filter((m): m is TranscriptMessage => m !== null);
 
-    // Preserve live in-flight messages / tokens / tool rows while incorporating persisted gateway messages
-    const mergedById = new Map<string, TranscriptMessage>();
-    for (const gm of gatewayMessages) {
-      mergedById.set(gm.messageId, gm);
-    }
-    for (const localMsg of base.messages) {
-      const fromGw = mergedById.get(localMsg.messageId);
-      if (!fromGw) {
-        mergedById.set(localMsg.messageId, localMsg);
-      } else {
-        mergedById.set(localMsg.messageId, {
-          ...fromGw,
-          text: localMsg.text.length >= fromGw.text.length ? localMsg.text : fromGw.text,
-          toolRows: localMsg.toolRows ?? fromGw.toolRows,
-          streaming: localMsg.streaming ?? fromGw.streaming,
-          status: localMsg.status ?? fromGw.status,
-          turnId: localMsg.turnId ?? fromGw.turnId,
-        });
+    let finalMessages: TranscriptMessage[];
+    if (options?.replace) {
+      // Clean full replacement on gap/resync: never mix stale or torn local messages
+      finalMessages = gatewayMessages;
+    } else {
+      // Preserve live in-flight messages / tokens / tool rows while incorporating persisted gateway messages
+      const mergedById = new Map<string, TranscriptMessage>();
+      for (const gm of gatewayMessages) {
+        mergedById.set(gm.messageId, gm);
       }
+      for (const localMsg of base.messages) {
+        const fromGw = mergedById.get(localMsg.messageId);
+        if (!fromGw) {
+          mergedById.set(localMsg.messageId, localMsg);
+        } else {
+          mergedById.set(localMsg.messageId, {
+            ...fromGw,
+            text: localMsg.text.length >= fromGw.text.length ? localMsg.text : fromGw.text,
+            toolRows: localMsg.toolRows ?? fromGw.toolRows,
+            streaming: localMsg.streaming ?? fromGw.streaming,
+            status: localMsg.status ?? fromGw.status,
+            turnId: localMsg.turnId ?? fromGw.turnId,
+          });
+        }
+      }
+      finalMessages = [...mergedById.values()];
     }
 
     const gwTurnId =
@@ -862,16 +996,19 @@ export class LocalConnectionSupervisor {
       connectionId: "local",
       profileId,
       sessionId,
-      messages: [...mergedById.values()],
-      activeTurnId: base.activeTurnId ?? gwTurnId,
+      messages: finalMessages,
+      activeTurnId: options?.replace ? gwTurnId : base.activeTurnId ?? gwTurnId,
       chatAvailable: entry.supportedActions.promptSubmit,
       ...(entry.supportedActions.promptSubmit
         ? {}
         : { chatUnavailableReason: "capability_missing:prompt.submit" }),
       supportedActions: { ...entry.supportedActions },
+      snapshotSeq: 0,
+      ...(options?.resynced ? { resynced: true } : {}),
     };
 
     this.transcripts.set(key, merged);
+    this.chatSessionStateStore?.recordTranscriptSnapshot(merged);
     this.emitTopic(
       "session.transcript",
       { connectionId: "local", profileId, sessionId },
@@ -1306,12 +1443,14 @@ export class LocalConnectionSupervisor {
       topic,
       scope,
       seq: 0,
+      snapshotSent: false,
       listener,
     };
     this.subscribers.set(id, record);
 
     queueMicrotask(() => {
       if (!this.subscribers.has(id)) return;
+      record.snapshotSent = true;
       const rev = this.revision;
       if (topic === "fleet") {
         listener({ topic, scope: null, kind: "snapshot", seq: 0, revision: rev, payload: this.getFleetSnapshot() });
@@ -1352,6 +1491,8 @@ export class LocalConnectionSupervisor {
           revision: rev,
           payload: this.capabilityRegistry.getSnapshot(),
         });
+      } else if (topic === "chat.state") {
+        listener({ topic, scope: null, kind: "snapshot", seq: 0, revision: rev, payload: this.getChatStateProjection() });
       }
     });
 
@@ -1370,7 +1511,12 @@ export class LocalConnectionSupervisor {
     | "sessions.resume"
     | "prompts.send"
     | "prompts.stop"
-    | "prompts.steer",
+    | "prompts.steer"
+    | "chatState.get"
+    | "chatState.dismissRouteBanner"
+    | "chatState.saveDraft"
+    | "chatState.exportMissingSession"
+    | "chatState.dismissMissingSession",
     HostCommandHandler
   > = {
     "capabilities.describe": async (payload, scope) => {
@@ -1442,6 +1588,14 @@ export class LocalConnectionSupervisor {
         ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
       };
       this.activeSessionId = resolvedSessionId;
+      if (this.chatSessionStateStore) {
+        this.chatSessionStateStore.recordActiveChat({
+          connectionId: "local",
+          profileId,
+          ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
+        });
+        this.syncChatStateWithSnapshot();
+      }
 
       let transcript: SessionTranscriptSnapshot | null = null;
       if (resolvedSessionId) {
@@ -1518,6 +1672,14 @@ export class LocalConnectionSupervisor {
         sessionId: created.sessionId,
       };
       this.activeSessionId = created.sessionId;
+      if (this.chatSessionStateStore) {
+        this.chatSessionStateStore.recordActiveChat({
+          connectionId: "local",
+          profileId,
+          sessionId: created.sessionId,
+        });
+        this.syncChatStateWithSnapshot();
+      }
 
       const snapshot = this.buildInitialTranscriptSnapshot(entry, profileId, created.sessionId);
       this.transcripts.set(transcriptKey("local", profileId, created.sessionId), snapshot);
@@ -1546,9 +1708,13 @@ export class LocalConnectionSupervisor {
       if (!sessionId) {
         throw makeBridgeError("invalid_request", "缺少目标 Session");
       }
+      const resync = Boolean(payload.resync || payload.replace);
       await this.ensureProfileTransport(profileId);
       const entry = this.requireTransport(profileId);
-      const transcript = await this.loadTranscriptSnapshot(entry, profileId, sessionId);
+      const transcript = await this.loadTranscriptSnapshot(entry, profileId, sessionId, {
+        replace: resync,
+        resynced: resync,
+      });
       return { transcript };
     },
 
@@ -1738,6 +1904,69 @@ export class LocalConnectionSupervisor {
       } catch (err) {
         this.translateRpcFailure(entry, err, "promptSteer", "session.steer");
       }
+    },
+
+    "chatState.get": async () => this.getChatStateProjection(),
+
+    "chatState.dismissRouteBanner": async () => {
+      if (!this.chatSessionStateStore) return this.getChatStateProjection();
+      const projection = this.chatSessionStateStore.dismissRouteBanner();
+      this.emitChatState();
+      return projection;
+    },
+
+    "chatState.saveDraft": async (payload, scope) => {
+      if (!this.chatSessionStateStore) return this.getChatStateProjection();
+      const profileId = this.resolveTargetProfile(payload, scope);
+      const sessionId = this.resolveTargetSessionId(payload, scope);
+      if (!sessionId) return this.getChatStateProjection();
+      const ref: ActiveChatRef = {
+        connectionId: scope?.connectionId ?? this.activeScope?.connectionId ?? "local",
+        profileId,
+        sessionId,
+      };
+      const text = typeof payload.text === "string" ? payload.text : "";
+      const projection = this.chatSessionStateStore.saveDraft(ref, text);
+      this.emitChatState();
+      return projection;
+    },
+
+    "chatState.exportMissingSession": async (_payload, scope) => {
+      if (!this.chatSessionStateStore) return null;
+      const ref: ActiveChatRef | undefined =
+        scope?.connectionId && scope?.profileId
+          ? {
+              connectionId: scope.connectionId,
+              profileId: scope.profileId,
+              ...(scope.sessionId ? { sessionId: scope.sessionId } : {}),
+            }
+          : undefined;
+      return this.chatSessionStateStore.exportMissingSession(ref);
+    },
+
+    "chatState.dismissMissingSession": async () => {
+      if (!this.chatSessionStateStore) return this.getChatStateProjection();
+      const allSessions = this.getAllSessions();
+      const projection = this.chatSessionStateStore.dismissMissingSession(allSessions);
+      if (projection.lastActiveChat) {
+        this.activeScope = {
+          connectionId: projection.lastActiveChat.connectionId,
+          profileId: projection.lastActiveChat.profileId,
+          ...(projection.lastActiveChat.sessionId
+            ? { sessionId: projection.lastActiveChat.sessionId }
+            : {}),
+        };
+        this.activeSessionId = projection.lastActiveChat.sessionId ?? null;
+        if (this.activeSessionId && this.activeScope.profileId) {
+          const entry = this.getTransportForProfile(this.activeScope.profileId);
+          if (entry) {
+            await this.loadTranscriptSnapshot(entry, this.activeScope.profileId, this.activeSessionId);
+          }
+        }
+      }
+      this.emitChatState();
+      this.emitFleet();
+      return projection;
     },
   };
 

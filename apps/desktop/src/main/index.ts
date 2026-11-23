@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, screen, session, shell } from "electron";
 import {
   type AppCommand,
   type AppInfo,
@@ -10,6 +10,7 @@ import {
 } from "@hermes/contracts";
 import { createBridgeDispatcher, formatAppInfoDisplay, validateHostTopic } from "@hermes/domain";
 import { createMainAppInfo, type EmbeddedBuildMeta } from "./appInfo";
+import { ChatSessionStateStore } from "./chatSessionStateStore";
 import { LocalConnectionSupervisor } from "./connectionSupervisor";
 import { LocalBackendManager, createNodeLocalBackendPorts } from "./localBackendManager";
 import {
@@ -22,6 +23,7 @@ import {
 } from "./security";
 import { createRegistryBridgeHandlers } from "./registryBridge";
 import { RegistryStore } from "./registryStore";
+import { WindowStateStore } from "./windowStateStore";
 
 declare const __HERMES_BUILD_META__: EmbeddedBuildMeta | undefined;
 
@@ -134,9 +136,22 @@ const localPorts = createNodeLocalBackendPorts({
 });
 
 const localBackendManager = new LocalBackendManager(localPorts);
+const windowStateStore = new WindowStateStore({
+  userDataDir: sandbox.userDataDir,
+  allowRealHome: sandbox.isRealHomeAllowed,
+  getDisplays: () =>
+    app.isReady()
+      ? screen.getAllDisplays().map((d) => d.workArea)
+      : [{ x: 0, y: 0, width: 1440, height: 900 }],
+});
+const chatSessionStateStore = new ChatSessionStateStore({
+  userDataDir: sandbox.userDataDir,
+  allowRealHome: sandbox.isRealHomeAllowed,
+});
 const connectionSupervisor = new LocalConnectionSupervisor(localBackendManager, {
   getLocalLabel: () =>
     registryStore.snapshot().connections.find((conn) => conn.id === "local")?.label ?? "This device",
+  chatSessionStateStore,
 });
 
 registryBridge.subscribeRegistry((event) => {
@@ -204,16 +219,38 @@ function createMainWindow(): BrowserWindow {
     ...createHardenedWebPreferences(preloadPath),
     devTools: isDev,
   };
+  const restored = windowStateStore.load();
 
   const win = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    minWidth: 1120,
-    minHeight: 700,
+    x: restored.bounds.x,
+    y: restored.bounds.y,
+    width: restored.bounds.width,
+    height: restored.bounds.height,
+    minWidth: Math.min(1120, restored.bounds.width),
+    minHeight: Math.min(700, restored.bounds.height),
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     backgroundColor: "#f7f7f5",
     show: true,
     webPreferences,
+  });
+
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  const persistBoundsNow = () => {
+    if (win.isDestroyed() || win.isMinimized()) return;
+    windowStateStore.saveBounds(win.getBounds());
+  };
+  const scheduleBoundsSave = () => {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(persistBoundsNow, 120);
+  };
+  win.on("move", scheduleBoundsSave);
+  win.on("resize", scheduleBoundsSave);
+  win.on("close", () => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    persistBoundsNow();
   });
 
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
@@ -334,7 +371,8 @@ app.whenReady().then(async () => {
         args.topic === "session.transcript" ||
         args.topic === "prompt" ||
         args.topic === "activity" ||
-        args.topic === "capabilities"
+        args.topic === "capabilities" ||
+        args.topic === "chat.state"
       ) {
         const unsub = connectionSupervisor.subscribe(args.topic, args.scope ?? null, (bridgeEvent) => {
           if (!event.sender.isDestroyed()) {
@@ -358,7 +396,12 @@ app.whenReady().then(async () => {
 
   mainWindow = createMainWindow();
   if (shouldAutoDialLocalOnStartup()) {
-    void connectionSupervisor.connectLocal("default");
+    const savedChat = chatSessionStateStore.load().lastActiveChat;
+    const startupProfile =
+      savedChat && savedChat.connectionId === "local" && savedChat.profileId
+        ? savedChat.profileId
+        : "default";
+    void connectionSupervisor.connectLocal(startupProfile);
   }
 
   app.on("activate", () => {

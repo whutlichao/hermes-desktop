@@ -1,7 +1,9 @@
 import type { RefObject } from "react";
 import type {
+  ChatSessionProjection,
   LocalInspectResult,
   LocalSafeActionId,
+  MissingSessionExport,
   SessionTranscriptSnapshot,
   ToolExecutionRow,
 } from "@hermes/contracts";
@@ -12,6 +14,8 @@ import { MarkdownText } from "./MarkdownText";
 interface ChatThreadProps {
   hasReadyConnection: boolean;
   transcript: SessionTranscriptSnapshot | null;
+  chatState: ChatSessionProjection | null;
+  exportedMissing: MissingSessionExport | null;
   localInspection: LocalInspectResult | null;
   localBusy: boolean;
   chatBusy: boolean;
@@ -23,6 +27,8 @@ interface ChatThreadProps {
   onSendPrompt: () => void;
   onStopTurn: () => void;
   onCreateSession: () => void;
+  onExportMissingSession: () => void;
+  onDismissMissingSession: () => void;
   onLocalAction: (action: LocalSafeActionId) => void;
   onOpenSettings: () => void;
   onOpenPalette: () => void;
@@ -57,6 +63,8 @@ function getRoleLabel(role: "user" | "assistant" | "system"): string {
 export function ChatThread({
   hasReadyConnection,
   transcript,
+  chatState,
+  exportedMissing,
   localInspection,
   localBusy,
   chatBusy,
@@ -68,6 +76,8 @@ export function ChatThread({
   onSendPrompt,
   onStopTurn,
   onCreateSession,
+  onExportMissingSession,
+  onDismissMissingSession,
   onLocalAction,
   onOpenSettings,
   onOpenPalette,
@@ -75,8 +85,30 @@ export function ChatThread({
   onOpenRemoteEscape,
 }: ChatThreadProps) {
   if (!hasReadyConnection) {
+    const unverifiedChat = chatState?.lastKnownUnverified ? chatState.lastActiveChat : null;
+    const unverifiedSummary =
+      unverifiedChat?.sessionId
+        ? chatState?.sessionSummaries[
+            `${unverifiedChat.connectionId}::${unverifiedChat.profileId}::${unverifiedChat.sessionId}`
+          ]
+        : null;
     return (
       <div className="thread-column">
+        {unverifiedChat && (
+          <section className="empty-relay-card unverified-card" role="status">
+            <div className="local-repair-header">
+              <h2>
+                {unverifiedSummary?.title ?? unverifiedChat.sessionId ?? unverifiedChat.profileId}
+              </h2>
+              <span className="status-pill is-warn">{getCopy("route.unverifiedBadge")}</span>
+            </div>
+            <p>
+              {unverifiedChat.connectionId} / {unverifiedChat.profileId}
+              {unverifiedChat.sessionId ? ` / ${unverifiedChat.sessionId}` : ""}
+            </p>
+          </section>
+        )}
+
         <section className="empty-relay-card" aria-labelledby="empty-relay-heading">
           <h1 id="empty-relay-heading">{getCopy("empty.title")}</h1>
           <p>{getCopy("empty.body")}</p>
@@ -129,8 +161,78 @@ export function ChatThread({
     );
   }
 
+  if (chatState?.activeStatus === "session_missing" && chatState.missingSession) {
+    const missing = chatState.missingSession;
+    return (
+      <div className="thread-column">
+        <section
+          className="empty-relay-card session-missing-card"
+          aria-labelledby="session-missing-heading"
+        >
+          <h1 id="session-missing-heading">{getCopy("chat.sessionMissingTitle")}</h1>
+          <p>{getCopy("chat.sessionMissingBody")}</p>
+
+          <dl className="local-repair-dl">
+            <div>
+              <dt>{getCopy("nav.sessionDetailsScope")}</dt>
+              <dd>
+                {missing.connectionId} / {missing.profileId} / {missing.sessionId}
+              </dd>
+            </div>
+            <div>
+              <dt>{getCopy("nav.sessionDetailsTitle")}</dt>
+              <dd>{missing.title}</dd>
+            </div>
+            {missing.draftText && (
+              <div>
+                <dt>{getCopy("chat.sessionMissingDraftLabel")}</dt>
+                <dd>
+                  <pre className="missing-draft-preview">{missing.draftText}</pre>
+                </dd>
+              </div>
+            )}
+          </dl>
+
+          <div className="empty-relay-actions" style={{ marginTop: 14 }}>
+            <button
+              type="button"
+              className="button button-primary"
+              onClick={onExportMissingSession}
+            >
+              {getCopy("chat.sessionMissingExportAction")}
+            </button>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={onDismissMissingSession}
+            >
+              {getCopy("chat.sessionMissingDismissAction")}
+            </button>
+          </div>
+
+          {exportedMissing && (
+            <div className="resync-notice" role="status" style={{ marginTop: 12 }}>
+              <span className="status-pill is-ready">
+                {getCopy("chat.sessionMissingExportedNotice")}
+              </span>
+              <pre className="diagnostics-json" style={{ marginTop: 8 }}>
+                {JSON.stringify(exportedMissing, null, 2)}
+              </pre>
+            </div>
+          )}
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div className="thread-column">
+      {transcript?.resynced && (
+        <div className="resync-notice" role="status">
+          <span className="status-pill is-ready">{getCopy("chat.resyncedNotice")}</span>
+        </div>
+      )}
+
       {!transcript || transcript.messages.length === 0 ? (
         <section className="empty-relay-card" aria-label={getCopy("chat.emptyTitle")}>
           <h1>{getCopy("chat.emptyTitle")}</h1>

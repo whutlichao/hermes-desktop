@@ -11,10 +11,12 @@ import type {
   CapabilityDomainId,
   CapabilityEntry,
   CapabilitySnapshot,
+  ChatSessionProjection,
   FleetSnapshot,
   LocalInspectResult,
   LocalSafeActionId,
   LocalSelectCliResult,
+  MissingSessionExport,
   RegistrySnapshotView,
   SanitizedDiagnosticsPayload,
   SessionSummary,
@@ -26,6 +28,7 @@ import {
   HERMES_UPDATE_DOCS_URL,
   createInitialShellState,
   createSequenceTracker,
+  createTranscriptSyncController,
   deriveViewportMode,
   filterProfilesForConnection,
   filterSessionsForScope,
@@ -59,14 +62,16 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
-  const [transcriptResyncNonce, setTranscriptResyncNonce] = useState(0);
+  const [exportedMissing, setExportedMissing] = useState<MissingSessionExport | null>(null);
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const trackerRef = useRef(createSequenceTracker());
   const registryTrackerRef = useRef(createSequenceTracker());
-  const transcriptTrackerRef = useRef(createSequenceTracker());
   const capabilitiesTrackerRef = useRef(createSequenceTracker());
+  const chatStateTrackerRef = useRef(createSequenceTracker());
+  const transcriptSyncRef = useRef(createTranscriptSyncController());
+  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const viewportMode = deriveViewportMode(viewportWidth);
   const topmostSurface = getTopmostSurface(state);
@@ -139,18 +144,14 @@ export default function App() {
       effectiveScope,
     );
     if (res.ok && res.value.transcript) {
-      dispatch({
-        type: "APPLY_TRANSCRIPT_EVENT",
-        event: {
-          topic: "session.transcript",
-          scope: effectiveScope,
-          kind: "snapshot",
-          seq: 0,
-          revision: 1,
-          payload: res.value.transcript,
-        },
-      });
+      const applied = transcriptSyncRef.current.applySnapshot(
+        res.value.transcript,
+        res.value.transcript.snapshotSeq ?? 0,
+        { replace: true, resynced: res.value.transcript.resynced },
+      );
+      dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
     }
+    setExportedMissing(null);
     return res.ok ? res.value.session ?? null : null;
   }, [canCreateSession, effectiveScope, hasReadyConnection]);
 
@@ -162,28 +163,95 @@ export default function App() {
         sessionId: session.sessionId,
       };
       dispatch({ type: "SET_STOP_ERROR", message: null });
+      setExportedMissing(null);
       const res = await host.request<{ transcript?: SessionTranscriptSnapshot }>(
         "sessions.select",
         { sessionId: session.sessionId, profileId: session.profileId },
         targetScope,
       );
       if (res.ok && res.value.transcript) {
-        dispatch({
-          type: "APPLY_TRANSCRIPT_EVENT",
-          event: {
-            topic: "session.transcript",
-            scope: targetScope,
-            kind: "snapshot",
-            seq: 0,
-            revision: 1,
-            payload: res.value.transcript,
-          },
-        });
+        const applied = transcriptSyncRef.current.applySnapshot(
+          res.value.transcript,
+          res.value.transcript.snapshotSeq ?? 0,
+          { replace: true, resynced: res.value.transcript.resynced },
+        );
+        dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
       }
-      dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" });
+      if (state.surfaceStack.includes("sessionsPopover")) {
+        dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" });
+      }
     },
-    [],
+    [state.surfaceStack],
   );
+
+  const handleDraftChange = useCallback(
+    (nextDraft: string) => {
+      setComposerDraft(nextDraft);
+      if (draftSaveTimerRef.current) {
+        clearTimeout(draftSaveTimerRef.current);
+      }
+      if (
+        !hasReadyConnection ||
+        !effectiveScope ||
+        !state.activeSessionId ||
+        state.chatState?.activeStatus === "session_missing"
+      ) {
+        return;
+      }
+      const targetScope: BridgeScope = {
+        connectionId: effectiveScope.connectionId,
+        profileId: effectiveScope.profileId ?? "default",
+        sessionId: state.activeSessionId,
+      };
+      draftSaveTimerRef.current = setTimeout(() => {
+        void host.request(
+          "chatState.saveDraft",
+          {
+            sessionId: targetScope.sessionId,
+            profileId: targetScope.profileId,
+            text: nextDraft,
+          },
+          targetScope,
+        );
+      }, 150);
+    },
+    [effectiveScope, hasReadyConnection, state.activeSessionId, state.chatState?.activeStatus],
+  );
+
+  const handleDismissRouteBanner = useCallback(async () => {
+    const res = await host.request<ChatSessionProjection>("chatState.dismissRouteBanner", {});
+    if (res.ok) {
+      dispatch({ type: "APPLY_CHAT_STATE", chatState: res.value });
+    }
+  }, []);
+
+  const handleExportMissingSession = useCallback(async () => {
+    const missing = state.chatState?.missingSession;
+    const scope: BridgeScope | null = missing
+      ? {
+          connectionId: missing.connectionId,
+          profileId: missing.profileId,
+          sessionId: missing.sessionId,
+        }
+      : effectiveScope;
+    const res = await host.request<MissingSessionExport | null>(
+      "chatState.exportMissingSession",
+      {},
+      scope,
+    );
+    if (res.ok && res.value) {
+      setExportedMissing(res.value);
+      dispatch({ type: "ANNOUNCE", message: getCopy("chat.sessionMissingExportedNotice") });
+    }
+  }, [effectiveScope, state.chatState?.missingSession]);
+
+  const handleDismissMissingSession = useCallback(async () => {
+    const res = await host.request<ChatSessionProjection>("chatState.dismissMissingSession", {});
+    if (res.ok) {
+      setExportedMissing(null);
+      dispatch({ type: "APPLY_CHAT_STATE", chatState: res.value });
+    }
+  }, []);
 
   const handleSelectProfile = useCallback(
     async (profileId: string) => {
@@ -222,6 +290,15 @@ export default function App() {
       const res = await host.request("prompts.send", { sessionId: targetSessionId, text }, targetScope);
       if (res.ok) {
         setComposerDraft("");
+        if (draftSaveTimerRef.current) {
+          clearTimeout(draftSaveTimerRef.current);
+          draftSaveTimerRef.current = null;
+        }
+        void host.request(
+          "chatState.saveDraft",
+          { sessionId: targetSessionId, profileId: targetScope.profileId, text: "" },
+          targetScope,
+        );
       } else {
         dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.sendFailed") });
       }
@@ -281,12 +358,19 @@ export default function App() {
     [handleCreateSession],
   );
 
-  // HostBridge bootstrap: hello + local.inspect + fleet subscription + native command listener
+  const handleAppCommandRef = useRef(handleAppCommand);
+  handleAppCommandRef.current = handleAppCommand;
+
+  // HostBridge bootstrap: hello -> chatState.get + local.inspect + fleet/chat.state/registry subscriptions + commands
   useEffect(() => {
     let active = true;
     void host.request("bridge.hello", {}).then((res) => {
       if (!active || !res.ok) return;
       dispatch({ type: "HYDRATE_HELLO", appInfo: res.value as NonNullable<typeof state.appInfo> });
+      void host.request<ChatSessionProjection>("chatState.get", {}).then((chatRes) => {
+        if (!active || !chatRes.ok) return;
+        dispatch({ type: "APPLY_CHAT_STATE", chatState: chatRes.value });
+      });
     });
 
     void host.request<LocalInspectResult>("local.inspect", {}).then((res) => {
@@ -311,6 +395,16 @@ export default function App() {
           activeScope: snapshot.activeScope,
           activeSessionId: snapshot.activeSessionId,
         });
+      }
+    });
+
+    const unsubChatState = host.subscribe("chat.state", null, (event) => {
+      const accepted = chatStateTrackerRef.current.accept(event);
+      if (accepted.status === "resync_required") {
+        chatStateTrackerRef.current.reset();
+      }
+      if (accepted.status === "applied" || accepted.status === "resync_required") {
+        dispatch({ type: "APPLY_CHAT_STATE", chatState: event.payload as ChatSessionProjection });
       }
     });
 
@@ -343,21 +437,26 @@ export default function App() {
       }
     });
 
-    const unsubCmd = host.onCommand(handleAppCommand);
+    const unsubCmd = host.onCommand((cmd) => handleAppCommandRef.current(cmd));
     return () => {
       active = false;
+      if (draftSaveTimerRef.current) {
+        clearTimeout(draftSaveTimerRef.current);
+      }
       unsubFleet();
+      unsubChatState();
       unsubRegistry();
       unsubCapabilities();
       unsubCmd();
     };
-  }, [handleAppCommand]);
+  }, []);
 
-  // Subscribe to active session transcript stream with sequence verification & resync recovery
+  // Subscribe to active session transcript stream with snapshot-before-patch discipline & gap/resync replacement
   useEffect(() => {
     const scope = state.activeScope;
     const sessionId = state.activeSessionId;
-    if (!hasReadyConnection || !scope || !sessionId) {
+    if (!hasReadyConnection || !scope || !sessionId || state.chatState?.activeStatus === "session_missing") {
+      transcriptSyncRef.current.reset();
       dispatch({ type: "CLEAR_TRANSCRIPT" });
       return;
     }
@@ -366,19 +465,48 @@ export default function App() {
       profileId: scope.profileId ?? "default",
       sessionId,
     };
-    transcriptTrackerRef.current.reset();
+    const currentSync = transcriptSyncRef.current.getSnapshot();
+    if (
+      !currentSync ||
+      currentSync.connectionId !== targetScope.connectionId ||
+      currentSync.profileId !== targetScope.profileId ||
+      currentSync.sessionId !== targetScope.sessionId
+    ) {
+      transcriptSyncRef.current.reset();
+    }
+
+    let active = true;
+    let resyncInFlight = false;
     const unsubTranscript = host.subscribe("session.transcript", targetScope, (event) => {
-      const accepted = transcriptTrackerRef.current.accept(event);
-      if (accepted.status === "resync_required") {
-        transcriptTrackerRef.current.reset();
-        setTranscriptResyncNonce((n) => n + 1);
+      if (!active) return;
+      const accepted = transcriptSyncRef.current.acceptEvent(event);
+      if (accepted.status === "applied") {
+        dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: accepted.snapshot });
         return;
       }
-      if (accepted.status === "applied") {
-        dispatch({ type: "APPLY_TRANSCRIPT_EVENT", event });
+      if (accepted.status === "resync_required" && !resyncInFlight) {
+        resyncInFlight = true;
+        void host
+          .request<{ transcript?: SessionTranscriptSnapshot }>(
+            "sessions.resume",
+            { sessionId, profileId: targetScope.profileId, resync: true },
+            targetScope,
+          )
+          .then((res) => {
+            resyncInFlight = false;
+            if (!active || !res.ok || !res.value.transcript) return;
+            const applied = transcriptSyncRef.current.applySnapshot(
+              res.value.transcript,
+              res.value.transcript.snapshotSeq ?? 0,
+              { replace: true, resynced: true },
+            );
+            dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
+            dispatch({ type: "ANNOUNCE", message: getCopy("chat.resyncedNotice") });
+          });
       }
     });
     return () => {
+      active = false;
       unsubTranscript();
     };
   }, [
@@ -386,7 +514,7 @@ export default function App() {
     state.activeScope?.connectionId,
     state.activeScope?.profileId,
     state.activeSessionId,
-    transcriptResyncNonce,
+    state.chatState?.activeStatus,
   ]);
 
   // Global keyboard handler (Esc single-layer dismissal; web-mode shortcuts)
@@ -657,6 +785,8 @@ export default function App() {
                 hasReadyConnection={hasReadyConnection}
                 sessions={scopedSessions}
                 activeSessionId={state.activeSessionId}
+                activeScope={effectiveScope}
+                supportedActions={state.transcript?.supportedActions ?? null}
                 onSelectSession={(s) => void handleSelectSession(s)}
               />
 
@@ -696,7 +826,11 @@ export default function App() {
                   →
                 </span>
                 <span>
-                  {activeConnection ? activeConnection.label : getCopy("route.unconnectedGateway")}
+                  {activeConnection
+                    ? activeConnection.label
+                    : state.chatState?.lastKnownUnverified && state.chatState.lastActiveChat
+                      ? state.chatState.lastActiveChat.connectionId
+                      : getCopy("route.unconnectedGateway")}
                 </span>
                 <span className="route-arrow" aria-hidden="true">
                   →
@@ -706,10 +840,15 @@ export default function App() {
                     ? activeProfile.displayName
                     : activeConnection && effectiveScope?.profileId
                       ? effectiveScope.profileId
-                      : getCopy("route.noProfile")}
+                      : state.chatState?.lastKnownUnverified && state.chatState.lastActiveChat
+                        ? state.chatState.lastActiveChat.profileId
+                        : getCopy("route.noProfile")}
                 </span>
                 {activeConnection && (
                   <span className="gateway-kind-tag">{activeConnection.kind}</span>
+                )}
+                {!hasReadyConnection && state.chatState?.lastKnownUnverified && (
+                  <span className="status-pill is-warn">{getCopy("route.unverifiedBadge")}</span>
                 )}
               </div>
 
@@ -763,10 +902,38 @@ export default function App() {
               </div>
             </div>
 
+            {state.chatState?.routeBanner && (
+              <div
+                className="route-fallback-banner"
+                role="region"
+                aria-label={getCopy("route.bannerFallbackPrefix")}
+              >
+                <span className="route-fallback-text">
+                  <strong>{getCopy("route.bannerFallbackPrefix")}：</strong>
+                  <span>
+                    {state.chatState.routeBanner.fromScope.connectionId} /{" "}
+                    {state.chatState.routeBanner.fromScope.profileId} →{" "}
+                    {state.chatState.routeBanner.toScope.connectionId} /{" "}
+                    {state.chatState.routeBanner.toScope.profileId} ·{" "}
+                    {getCopy(`route.bannerReason.${state.chatState.routeBanner.reason}`)}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  onClick={() => void handleDismissRouteBanner()}
+                >
+                  {getCopy("route.bannerDismiss")}
+                </button>
+              </div>
+            )}
+
             <div className="thread-viewport">
               <ChatThread
                 hasReadyConnection={hasReadyConnection}
                 transcript={state.transcript}
+                chatState={state.chatState}
+                exportedMissing={exportedMissing}
                 localInspection={state.localInspection}
                 localBusy={localBusy}
                 chatBusy={state.chatBusy}
@@ -774,10 +941,12 @@ export default function App() {
                 stopError={state.stopError}
                 canCreateSession={canCreateSession}
                 composerRef={composerRef}
-                onDraftChange={setComposerDraft}
+                onDraftChange={handleDraftChange}
                 onSendPrompt={() => void handleSendPrompt()}
                 onStopTurn={() => void handleStopTurn()}
                 onCreateSession={() => void handleCreateSession()}
+                onExportMissingSession={() => void handleExportMissingSession()}
+                onDismissMissingSession={() => void handleDismissMissingSession()}
                 onLocalAction={(action) => void handleLocalAction(action)}
                 onOpenSettings={() =>
                   dispatch({ type: "OPEN_SURFACE", surface: "settings" })
@@ -947,13 +1116,21 @@ export default function App() {
         open={state.surfaceStack.includes("sessionsPopover")}
         title={getCopy("popover.sessionsTitle")}
         closeLabel={getCopy("popover.close")}
-        className="is-popover"
+        className="is-popover sessions-popover"
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" })}
       >
         <SessionRailList
           hasReadyConnection={hasReadyConnection}
           sessions={scopedSessions}
           activeSessionId={state.activeSessionId}
+          activeScope={effectiveScope}
+          supportedActions={state.transcript?.supportedActions ?? null}
+          showNewChatButton
+          canCreateSession={canCreateSession}
+          onCreateSession={() => {
+            dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" });
+            void handleCreateSession();
+          }}
           onSelectSession={(s) => void handleSelectSession(s)}
         />
       </FocusDialog>

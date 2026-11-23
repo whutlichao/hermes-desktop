@@ -11,6 +11,7 @@ import {
   classifyRuntimeCapabilities,
   createBridgeDispatcher,
   createInitialShellState,
+  createTranscriptSyncController,
   evaluateCodeShaMismatch,
   filterSessionsForScope,
   isJsonRpcMethodNotFound,
@@ -385,5 +386,70 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
     if (!afterTool) return;
     expect(afterTool.messages[1].toolRows).toHaveLength(1);
     expect(afterTool.messages[1].toolRows?.[0].name).toBe("read_file");
+  });
+
+  it("discards duplicate pre-snapshot patches, applies seq > snapshot.seq patches, and cleanly replaces transcript on gap/resync", () => {
+    const sync = createTranscriptSyncController();
+
+    const makeSnap = (messages: SessionTranscriptSnapshot["messages"], seq: number): SessionTranscriptSnapshot => ({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-1",
+      messages,
+      activeTurnId: "t-1",
+      turnStopping: false,
+      chatAvailable: true,
+      snapshotSeq: seq,
+      supportedActions: {
+        promptSubmit: true,
+        promptCancel: true,
+        promptSteer: true,
+        sessionCreate: true,
+        sessionResume: true,
+      },
+    });
+
+    // Apply authoritative snapshot at seq=5
+    const snapRes = sync.applySnapshot(
+      makeSnap(
+        [{ messageId: "m-1", sessionId: "s-1", role: "assistant", text: "Hello", createdAt: "2026-11-23T06:00:00Z" }],
+        5,
+      ),
+      5,
+    );
+    expect(snapRes.status).toBe("applied");
+
+    // Pre-snapshot duplicate patch (seq=4 and seq=5) must be discarded
+    expect(
+      sync.applyPatch(4, { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: "DUP" }).status,
+    ).toBe("discarded_duplicate");
+    expect(
+      sync.applyPatch(5, { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: "DUP" }).status,
+    ).toBe("discarded_duplicate");
+    expect(sync.getSnapshot()?.messages[0].text).toBe("Hello");
+
+    // Sequential patch seq=6 applies cleanly
+    const seq6 = sync.applyPatch(6, { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: " world" });
+    expect(seq6.status).toBe("applied");
+    expect(sync.getSnapshot()?.messages[0].text).toBe("Hello world");
+
+    // Gap patch seq=8 (missed seq=7) triggers resync_required
+    const seq8 = sync.applyPatch(8, { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: "TORN" });
+    expect(seq8.status).toBe("resync_required");
+    expect(sync.getSnapshot()?.messages[0].text).toBe("Hello world");
+
+    // Replacement snapshot at seq=9 replaces entire transcript cleanly with resynced=true (no torn text)
+    const replaced = sync.applySnapshot(
+      makeSnap(
+        [{ messageId: "m-1", sessionId: "s-1", role: "assistant", text: "Clean authoritative reply", createdAt: "2026-11-23T06:00:00Z" }],
+        9,
+      ),
+      9,
+      { replace: true, resynced: true },
+    );
+    expect(replaced.status).toBe("applied");
+    expect(sync.getSnapshot()?.messages).toHaveLength(1);
+    expect(sync.getSnapshot()?.messages[0].text).toBe("Clean authoritative reply");
+    expect(sync.getSnapshot()?.resynced).toBe(true);
   });
 });

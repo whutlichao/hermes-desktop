@@ -2,9 +2,15 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { BridgeEvent, CapabilitySnapshot, SessionTranscriptSnapshot } from "@hermes/contracts";
+import type {
+  BridgeEvent,
+  CapabilitySnapshot,
+  ChatSessionProjection,
+  SessionTranscriptSnapshot,
+} from "@hermes/contracts";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
 import { startFakeGatewayServer } from "../../../../tests/helpers/fakeGatewayServer";
+import { ChatSessionStateStore } from "./chatSessionStateStore";
 import { LocalBackendManager, createNodeLocalBackendPorts } from "./localBackendManager";
 import { LocalConnectionSupervisor } from "./connectionSupervisor";
 
@@ -616,6 +622,115 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
       expect(afterRetry.key.ownerGeneration).toBeGreaterThan(prevOwnerGen);
       expect(afterRetry.generation).toBeGreaterThan(prevGen);
       expect(capEvents.length).toBeGreaterThanOrEqual(2);
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("restores lastActiveChat via ChatSessionStateStore after snapshot, handles session_missing without auto session.create, and replaces torn transcript on resync", async () => {
+    const sandbox = createTestSandbox("hermes-s1-recovery-resync-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_rec_1"]);
+    let resumeCount = 0;
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "s-def", title: "Default Chat" },
+        { profile_id: "ops", session_id: "s-ops", title: "Ops Chat" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume") {
+          resumeCount += 1;
+          const sid = String(params.session_id ?? "");
+          ctx.replyResult({
+            session_id: sid,
+            messages: [
+              {
+                message_id: `gw-msg-${resumeCount}`,
+                role: "assistant",
+                text: `Authoritative reply #${resumeCount}`,
+                created_at: "2026-11-23T06:00:00Z",
+              },
+            ],
+            active_turn_id: null,
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      // Pre-seed persisted ChatSessionStateStore pointing to missing session WITH draft
+      const seedStore = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      seedStore.recordActiveChat({
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "s-deleted-with-draft",
+      });
+      seedStore.saveDraft(
+        { connectionId: "local", profileId: "default", sessionId: "s-deleted-with-draft" },
+        "unsent recovery draft",
+      );
+
+      const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const backend = new LocalBackendManager(ports);
+      const supervisor = new LocalConnectionSupervisor(backend, { chatSessionStateStore: store });
+
+      await supervisor.connectLocal("default");
+
+      const chatState = (await supervisor.handlers["chatState.get"]({}, null)) as ChatSessionProjection;
+      expect(chatState.activeStatus).toBe("session_missing");
+      expect(chatState.missingSession?.sessionId).toBe("s-deleted-with-draft");
+      expect(chatState.missingSession?.draftText).toBe("unsent recovery draft");
+      // Must NEVER auto-call session.create
+      expect(gw.rpcCalls.filter((c) => c.method === "session.create")).toHaveLength(0);
+
+      // Dismiss missing session -> falls back to s-def cleanly
+      const afterDismiss = (await supervisor.handlers["chatState.dismissMissingSession"]({}, null)) as ChatSessionProjection;
+      expect(afterDismiss.activeStatus).toBe("ready");
+      expect(afterDismiss.lastActiveChat?.sessionId).toBe("s-def");
+      expect(supervisor.getFleetSnapshot().activeSessionId).toBe("s-def");
+
+      // Resync replacement replaces entire transcript cleanly with resynced=true
+      const resynced = (await supervisor.handlers["sessions.resume"](
+        { sessionId: "s-def", resync: true },
+        { connectionId: "local", profileId: "default", sessionId: "s-def" },
+      )) as { transcript: SessionTranscriptSnapshot };
+      expect(resynced.transcript.resynced).toBe(true);
+      expect(resynced.transcript.messages).toHaveLength(1);
+      expect(resynced.transcript.messages[0].text).toContain("Authoritative reply #");
 
       await supervisor.dispose();
       passed = true;

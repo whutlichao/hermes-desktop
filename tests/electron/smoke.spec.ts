@@ -569,4 +569,178 @@ test.describe("Electron hardened smoke", () => {
       sandbox.cleanup(passed);
     }
   });
+
+  test("persists BrowserWindow bounds and restores lastActiveChat after bridge.hello + snapshot on relaunch", async () => {
+    const sandbox = createTestSandbox("hr-persist-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2"]);
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-1", title: "Session One", preview: "first" },
+        { profile_id: "default", session_id: "sess-2", title: "Session Two", preview: "second" },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const launchEnv = {
+      ...process.env,
+      HERMES_USER_DATA_DIR: sandbox.userDataDir,
+      HERMES_HOME: sandbox.hermesHomeDir,
+    };
+
+    // Launch #1: select sess-2, resize window, close cleanly
+    const app1 = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: launchEnv,
+    });
+    try {
+      const page1 = await app1.firstWindow();
+      await page1.waitForLoadState("domcontentloaded");
+      await expect(page1.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      const sess2Btn = page1.locator("nav.sidebar").getByRole("button", { name: /Session Two/ });
+      await expect(sess2Btn).toBeVisible();
+      await sess2Btn.click();
+      await expect(sess2Btn).toHaveAttribute("aria-current", "page");
+
+      await app1.evaluate(({ BrowserWindow }) => {
+        const win = BrowserWindow.getAllWindows()[0];
+        win.setBounds({ x: 120, y: 90, width: 1240, height: 760 });
+      });
+      await page1.waitForTimeout(220);
+      await app1.close();
+
+      // Verify 0600 window-state.json & chat-session-state.json
+      const winStatePath = path.join(sandbox.userDataDir, "window-state.json");
+      const chatStatePath = path.join(sandbox.userDataDir, "chat-session-state.json");
+      expect(fs.existsSync(winStatePath)).toBe(true);
+      expect(fs.existsSync(chatStatePath)).toBe(true);
+      expect(fs.statSync(winStatePath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(chatStatePath).mode & 0o777).toBe(0o600);
+
+      const savedWin = JSON.parse(fs.readFileSync(winStatePath, "utf8")) as Record<string, unknown>;
+      expect(savedWin.windowId).toBe("primary");
+      expect((savedWin.panes as Array<Record<string, unknown>>)[0]?.paneId).toBe("main");
+      expect((savedWin.bounds as { width: number; height: number }).width).toBe(1240);
+      expect((savedWin.bounds as { width: number; height: number }).height).toBe(760);
+      expect("sidebarOpen" in savedWin).toBe(false);
+
+      // Launch #2: verify bounds and sess-2 activeChat restored after bridge.hello + snapshot
+      const app2 = await electron.launch({
+        args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+        env: launchEnv,
+      });
+      try {
+        const page2 = await app2.firstWindow();
+        await page2.waitForLoadState("domcontentloaded");
+        await expect(page2.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+        const bounds2 = await app2.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows()[0].getBounds(),
+        );
+        expect(bounds2.width).toBe(1240);
+        expect(bounds2.height).toBe(760);
+
+        // At 1240 width (<=1340), popover trigger is shown -> open popover to verify sess-2 active
+        await page2.getByRole("button", { name: /Sessions\s+2/ }).click();
+        const popDialog = page2.getByRole("dialog", { name: "Sessions" });
+        await expect(popDialog.getByRole("button", { name: /Session Two/ })).toHaveAttribute(
+          "aria-current",
+          "page",
+        );
+        passed = true;
+      } finally {
+        await app2.close();
+      }
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("enters session_missing read-only state with saved draft on startup without calling session.create", async () => {
+    const sandbox = createTestSandbox("hr-miss-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1"]);
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-fallback", title: "Fallback Chat" },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "chat-session-state.json"),
+      JSON.stringify({
+        windowId: "primary",
+        paneId: "main",
+        lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-deleted" },
+        lastSessionByScope: { "local::default": "sess-deleted" },
+        lastValidProfileByConnection: { local: "default" },
+        lastValidScopes: [{ connectionId: "local", profileId: "default" }],
+        sessionSummaries: {
+          "local::default::sess-deleted": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-deleted",
+            title: "Deleted Session",
+            hasDraft: true,
+            draftText: "Unsaved local draft",
+          },
+        },
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      const missingCard = page.locator(".session-missing-card");
+      await expect(missingCard).toBeVisible();
+      await expect(missingCard).toContainText("Unsaved local draft");
+      expect(gw.rpcCalls.filter((c) => c.method === "session.create")).toHaveLength(0);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });
