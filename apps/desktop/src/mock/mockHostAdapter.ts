@@ -391,6 +391,42 @@ export function createMockHostBridge(): HermesHost {
     }),
     "profiles.list": async () => ({ profiles: EMPTY_FLEET.profiles }),
     "sessions.list": async () => ({ sessions: EMPTY_FLEET.sessions }),
+    "connections.retry": async () => ({
+      ok: false,
+      fleet: EMPTY_FLEET,
+      inspection: currentInspection,
+      failure: currentInspection.failure,
+    }),
+    "sessions.create": async () => {
+      const err = new Error("Not connected to Gateway");
+      (err as { code?: string }).code = "unreachable";
+      throw err;
+    },
+    "sessions.select": async () => {
+      const err = new Error("Not connected to Gateway");
+      (err as { code?: string }).code = "unreachable";
+      throw err;
+    },
+    "sessions.resume": async () => {
+      const err = new Error("Not connected to Gateway");
+      (err as { code?: string }).code = "unreachable";
+      throw err;
+    },
+    "prompts.send": async () => {
+      const err = new Error("Not connected to Gateway");
+      (err as { code?: string }).code = "unreachable";
+      throw err;
+    },
+    "prompts.stop": async () => {
+      const err = new Error("Not connected to Gateway");
+      (err as { code?: string }).code = "unreachable";
+      throw err;
+    },
+    "prompts.steer": async () => {
+      const err = new Error("Not connected to Gateway");
+      (err as { code?: string }).code = "unreachable";
+      throw err;
+    },
     "local.inspect": async (): Promise<LocalInspectResult> => currentInspection,
     "local.selectCli": async (): Promise<LocalSelectCliResult> => ({
       cancelled: true,
@@ -450,6 +486,28 @@ export function createMockHostBridge(): HermesHost {
             seq: 0,
             revision: 1,
             payload: EMPTY_FLEET,
+          });
+        });
+      } else if (topic === "profiles") {
+        queueMicrotask(() => {
+          listener({
+            topic: "profiles",
+            scope: null,
+            kind: "snapshot",
+            seq: 0,
+            revision: 1,
+            payload: { profiles: EMPTY_FLEET.profiles },
+          });
+        });
+      } else if (topic === "sessions") {
+        queueMicrotask(() => {
+          listener({
+            topic: "sessions",
+            scope: null,
+            kind: "snapshot",
+            seq: 0,
+            revision: 1,
+            payload: { sessions: EMPTY_FLEET.sessions },
           });
         });
       } else if (topic === "registry") {

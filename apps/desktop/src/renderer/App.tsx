@@ -7,12 +7,15 @@ import {
 } from "lucide-react";
 import type {
   AppCommand,
+  BridgeScope,
   FleetSnapshot,
   LocalInspectResult,
   LocalSafeActionId,
   LocalSelectCliResult,
   RegistrySnapshotView,
   SanitizedDiagnosticsPayload,
+  SessionSummary,
+  SessionTranscriptSnapshot,
   WorkspaceTab,
 } from "@hermes/contracts";
 import {
@@ -21,17 +24,20 @@ import {
   createInitialShellState,
   createSequenceTracker,
   deriveViewportMode,
+  filterProfilesForConnection,
+  filterSessionsForScope,
   formatAppInfoDisplay,
   getCopy,
   getTopmostSurface,
   shellReducer,
 } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
+import { ChatThread } from "./components/ChatThread";
 import { DiagnosticsModal } from "./components/DiagnosticsModal";
 import { GatewaysSettings } from "./components/GatewaysSettings";
 import { HermesMark } from "./components/HermesMark";
-import { LocalRepairCard } from "./components/LocalRepairCard";
 import { FocusDialog } from "./components/Modal";
+import { SessionRailList } from "./components/SessionRail";
 
 const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string }> = [
   { id: "artifacts", label: "Artifacts" },
@@ -46,15 +52,57 @@ export default function App() {
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
+  const [composerDraft, setComposerDraft] = useState("");
+  const [transcriptResyncNonce, setTranscriptResyncNonce] = useState(0);
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const trackerRef = useRef(createSequenceTracker());
   const registryTrackerRef = useRef(createSequenceTracker());
+  const transcriptTrackerRef = useRef(createSequenceTracker());
 
   const viewportMode = deriveViewportMode(viewportWidth);
   const topmostSurface = getTopmostSurface(state);
   const hasModal = topmostSurface !== null;
+
+  const activeConnection = useMemo(() => {
+    if (state.connections.length === 0) return null;
+    if (state.activeScope?.connectionId) {
+      return state.connections.find((c) => c.connectionId === state.activeScope?.connectionId) ?? state.connections[0];
+    }
+    return state.connections[0];
+  }, [state.activeScope?.connectionId, state.connections]);
+
+  const hasReadyConnection = Boolean(activeConnection && activeConnection.actual === "ready");
+  const effectiveScope: BridgeScope | null = useMemo(() => {
+    if (state.activeScope) return state.activeScope;
+    if (activeConnection) {
+      return { connectionId: activeConnection.connectionId, profileId: "default" };
+    }
+    return null;
+  }, [activeConnection, state.activeScope]);
+
+  const scopedProfiles = useMemo(
+    () => filterProfilesForConnection(state.profiles, effectiveScope?.connectionId),
+    [effectiveScope?.connectionId, state.profiles],
+  );
+
+  const activeProfile = useMemo(() => {
+    const pid = effectiveScope?.profileId;
+    if (!pid) return scopedProfiles[0] ?? null;
+    return scopedProfiles.find((p) => p.profileId === pid) ?? null;
+  }, [effectiveScope?.profileId, scopedProfiles]);
+
+  const scopedSessions = useMemo(
+    () => (hasReadyConnection ? filterSessionsForScope(state.sessions, effectiveScope) : []),
+    [effectiveScope, hasReadyConnection, state.sessions],
+  );
+
+  const canCreateSession = hasReadyConnection
+    ? state.transcript
+      ? state.transcript.supportedActions.sessionCreate
+      : true
+    : false;
 
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth);
@@ -73,35 +121,158 @@ export default function App() {
     }
   }, [hasModal]);
 
-  const handleAppCommand = useCallback((command: AppCommand) => {
-    switch (command.type) {
-      case "open_palette":
-        dispatch({ type: "OPEN_SURFACE", surface: "palette" });
-        dispatch({ type: "ANNOUNCE", message: getCopy("palette.title") });
-        break;
-      case "open_settings":
-        dispatch({ type: "OPEN_SURFACE", surface: "settings" });
-        dispatch({ type: "ANNOUNCE", message: getCopy("settings.title") });
-        break;
-      case "toggle_workspace":
-        dispatch({ type: "TOGGLE_WORKSPACE" });
-        break;
-      case "new_session":
-        dispatch({
-          type: "ANNOUNCE",
-          message: getCopy("empty.body"),
-        });
-        break;
-      case "open_shortcuts":
-        dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" });
-        dispatch({ type: "ANNOUNCE", message: getCopy("shortcuts.title") });
-        break;
-      case "open_about":
-      case "close_window":
-      case "focus_scope":
-        break;
+  const handleCreateSession = useCallback(async () => {
+    if (!hasReadyConnection || !effectiveScope || !canCreateSession) {
+      dispatch({ type: "ANNOUNCE", message: getCopy("empty.body") });
+      return null;
     }
-  }, []);
+    const res = await host.request<{ session?: SessionSummary; transcript?: SessionTranscriptSnapshot }>(
+      "sessions.create",
+      { title: getCopy("chat.newSessionDefaultTitle"), profileId: effectiveScope.profileId ?? "default" },
+      effectiveScope,
+    );
+    if (res.ok && res.value.transcript) {
+      dispatch({
+        type: "APPLY_TRANSCRIPT_EVENT",
+        event: {
+          topic: "session.transcript",
+          scope: effectiveScope,
+          kind: "snapshot",
+          seq: 0,
+          revision: 1,
+          payload: res.value.transcript,
+        },
+      });
+    }
+    return res.ok ? res.value.session ?? null : null;
+  }, [canCreateSession, effectiveScope, hasReadyConnection]);
+
+  const handleSelectSession = useCallback(
+    async (session: SessionSummary) => {
+      const targetScope: BridgeScope = {
+        connectionId: session.connectionId,
+        profileId: session.profileId,
+        sessionId: session.sessionId,
+      };
+      dispatch({ type: "SET_STOP_ERROR", message: null });
+      const res = await host.request<{ transcript?: SessionTranscriptSnapshot }>(
+        "sessions.select",
+        { sessionId: session.sessionId, profileId: session.profileId },
+        targetScope,
+      );
+      if (res.ok && res.value.transcript) {
+        dispatch({
+          type: "APPLY_TRANSCRIPT_EVENT",
+          event: {
+            topic: "session.transcript",
+            scope: targetScope,
+            kind: "snapshot",
+            seq: 0,
+            revision: 1,
+            payload: res.value.transcript,
+          },
+        });
+      }
+      dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" });
+    },
+    [],
+  );
+
+  const handleSelectProfile = useCallback(
+    async (profileId: string) => {
+      if (!effectiveScope) return;
+      const targetScope: BridgeScope = {
+        connectionId: effectiveScope.connectionId,
+        profileId,
+      };
+      await host.request("sessions.select", { profileId }, targetScope);
+      dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" });
+      dispatch({ type: "ANNOUNCE", message: getCopy("scope.switchNotice") });
+    },
+    [effectiveScope],
+  );
+
+  const handleSendPrompt = useCallback(async () => {
+    const text = composerDraft.trim();
+    if (!text || !hasReadyConnection || !effectiveScope || state.chatBusy) return;
+    dispatch({ type: "SET_CHAT_BUSY", busy: true });
+    dispatch({ type: "SET_STOP_ERROR", message: null });
+    try {
+      let targetSessionId = state.activeSessionId;
+      if (!targetSessionId) {
+        const created = await handleCreateSession();
+        targetSessionId = created?.sessionId ?? null;
+      }
+      if (!targetSessionId) {
+        dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.sendFailed") });
+        return;
+      }
+      const targetScope: BridgeScope = {
+        connectionId: effectiveScope.connectionId,
+        profileId: effectiveScope.profileId ?? "default",
+        sessionId: targetSessionId,
+      };
+      const res = await host.request("prompts.send", { sessionId: targetSessionId, text }, targetScope);
+      if (res.ok) {
+        setComposerDraft("");
+      } else {
+        dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.sendFailed") });
+      }
+    } finally {
+      dispatch({ type: "SET_CHAT_BUSY", busy: false });
+    }
+  }, [composerDraft, effectiveScope, handleCreateSession, hasReadyConnection, state.activeSessionId, state.chatBusy]);
+
+  const handleStopTurn = useCallback(async () => {
+    if (!effectiveScope || !state.activeSessionId || !state.transcript?.activeTurnId) return;
+    const targetScope: BridgeScope = {
+      connectionId: effectiveScope.connectionId,
+      profileId: effectiveScope.profileId ?? "default",
+      sessionId: state.activeSessionId,
+    };
+    dispatch({ type: "SET_STOP_ERROR", message: null });
+    const res = await host.request(
+      "prompts.stop",
+      {
+        sessionId: state.activeSessionId,
+        turnId: state.transcript.activeTurnId,
+      },
+      targetScope,
+    );
+    if (!res.ok) {
+      dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.stopFailed") });
+    }
+  }, [effectiveScope, state.activeSessionId, state.transcript?.activeTurnId]);
+
+  const handleAppCommand = useCallback(
+    (command: AppCommand) => {
+      switch (command.type) {
+        case "open_palette":
+          dispatch({ type: "OPEN_SURFACE", surface: "palette" });
+          dispatch({ type: "ANNOUNCE", message: getCopy("palette.title") });
+          break;
+        case "open_settings":
+          dispatch({ type: "OPEN_SURFACE", surface: "settings" });
+          dispatch({ type: "ANNOUNCE", message: getCopy("settings.title") });
+          break;
+        case "toggle_workspace":
+          dispatch({ type: "TOGGLE_WORKSPACE" });
+          break;
+        case "new_session":
+          void handleCreateSession();
+          break;
+        case "open_shortcuts":
+          dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" });
+          dispatch({ type: "ANNOUNCE", message: getCopy("shortcuts.title") });
+          break;
+        case "open_about":
+        case "close_window":
+        case "focus_scope":
+          break;
+      }
+    },
+    [handleCreateSession],
+  );
 
   // HostBridge bootstrap: hello + local.inspect + fleet subscription + native command listener
   useEffect(() => {
@@ -149,6 +320,42 @@ export default function App() {
       unsubCmd();
     };
   }, [handleAppCommand]);
+
+  // Subscribe to active session transcript stream with sequence verification & resync recovery
+  useEffect(() => {
+    const scope = state.activeScope;
+    const sessionId = state.activeSessionId;
+    if (!hasReadyConnection || !scope || !sessionId) {
+      dispatch({ type: "CLEAR_TRANSCRIPT" });
+      return;
+    }
+    const targetScope: BridgeScope = {
+      connectionId: scope.connectionId,
+      profileId: scope.profileId ?? "default",
+      sessionId,
+    };
+    transcriptTrackerRef.current.reset();
+    const unsubTranscript = host.subscribe("session.transcript", targetScope, (event) => {
+      const accepted = transcriptTrackerRef.current.accept(event);
+      if (accepted.status === "resync_required") {
+        transcriptTrackerRef.current.reset();
+        setTranscriptResyncNonce((n) => n + 1);
+        return;
+      }
+      if (accepted.status === "applied") {
+        dispatch({ type: "APPLY_TRANSCRIPT_EVENT", event });
+      }
+    });
+    return () => {
+      unsubTranscript();
+    };
+  }, [
+    hasReadyConnection,
+    state.activeScope?.connectionId,
+    state.activeScope?.profileId,
+    state.activeSessionId,
+    transcriptResyncNonce,
+  ]);
 
   // Global keyboard handler (Esc single-layer dismissal; web-mode shortcuts)
   useEffect(() => {
@@ -287,10 +494,32 @@ export default function App() {
           break;
         case "retry":
         case "restart_gateway": {
-          const res = await host.request<LocalInspectResult>("local.inspect", {});
-          if (res.ok) {
-            dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: res.value });
-            dispatch({ type: "ANNOUNCE", message: res.value.cli.displayName });
+          const retryRes = await host.request<{
+            ok?: boolean;
+            fleet?: FleetSnapshot;
+            inspection?: LocalInspectResult;
+          }>("connections.retry", { connectionId: "local" });
+          if (retryRes.ok) {
+            if (retryRes.value.inspection) {
+              dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: retryRes.value.inspection });
+              dispatch({ type: "ANNOUNCE", message: retryRes.value.inspection.cli.displayName });
+            }
+            if (retryRes.value.fleet) {
+              dispatch({
+                type: "APPLY_FLEET_SNAPSHOT",
+                connections: retryRes.value.fleet.connections,
+                profiles: retryRes.value.fleet.profiles,
+                sessions: retryRes.value.fleet.sessions,
+                activeScope: retryRes.value.fleet.activeScope,
+                activeSessionId: retryRes.value.fleet.activeSessionId,
+              });
+            }
+          } else {
+            const res = await host.request<LocalInspectResult>("local.inspect", {});
+            if (res.ok) {
+              dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: res.value });
+              dispatch({ type: "ANNOUNCE", message: res.value.cli.displayName });
+            }
           }
           break;
         }
@@ -352,12 +581,13 @@ export default function App() {
             <nav className="sidebar" aria-label={getCopy("nav.sessionsLandmark")}>
               <div className="sidebar-head">
                 <span className="sidebar-title">{getCopy("nav.sessionsTab")}</span>
-                <span className="sidebar-count">{state.sessions.length}</span>
+                <span className="sidebar-count">{scopedSessions.length}</span>
               </div>
 
               <button
                 type="button"
                 className="sidebar-new-btn"
+                disabled={hasReadyConnection ? !canCreateSession : false}
                 onClick={() => handleAppCommand({ type: "new_session" })}
               >
                 <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -367,10 +597,12 @@ export default function App() {
                 <kbd className="kbd">⌘N</kbd>
               </button>
 
-              <div className="sidebar-empty">
-                <strong>{getCopy("nav.sessionsEmptyTitle")}</strong>
-                <p>{getCopy("nav.sessionsEmptyBody")}</p>
-              </div>
+              <SessionRailList
+                hasReadyConnection={hasReadyConnection}
+                sessions={scopedSessions}
+                activeSessionId={state.activeSessionId}
+                onSelectSession={(s) => void handleSelectSession(s)}
+              />
 
               <div className="sidebar-footer">
                 <button
@@ -397,7 +629,7 @@ export default function App() {
                   }
                 >
                   <span>
-                    {getCopy("nav.sessionsCount")} {state.sessions.length}
+                    {getCopy("nav.sessionsCount")} {scopedSessions.length}
                   </span>
                 </button>
               )}
@@ -407,11 +639,22 @@ export default function App() {
                 <span className="route-arrow" aria-hidden="true">
                   →
                 </span>
-                <span>{getCopy("route.unconnectedGateway")}</span>
+                <span>
+                  {activeConnection ? activeConnection.label : getCopy("route.unconnectedGateway")}
+                </span>
                 <span className="route-arrow" aria-hidden="true">
                   →
                 </span>
-                <span>{getCopy("route.noProfile")}</span>
+                <span>
+                  {activeProfile
+                    ? activeProfile.displayName
+                    : activeConnection && effectiveScope?.profileId
+                      ? effectiveScope.profileId
+                      : getCopy("route.noProfile")}
+                </span>
+                {activeConnection && (
+                  <span className="gateway-kind-tag">{activeConnection.kind}</span>
+                )}
               </div>
 
               <button
@@ -419,8 +662,26 @@ export default function App() {
                 className="route-chip"
                 onClick={() => dispatch({ type: "OPEN_SURFACE", surface: "scopePopover" })}
               >
-                <span className="status-dot" aria-hidden="true" />
-                <span>{getCopy("route.statusUnconnected")}</span>
+                <span
+                  className={[
+                    "status-dot",
+                    activeConnection ? `is-${activeConnection.actual}` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  aria-hidden="true"
+                />
+                <span>
+                  {activeConnection
+                    ? activeConnection.actual === "ready"
+                      ? getCopy("route.statusReady")
+                      : activeConnection.actual === "connecting"
+                        ? getCopy("route.statusConnecting")
+                        : activeConnection.actual === "reconnecting"
+                          ? getCopy("route.statusReconnecting")
+                          : getCopy("route.statusBlocked")
+                    : getCopy("route.statusUnconnected")}
+                </span>
               </button>
 
               <div className="route-actions">
@@ -447,76 +708,34 @@ export default function App() {
             </div>
 
             <div className="thread-viewport">
-              <div className="thread-column">
-                <section className="empty-relay-card" aria-labelledby="empty-relay-heading">
-                  <h1 id="empty-relay-heading">{getCopy("empty.title")}</h1>
-                  <p>{getCopy("empty.body")}</p>
-                  <div className="empty-relay-actions">
-                    <button
-                      type="button"
-                      className="button button-primary"
-                      onClick={() =>
-                        dispatch({ type: "OPEN_SURFACE", surface: "settings" })
-                      }
-                    >
-                      {getCopy("empty.actionSettings")}
-                    </button>
-                    <button
-                      type="button"
-                      className="button button-secondary"
-                      onClick={() =>
-                        dispatch({ type: "OPEN_SURFACE", surface: "palette" })
-                      }
-                    >
-                      {getCopy("empty.actionPalette")}
-                    </button>
-                    <button
-                      type="button"
-                      className="button button-secondary"
-                      onClick={() =>
-                        dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" })
-                      }
-                    >
-                      {getCopy("empty.actionShortcuts")}
-                    </button>
-                  </div>
-                </section>
-
-                <LocalRepairCard
-                  inspection={state.localInspection}
-                  busy={localBusy}
-                  onAction={(action) => void handleLocalAction(action)}
-                  onOpenRemoteEscape={() =>
-                    dispatch({ type: "OPEN_SURFACE", surface: "remoteEscape" })
-                  }
-                />
-
-                <form
-                  className="composer-shell"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                  }}
-                >
-                  <label htmlFor="composer-input" className="sr-only">
-                    {getCopy("composer.label")}
-                  </label>
-                  <textarea
-                    id="composer-input"
-                    ref={composerRef}
-                    className="composer-textarea"
-                    rows={2}
-                    readOnly
-                    aria-disabled="true"
-                    placeholder={getCopy("composer.placeholder")}
-                  />
-                  <div className="composer-bar">
-                    <span className="composer-hint">{getCopy("composer.unconnectedHint")}</span>
-                    <button type="submit" className="button button-primary" disabled>
-                      {getCopy("composer.send")}
-                    </button>
-                  </div>
-                </form>
-              </div>
+              <ChatThread
+                hasReadyConnection={hasReadyConnection}
+                transcript={state.transcript}
+                localInspection={state.localInspection}
+                localBusy={localBusy}
+                chatBusy={state.chatBusy}
+                composerDraft={composerDraft}
+                stopError={state.stopError}
+                canCreateSession={canCreateSession}
+                composerRef={composerRef}
+                onDraftChange={setComposerDraft}
+                onSendPrompt={() => void handleSendPrompt()}
+                onStopTurn={() => void handleStopTurn()}
+                onCreateSession={() => void handleCreateSession()}
+                onLocalAction={(action) => void handleLocalAction(action)}
+                onOpenSettings={() =>
+                  dispatch({ type: "OPEN_SURFACE", surface: "settings" })
+                }
+                onOpenPalette={() =>
+                  dispatch({ type: "OPEN_SURFACE", surface: "palette" })
+                }
+                onOpenShortcuts={() =>
+                  dispatch({ type: "OPEN_SURFACE", surface: "shortcuts" })
+                }
+                onOpenRemoteEscape={() =>
+                  dispatch({ type: "OPEN_SURFACE", surface: "remoteEscape" })
+                }
+              />
             </div>
           </main>
 
@@ -703,8 +922,12 @@ export default function App() {
         className="is-popover"
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" })}
       >
-        <strong>{getCopy("nav.sessionsEmptyTitle")}</strong>
-        <p>{getCopy("nav.sessionsEmptyBody")}</p>
+        <SessionRailList
+          hasReadyConnection={hasReadyConnection}
+          sessions={scopedSessions}
+          activeSessionId={state.activeSessionId}
+          onSelectSession={(s) => void handleSelectSession(s)}
+        />
       </FocusDialog>
 
       <FocusDialog
@@ -714,7 +937,40 @@ export default function App() {
         className="is-popover"
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" })}
       >
-        <p>{getCopy("scope.empty")}</p>
+        {scopedProfiles.length === 0 && state.connections.length === 0 ? (
+          <p>{getCopy("scope.empty")}</p>
+        ) : (
+          <div className="scope-popover-body">
+            {scopedProfiles.length > 0 && (
+              <section className="settings-section" aria-label={getCopy("scope.profileSection")}>
+                <h3 className="settings-section-title">{getCopy("scope.profileSection")}</h3>
+                <div className="scope-list">
+                  {scopedProfiles.map((profile) => {
+                    const isCurrent = profile.profileId === (effectiveScope?.profileId ?? "default");
+                    return (
+                      <button
+                        key={`${profile.connectionId}:${profile.profileId}`}
+                        type="button"
+                        className={["palette-item", isCurrent && "is-active-scope"]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onClick={() => void handleSelectProfile(profile.profileId)}
+                      >
+                        <span>
+                          <strong>{profile.displayName}</strong>
+                          <span style={{ display: "block", fontSize: 11.5, color: "var(--muted)" }}>
+                            @{profile.handle}
+                          </span>
+                        </span>
+                        {isCurrent && <span className="gateway-badge is-primary">Active</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+          </div>
+        )}
       </FocusDialog>
 
       <DiagnosticsModal

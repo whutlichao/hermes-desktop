@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
@@ -505,6 +506,345 @@ describe("LocalBackendManager (S2 fake CLI/process/control-socket/fs/clock)", ()
         stdinClose: true,
       });
       expect(timedOut.timedOut).toBe(true);
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("prepareDial runs modern ensure --json, enforces protocol-1 + session-authority-v1, and mints single-use 30s interactive ticket over real UDS", async () => {
+    const sandbox = createTestSandbox("hermes-s2-uds-dial-");
+    let passed = false;
+    const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+    let ticketSeq = 0;
+    const requestsSeen: Array<Record<string, unknown>> = [];
+
+    const server = net.createServer((socket) => {
+      let buf = "";
+      socket.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        const idx = buf.indexOf("\n");
+        if (idx === -1) return;
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        const req = JSON.parse(line) as Record<string, unknown>;
+        requestsSeen.push(req);
+        if (req.op === "resolve-profile") {
+          socket.write(
+            JSON.stringify({
+              status: "ok",
+              state: "ready",
+              attachable: true,
+              purposes: ["interactive", "native-http"],
+              install_code_sha: "sha_match_1",
+              endpoint: {
+                profile_id: "default",
+                instance_id: "inst-uds-1",
+                authority_epoch: 2,
+                runtime_protocol: 1,
+                capabilities: ["session-authority-v1", "host-scope-interactive"],
+                code_sha: "sha_match_1",
+                ws_url: "ws://127.0.0.1:18642/api/ws",
+              },
+            }) + "\n",
+          );
+        } else if (req.op === "session-ticket") {
+          ticketSeq += 1;
+          socket.write(
+            JSON.stringify({
+              status: "ok",
+              ticket: `tkt_uds_${ticketSeq}`,
+              expires_in_seconds: 30,
+              profile_id: req.profile_id,
+              instance_id: req.instance_id,
+            }) + "\n",
+          );
+        }
+      });
+    });
+
+    await new Promise<void>((resolve) => server.listen(sockPath, resolve));
+    fs.chmodSync(sockPath, 0o600);
+
+    try {
+      const fakeCli = path.join(sandbox.rootDir, "hermes");
+      fs.writeFileSync(
+        fakeCli,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "--version" ]; then echo "Hermes Agent v0.23.3"; exit 0; fi',
+          'if [ "$1" = "gateway" ] && [ "$2" = "--help" ]; then echo "{ensure,attach,tickets,restart}"; exit 0; fi',
+          'if [ "$1" = "gateway" ] && [ "$2" = "ensure" ] && [ "$3" = "--help" ]; then echo "--json --timeout"; exit 0; fi',
+          'if [ "$1" = "gateway" ] && [ "$2" = "attach" ] && [ "$3" = "--help" ]; then echo "--json --recover"; exit 0; fi',
+          'if [ "$1" = "gateway" ] && [ "$2" = "tickets" ] && [ "$3" = "--json" ]; then echo \'{"protocol":1,"purposes":["interactive"]}\'; exit 0; fi',
+          'if [ "$1" = "gateway" ] && [ "$2" = "ensure" ] && [ "$3" = "--json" ]; then',
+          '  echo \'{"state":"ready","attachable":true,"install_code_sha":"sha_match_1","client_code_sha":"sha_match_1","endpoint":{"profile_id":"default","instance_id":"inst-uds-1","authority_epoch":2,"runtime_protocol":1,"capabilities":["session-authority-v1","host-scope-interactive"],"code_sha":"sha_match_1","ws_url":"ws://127.0.0.1:18642/api/ws","ws_protocol":"hermes-gateway-v1","ticket_protocol_prefix":"hermes-gateway-ticket."}}\'',
+          "  exit 0",
+          "fi",
+          "exit 1",
+        ].join("\n"),
+        { encoding: "utf8", mode: 0o755 },
+      );
+
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(fakeCli);
+
+      const mgr = new LocalBackendManager(ports);
+      const res = await mgr.prepareDial({ profileId: "default" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+
+      expect(res.dial.transportMode).toBe("shared-host-scope");
+      expect(res.dial.instanceId).toBe("inst-uds-1");
+      expect(res.dial.consumeTicket()).toBe("tkt_uds_1");
+      // Single-use: second consume returns null
+      expect(res.dial.consumeTicket()).toBeNull();
+      expect(requestsSeen.some((r) => r.op === "session-ticket" && r.purpose === "interactive")).toBe(true);
+
+      // Reconnect mints a brand-new ticket
+      const freshTicket = await mgr.mintReconnectTicket(res.dial);
+      expect(freshTicket.ok).toBe(true);
+      if (freshTicket.ok) {
+        expect(freshTicket.consumeTicket()).toBe("tkt_uds_2");
+        expect(freshTicket.consumeTicket()).toBeNull();
+      }
+
+      // Diagnostics and inspection must NEVER contain ticket or wsUrl
+      const diag = await mgr.diagnose();
+      const diagStr = JSON.stringify(diag);
+      expect(diagStr).not.toContain("tkt_uds_");
+      expect(diagStr).not.toContain("18642");
+      expect(JSON.stringify(res.inspection)).not.toContain("tkt_uds_");
+      expect(JSON.stringify(res.inspection)).not.toContain("18642");
+
+      passed = true;
+    } finally {
+      server.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("enforces socket permissions without fallback, handles starting/deadline timeout, falls back to attach when host-scope unavailable, and bounds code_sha restart to 1 single-flight attempt", async () => {
+    const sandbox = createTestSandbox("hermes-s2-dial-edges-");
+    let passed = false;
+    try {
+      const cliBin = path.join(sandbox.rootDir, "hermes");
+      const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+
+      // 1. Socket permission denied MUST NOT fall back to attach --json
+      let attachCalled = false;
+      const permPorts = createFakePorts({
+        sandboxRoot: sandbox.rootDir,
+        userDataDir: sandbox.userDataDir,
+        overridePath: cliBin,
+        files: {
+          [cliBin]: { executable: true },
+          [sockPath]: { executable: false },
+        },
+        processes: (req) => {
+          if (req.args.includes("--version")) return { exitCode: 0, stdout: "v0.23.3", stderr: "", timedOut: false };
+          if (req.args.includes("gateway") && req.args.includes("--help") && !req.args.includes("ensure") && !req.args.includes("attach")) {
+            return { exitCode: 0, stdout: "{ensure,attach,tickets,restart}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json --timeout", stderr: "", timedOut: false };
+          if (req.args.includes("attach") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json", stderr: "", timedOut: false };
+          if (req.args.includes("tickets")) return { exitCode: 0, stdout: '{"protocol":1,"purposes":["interactive"]}', stderr: "", timedOut: false };
+          if (req.args.includes("ensure") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                state: "ready",
+                endpoint: {
+                  profile_id: "default",
+                  instance_id: "inst-perm",
+                  runtime_protocol: 1,
+                  capabilities: ["session-authority-v1"],
+                  ws_url: "ws://127.0.0.1:8642/api/ws",
+                },
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("attach")) {
+            attachCalled = true;
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+        controlSocketProbe: async () => ({ status: "permission_denied" }),
+      });
+      permPorts.ports.getControlSocketCandidates = () => [sockPath];
+      permPorts.ports.controlSocketRequest = async () => ({ status: "permission_denied" });
+      const permRes = await new LocalBackendManager(permPorts.ports).prepareDial();
+      expect(permRes.ok).toBe(false);
+      if (!permRes.ok) {
+        expect(permRes.failure.code).toBe("socket_permission_denied");
+      }
+      expect(attachCalled).toBe(false);
+
+      // 2. Host-scope explicitly unsupported falls back to per-Profile attach --json
+      const fallbackPorts = createFakePorts({
+        sandboxRoot: sandbox.rootDir,
+        userDataDir: sandbox.userDataDir,
+        overridePath: cliBin,
+        files: {
+          [cliBin]: { executable: true },
+          [sockPath]: { executable: false },
+        },
+        processes: (req) => {
+          if (req.args.includes("--version")) return { exitCode: 0, stdout: "v0.23.3", stderr: "", timedOut: false };
+          if (req.args.includes("gateway") && req.args.includes("--help") && !req.args.includes("ensure") && !req.args.includes("attach")) {
+            return { exitCode: 0, stdout: "{ensure,attach,tickets}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json --timeout", stderr: "", timedOut: false };
+          if (req.args.includes("attach") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json", stderr: "", timedOut: false };
+          if (req.args.includes("tickets")) return { exitCode: 0, stdout: '{"protocol":1,"purposes":["native-http"]}', stderr: "", timedOut: false };
+          if (req.args.includes("ensure") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                state: "ready",
+                endpoint: {
+                  profile_id: "work",
+                  instance_id: "inst-fb",
+                  runtime_protocol: 1,
+                  capabilities: ["session-authority-v1"],
+                  ws_url: "ws://127.0.0.1:8642/api/ws",
+                },
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("attach") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                state: "ready",
+                ticket: "tkt_per_profile_1",
+                expires_in_seconds: 30,
+                endpoint: {
+                  profile_id: "work",
+                  instance_id: "inst-fb",
+                  runtime_protocol: 1,
+                  capabilities: ["session-authority-v1"],
+                  ws_url: "ws://127.0.0.1:8642/api/ws",
+                },
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      });
+      fallbackPorts.ports.getControlSocketCandidates = () => [sockPath];
+      fallbackPorts.ports.controlSocketRequest = async () => ({ status: "unsupported" });
+      const fbRes = await new LocalBackendManager(fallbackPorts.ports).prepareDial({ profileId: "work" });
+      expect(fbRes.ok).toBe(true);
+      if (fbRes.ok) {
+        expect(fbRes.dial.transportMode).toBe("per-profile");
+        expect(fbRes.dial.consumeTicket()).toBe("tkt_per_profile_1");
+      }
+
+      // 3. state=starting / reason_code=deadline -> does not spawn second owner; 60s -> gateway_starting_timeout
+      let virtualNow = 1_000_000;
+      const startingPorts = createFakePorts({
+        sandboxRoot: sandbox.rootDir,
+        userDataDir: sandbox.userDataDir,
+        overridePath: cliBin,
+        files: { [cliBin]: { executable: true } },
+        processes: (req) => {
+          if (req.args.includes("--version")) return { exitCode: 0, stdout: "v0.23.3", stderr: "", timedOut: false };
+          if (req.args.includes("gateway") && req.args.includes("--help") && !req.args.includes("ensure") && !req.args.includes("attach")) {
+            return { exitCode: 0, stdout: "{ensure,attach}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json --timeout", stderr: "", timedOut: false };
+          if (req.args.includes("attach") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json", stderr: "", timedOut: false };
+          if (req.args.includes("ensure") && req.args.includes("--json")) {
+            return {
+              exitCode: 5,
+              stdout: JSON.stringify({ state: "starting", reason_code: "deadline" }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      });
+      startingPorts.ports.now = () => virtualNow;
+      startingPorts.ports.sleep = async (ms) => {
+        virtualNow += ms;
+      };
+      const startRes = await new LocalBackendManager(startingPorts.ports).prepareDial({
+        timeoutMs: 60_000,
+        pollIntervalMs: 20_000,
+      });
+      expect(startRes.ok).toBe(false);
+      if (!startRes.ok) {
+        expect(startRes.failure.code).toBe("gateway_starting_timeout");
+        expect(startRes.failure.actual).toBe("reconnecting");
+      }
+      expect(startingPorts.invokedCommands.some((c) => c.args.includes("restart") || c.args.includes("run"))).toBe(false);
+
+      // 4. code_sha mismatch performs at most 1 single-flight restart --detach per stale owner
+      let restartCount = 0;
+      const shaPorts = createFakePorts({
+        sandboxRoot: sandbox.rootDir,
+        userDataDir: sandbox.userDataDir,
+        overridePath: cliBin,
+        files: { [cliBin]: { executable: true } },
+        processes: (req) => {
+          if (req.args.includes("--version")) return { exitCode: 0, stdout: "v0.23.3", stderr: "", timedOut: false };
+          if (req.args.includes("gateway") && req.args.includes("--help") && !req.args.includes("ensure") && !req.args.includes("attach")) {
+            return { exitCode: 0, stdout: "{ensure,attach,restart}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json --timeout", stderr: "", timedOut: false };
+          if (req.args.includes("attach") && req.args.includes("--help")) return { exitCode: 0, stdout: "--json", stderr: "", timedOut: false };
+          if (req.args.includes("restart") && req.args.includes("--detach")) {
+            restartCount += 1;
+            return { exitCode: 0, stdout: "{}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                state: "ready",
+                client_code_sha: "cli_new_sha",
+                install_code_sha: "cli_new_sha",
+                endpoint: {
+                  profile_id: "default",
+                  instance_id: "inst-stale-1",
+                  runtime_protocol: 1,
+                  capabilities: ["session-authority-v1"],
+                  code_sha: "gw_old_sha",
+                  ws_url: "ws://127.0.0.1:8642/api/ws",
+                },
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+        },
+      });
+      const shaMgr = new LocalBackendManager(shaPorts.ports);
+      const [dialA, dialB] = await Promise.all([shaMgr.prepareDial(), shaMgr.prepareDial()]);
+      expect(restartCount).toBe(1);
+      expect(dialA.ok).toBe(false);
+      expect(dialB.ok).toBe(false);
+      if (!dialA.ok) {
+        expect(dialA.failure.code).toBe("code_sha_mismatch");
+        expect(dialA.failure.restartAttempts).toEqual({ current: 1, max: 1 });
+      }
 
       passed = true;
     } finally {

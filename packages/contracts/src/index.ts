@@ -194,6 +194,8 @@ export interface ProfileSummary {
   displayName: string;
   handle: string;
   isDefault: boolean;
+  actual?: ConnectionActualState;
+  unavailableCode?: LocalFailureCode;
 }
 
 export interface SessionSummary {
@@ -206,6 +208,112 @@ export interface SessionSummary {
   pinned: boolean;
   unreadCount: number;
   needsInput: boolean;
+  activeTurnId?: string | null;
+  status?: "idle" | "running" | "error";
+}
+
+export interface ToolExecutionRow {
+  toolCallId: string;
+  name: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  summary?: string;
+  durationMs?: number;
+}
+
+export interface TranscriptMessage {
+  messageId: string;
+  sessionId: string;
+  role: "user" | "assistant" | "system";
+  text: string;
+  createdAt: string;
+  turnId?: string;
+  streaming?: boolean;
+  toolRows?: ToolExecutionRow[];
+  status?: "complete" | "streaming" | "stopped" | "error";
+}
+
+export interface SupportedChatActions {
+  promptSubmit: boolean;
+  promptCancel: boolean;
+  promptSteer: boolean;
+  sessionCreate: boolean;
+  sessionResume: boolean;
+}
+
+export interface SessionTranscriptSnapshot {
+  connectionId: string;
+  profileId: string;
+  sessionId: string;
+  messages: TranscriptMessage[];
+  activeTurnId: string | null;
+  turnStopping: boolean;
+  chatAvailable: boolean;
+  chatUnavailableReason?: string;
+  supportedActions: SupportedChatActions;
+}
+
+export type TranscriptPatchPayload =
+  | {
+      type: "message_upsert";
+      sessionId: string;
+      message: TranscriptMessage;
+    }
+  | {
+      type: "token_delta";
+      sessionId: string;
+      turnId?: string;
+      messageId: string;
+      delta: string;
+    }
+  | {
+      type: "tool_row";
+      sessionId: string;
+      turnId?: string;
+      messageId?: string;
+      toolRow: ToolExecutionRow;
+    }
+  | {
+      type: "turn_state";
+      sessionId: string;
+      activeTurnId: string | null;
+      turnStopping?: boolean;
+      messageId?: string;
+      status?: TranscriptMessage["status"];
+    }
+  | {
+      type: "capabilities_update";
+      sessionId: string;
+      chatAvailable: boolean;
+      supportedActions: SupportedChatActions;
+      chatUnavailableReason?: string;
+    };
+
+export interface PromptEventPayload {
+  connectionId: string;
+  profileId: string;
+  sessionId: string;
+  turnId: string;
+  kind: "accepted" | "delta" | "completed" | "stopped" | "stop_failed" | "error";
+  delta?: string;
+  messageId?: string;
+  reason?: string;
+}
+
+export interface ActivityEventPayload {
+  connectionId: string;
+  profileId: string;
+  sessionId: string;
+  turnId?: string;
+  toolRow: ToolExecutionRow;
+}
+
+export interface GatewayCapabilitiesSummary {
+  connectionId: string;
+  profileId: string;
+  ownerGeneration: number;
+  authorityEpoch: number;
+  chatAvailable: boolean;
+  supportedActions: SupportedChatActions;
 }
 
 export interface FleetSnapshot {

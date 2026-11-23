@@ -95,3 +95,31 @@ describe("MockHostBridge registry contract parity", () => {
     unsub();
   });
 });
+
+describe("MockHostBridge Ticket #28 chat/session parity", () => {
+  it("keeps empty default fleet and rejects session/prompt commands honestly when unconnected", async () => {
+    const mock = createMockHostBridge();
+
+    const fleetEvents: BridgeEvent[] = [];
+    const unsub = mock.subscribe("fleet", null, (ev) => fleetEvents.push(ev));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fleetEvents).toHaveLength(1);
+    expect((fleetEvents[0].payload as { sessions: unknown[] }).sessions).toEqual([]);
+
+    for (const cmd of ["sessions.create", "sessions.select", "sessions.resume", "prompts.send", "prompts.stop"] as const) {
+      const res = await mock.request(cmd, { sessionId: "s1", text: "hi" });
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error.code).toBe("unreachable");
+      }
+    }
+
+    const retryRes = await mock.request<{ ok: boolean }>("connections.retry", { connectionId: "local" });
+    expect(retryRes.ok).toBe(true);
+    if (retryRes.ok) {
+      expect(retryRes.value.ok).toBe(false);
+    }
+
+    unsub();
+  });
+});
