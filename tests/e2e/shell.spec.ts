@@ -68,9 +68,10 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/");
 
-    // Skip link on first Tab
-    await page.keyboard.press("Tab");
+    // Wait for initial React render before sending the first keyboard Tab
     const skipLink = page.getByRole("link", { name: "跳到对话输入" });
+    await expect(skipLink).toBeAttached();
+    await page.keyboard.press("Tab");
     await expect(skipLink).toBeFocused();
     await page.keyboard.press("Enter");
 
