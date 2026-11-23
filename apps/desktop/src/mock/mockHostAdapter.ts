@@ -282,6 +282,7 @@ interface MockE2EFixture {
     stopMode?: "ack_stopping" | "ack_loss" | "terminal_stopped" | "owner_changed";
     stopDelayedTerminalMs?: number;
     queueAckMode?: "admitted" | "ack_loss_already_admitted" | "ack_loss_unadmitted" | "ack_loss";
+    queueRetryMode?: "admitted" | "delivery_unknown" | "ack_loss";
     queueCancelOutcome?: "cancelled" | "stopped" | "already_started" | "completed" | "ack_loss";
     queueCancelReconcileOutcome?: QueuedAdmissionState;
     steerMode?: "ok" | "turn_finished" | "generation_mismatch" | "rejected";
@@ -4545,11 +4546,18 @@ export function createMockHostBridge(): HermesHost {
         { connectionId: cid, profileId: pid, sessionId: sid, submissionId, online: true },
         async (rpcPayload) => {
           e2eCounts.queueSubmittedIds.push(rpcPayload.submission_id);
-          if (liveFix?.turnRecovery?.queueAckMode === "ack_loss") {
+          const retryMode = liveFix?.turnRecovery?.queueRetryMode;
+          if (retryMode === "ack_loss" || liveFix?.turnRecovery?.queueAckMode === "ack_loss") {
             const err = new Error("Retry ACK lost");
             err.name = "GatewayTransportError";
             (err as { code?: ErrorCode }).code = "timeout";
             throw err;
+          }
+          if (retryMode === "delivery_unknown") {
+            return {
+              admitted: true,
+              status: "queued",
+            };
           }
           const currentQueue = mockGatewayQueueStore.get(storeKey) ?? [];
           mockQueueAdmissionSeq += 1;

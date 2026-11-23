@@ -6387,7 +6387,10 @@ export class ConnectionSupervisor {
       const submissionId =
         typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
       if (!sessionId || !submissionId) {
-        throw makeBridgeError("invalid_request", "缺少 submissionId");
+        throw makeBridgeError(
+          "invalid_request",
+          getCopy("turn.queue.submissionIdRequiredError"),
+        );
       }
       const entry = this.requireTransport(connectionId, profileId);
       return this.turnCoordinator.checkQueueReceipt(
@@ -6453,11 +6456,17 @@ export class ConnectionSupervisor {
       const submissionId =
         typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
       if (!sessionId || !submissionId) {
-        throw makeBridgeError("invalid_request", "缺少 submissionId");
+        throw makeBridgeError(
+          "invalid_request",
+          getCopy("turn.queue.submissionIdRequiredError"),
+        );
       }
       const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptSubmit) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("turn.queue.promptSubmitUnavailableError"),
+        );
       }
       try {
         const res = await this.turnCoordinator.retryQueued(

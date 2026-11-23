@@ -69,7 +69,8 @@ interface InternalSessionRecovery {
   stopRequestedGeneration?: number;
   stopOutcomeMessage?: string;
   queuePaused: boolean;
-  unknownTurn: UnknownTurnRecord | null;
+  unknownTurns: UnknownTurnRecord[];
+  unknownTurnProtocolError?: string;
   queuedAdmissions: QueuedAdmissionView[];
   pendingDeliveryUnknown: QueueDeliveryUnknownView[];
   pendingSteerFallback: SteerFallbackPromptView | null;
@@ -283,7 +284,7 @@ export class TurnRecoveryCoordinator {
     rec.activeTurnId = null;
     rec.queuePaused = true;
     rec.stopState = rec.stopState === "stopping" ? "cancel_outcome_unknown" : rec.stopState;
-    rec.unknownTurn = Object.freeze({
+    const record = Object.freeze({
       admissionId: input.admissionId,
       executionGeneration: input.executionGeneration,
       ownerGeneration: input.ownerGeneration,
@@ -295,6 +296,10 @@ export class TurnRecoveryCoordinator {
       resolving: false,
       lastKnownUnverified: false,
     });
+    rec.unknownTurns = [
+      ...rec.unknownTurns.filter((item) => item.admissionId !== input.admissionId),
+      record,
+    ];
     rec.updatedAt = nowIso;
     this.emitChange();
     return this.toImmutableView(rec);
@@ -324,10 +329,12 @@ export class TurnRecoveryCoordinator {
     executionGeneration: number;
   }> {
     const rec = this.sessions.get(makeKey(scope.connectionId, scope.profileId, scope.sessionId));
-    if (!rec || !rec.unknownTurn) {
+    const target = scope.admissionId
+      ? rec?.unknownTurns.find((item) => item.admissionId === scope.admissionId)
+      : rec?.unknownTurns[0];
+    if (!rec || !target) {
       throw makeTurnError("unknown_turn", "当前 Session 没有待处理的丢失 Turn");
     }
-    const target = rec.unknownTurn;
     if (scope.admissionId && scope.admissionId !== target.admissionId) {
       throw makeTurnError("conflict", "丢失 Turn 的 admission_id 不匹配");
     }
@@ -342,7 +349,9 @@ export class TurnRecoveryCoordinator {
     }
 
     const nowIso = new Date(this.now()).toISOString();
-    rec.unknownTurn = Object.freeze({ ...target, resolving: true });
+    rec.unknownTurns = rec.unknownTurns.map((item) =>
+      item.admissionId === target.admissionId ? Object.freeze({ ...item, resolving: true }) : item,
+    );
     rec.updatedAt = nowIso;
     this.emitChange();
 
@@ -353,14 +362,21 @@ export class TurnRecoveryCoordinator {
       });
       const afterIso = new Date(this.now()).toISOString();
       if (res && res.settled === false) {
-        rec.unknownTurn = Object.freeze({ ...target, resolving: false });
+        rec.unknownTurns = rec.unknownTurns.map((item) =>
+          item.admissionId === target.admissionId
+            ? Object.freeze({ ...item, resolving: false })
+            : item,
+        );
         rec.updatedAt = afterIso;
         this.emitChange();
         throw makeTurnError("conflict", "Gateway 未确认放弃丢失 Turn");
       }
 
-      rec.unknownTurn = null;
-      rec.queuePaused = false;
+      rec.unknownTurns = rec.unknownTurns.filter(
+        (item) => item.admissionId !== target.admissionId,
+      );
+      rec.queuePaused =
+        rec.unknownTurns.length > 0 || Boolean(rec.unknownTurnProtocolError);
       rec.activeTurnId = null;
       rec.stopState = "stopped";
       if (Array.isArray(res?.queuedAdmissions)) {
@@ -375,8 +391,12 @@ export class TurnRecoveryCoordinator {
         executionGeneration: target.executionGeneration,
       };
     } catch (err) {
-      if (rec.unknownTurn && rec.unknownTurn.admissionId === target.admissionId) {
-        rec.unknownTurn = Object.freeze({ ...rec.unknownTurn, resolving: false });
+      if (rec.unknownTurns.some((item) => item.admissionId === target.admissionId)) {
+        rec.unknownTurns = rec.unknownTurns.map((item) =>
+          item.admissionId === target.admissionId
+            ? Object.freeze({ ...item, resolving: false })
+            : item,
+        );
         rec.updatedAt = new Date(this.now()).toISOString();
         this.emitChange();
       }
@@ -448,12 +468,11 @@ export class TurnRecoveryCoordinator {
       }
 
       if (res?.stopped === false) {
-        rec.stopState = "idle";
-        rec.stopRequestedTurnId = undefined;
-        rec.stopRequestedGeneration = undefined;
+        rec.stopState = "cancel_outcome_unknown";
+        rec.stopOutcomeMessage = getCopy("turn.stop.notConfirmedBody");
         rec.updatedAt = afterIso;
         this.emitChange();
-        throw makeTurnError("internal", "Gateway 未确认停止 Turn");
+        throw makeTurnError("conflict", getCopy("turn.stop.notConfirmedError"));
       }
 
       const terminalConfirmed =
@@ -488,7 +507,10 @@ export class TurnRecoveryCoordinator {
       };
     } catch (err) {
       const afterIso = new Date(this.now()).toISOString();
-      if (isAckLossError(err) || rec.ownerGeneration !== capturedOwnerGen) {
+      if (rec.stopState === "cancel_outcome_unknown") {
+        rec.updatedAt = afterIso;
+        this.emitChange();
+      } else if (isAckLossError(err) || rec.ownerGeneration !== capturedOwnerGen) {
         rec.stopState = "cancel_outcome_unknown";
         rec.stopOutcomeMessage = getCopy("turn.stop.cancelOutcomeUnknownBody");
         rec.updatedAt = afterIso;
@@ -515,8 +537,10 @@ export class TurnRecoveryCoordinator {
         rec.stopOutcomeMessage = getCopy("turn.stop.cancelOutcomeUnknownBody");
       }
       rec.lastKnownUnverified = true;
-      if (rec.unknownTurn) {
-        rec.unknownTurn = Object.freeze({ ...rec.unknownTurn, lastKnownUnverified: true });
+      if (rec.unknownTurns.length > 0) {
+        rec.unknownTurns = rec.unknownTurns.map((item) =>
+          Object.freeze({ ...item, lastKnownUnverified: true }),
+        );
       }
       if (rec.queuedAdmissions.length > 0) {
         rec.queuedAdmissions = rec.queuedAdmissions.map((item) =>
@@ -607,45 +631,52 @@ export class TurnRecoveryCoordinator {
     }
 
     if (input.unknownTurns !== undefined) {
-      const firstUnknown = input.unknownTurns[0];
-      const admId = firstUnknown
-        ? cleanString(firstUnknown.admissionId ?? firstUnknown.admission_id)
-        : "";
-      if (firstUnknown && admId) {
+      const projected = input.unknownTurns.flatMap((raw) => {
+        const admId = cleanString(raw.admissionId ?? raw.admission_id);
+        if (!admId) return [];
         const execGen =
-          typeof (firstUnknown.executionGeneration ?? firstUnknown.execution_generation) === "number"
-            ? Number(firstUnknown.executionGeneration ?? firstUnknown.execution_generation)
+          typeof (raw.executionGeneration ?? raw.execution_generation) === "number"
+            ? Number(raw.executionGeneration ?? raw.execution_generation)
             : rec.executionGeneration;
-        const turnId = cleanString(firstUnknown.turnId ?? firstUnknown.turn_id) || undefined;
+        const turnId = cleanString(raw.turnId ?? raw.turn_id) || undefined;
         const originalInput =
-          typeof firstUnknown.originalInput === "string"
-            ? firstUnknown.originalInput
-            : typeof firstUnknown.original_input === "string"
-              ? firstUnknown.original_input
-              : typeof firstUnknown.text === "string"
-                ? firstUnknown.text
+          typeof raw.originalInput === "string"
+            ? raw.originalInput
+            : typeof raw.original_input === "string"
+              ? raw.original_input
+              : typeof raw.text === "string"
+                ? raw.text
                 : undefined;
-        rec.queuePaused = true;
-        rec.unknownTurn = Object.freeze({
+        const existing = rec.unknownTurns.find((item) => item.admissionId === admId);
+        return [
+          Object.freeze({
           admissionId: admId,
           executionGeneration: execGen,
           ownerGeneration: input.ownerGeneration,
           ...(turnId ? { turnId } : {}),
           ...(originalInput !== undefined ? { originalInput } : {}),
-          message: cleanString(firstUnknown.message) || "Turn lost during restart",
+          message: cleanString(raw.message) || "Turn lost during restart",
           lostReason:
-            cleanString(firstUnknown.lostReason ?? firstUnknown.lost_reason ?? firstUnknown.reason) ||
+            cleanString(raw.lostReason ?? raw.lost_reason ?? raw.reason) ||
             "owner_restarted",
-          detectedAt: rec.unknownTurn?.detectedAt ?? nowIso,
+          detectedAt: existing?.detectedAt ?? nowIso,
           resolving: false,
           lastKnownUnverified: false,
-        });
+          }),
+        ];
+      });
+      const malformedCount = input.unknownTurns.length - projected.length;
+      rec.unknownTurns = projected;
+      rec.queuePaused = projected.length > 0 || malformedCount > 0;
+      if (malformedCount > 0) {
+        rec.unknownTurnProtocolError = getCopy("turn.unknown.protocolUnsupportedBody");
       } else {
-        rec.unknownTurn = null;
-        rec.queuePaused = false;
+        rec.unknownTurnProtocolError = undefined;
       }
-    } else if (rec.unknownTurn) {
-      rec.unknownTurn = Object.freeze({ ...rec.unknownTurn, lastKnownUnverified: false });
+    } else if (rec.unknownTurns.length > 0) {
+      rec.unknownTurns = rec.unknownTurns.map((item) =>
+        Object.freeze({ ...item, lastKnownUnverified: false }),
+      );
     }
 
     if (input.queuedAdmissions !== undefined) {
@@ -729,7 +760,7 @@ export class TurnRecoveryCoordinator {
       const afterIso = new Date(this.now()).toISOString();
       const admissionId = cleanString(res?.admission_id ?? res?.admissionId);
       if (res?.admitted === false) {
-        throw makeTurnError("conflict", "Gateway 拒绝了本次排队请求");
+        throw makeTurnError("conflict", getCopy("turn.queue.rejectedError"));
       }
       if (!admissionId) {
         const unknownEntry = this.upsertDeliveryUnknown(
@@ -870,6 +901,13 @@ export class TurnRecoveryCoordinator {
         found: true,
         canRetrySameSubmission: false,
         admission: alreadyInQueue,
+      };
+    }
+
+    if (!pending && !matchedRaw) {
+      return {
+        found: false,
+        canRetrySameSubmission: false,
       };
     }
 
@@ -1089,7 +1127,7 @@ export class TurnRecoveryCoordinator {
             executionGeneration: input.executionGeneration ?? 0,
           };
     }
-    if (rec.queuePaused || rec.unknownTurn) {
+    if (rec.queuePaused || rec.unknownTurns.length > 0) {
       return {
         allowed: false,
         reason: "rejected",
@@ -1224,7 +1262,7 @@ export class TurnRecoveryCoordinator {
       ownerGeneration: 0,
       stopState: "idle",
       queuePaused: false,
-      unknownTurn: null,
+      unknownTurns: [],
       queuedAdmissions: [],
       pendingDeliveryUnknown: [],
       pendingSteerFallback: null,
@@ -1369,7 +1407,11 @@ export class TurnRecoveryCoordinator {
         : {}),
       ...(rec.stopOutcomeMessage ? { stopOutcomeMessage: rec.stopOutcomeMessage } : {}),
       queuePaused: rec.queuePaused,
-      unknownTurn: rec.unknownTurn,
+      unknownTurns: Object.freeze([...rec.unknownTurns]),
+      unknownTurn: rec.unknownTurns[0] ?? null,
+      ...(rec.unknownTurnProtocolError
+        ? { unknownTurnProtocolError: rec.unknownTurnProtocolError }
+        : {}),
       queuedAdmissions: Object.freeze([...rec.queuedAdmissions]),
       pendingDeliveryUnknown: Object.freeze([...rec.pendingDeliveryUnknown]),
       pendingSteerFallback: rec.pendingSteerFallback,

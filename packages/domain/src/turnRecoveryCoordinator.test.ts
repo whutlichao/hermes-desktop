@@ -467,4 +467,122 @@ describe("TurnRecoveryCoordinator (Issue #43 TDD slices)", () => {
         ?.pendingSteerFallback?.allowedFallbacks,
     ).toEqual(["new_turn", "queue"]);
   });
+
+  it("Slice S2: explicit stopped:false keeps cancel_outcome_unknown with a typed conflict instead of resetting to idle", async () => {
+    const coord = new TurnRecoveryCoordinator({
+      now: () => Date.parse("2026-11-23T10:40:00.000Z"),
+    });
+    coord.noteTurnStarted({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-stop-false",
+      turnId: "turn-stop-false",
+      executionGeneration: 9,
+      ownerGeneration: 1,
+    });
+
+    await expect(
+      coord.requestStop(
+        {
+          connectionId: "local",
+          profileId: "default",
+          sessionId: "s-stop-false",
+          turnId: "turn-stop-false",
+          executionGeneration: 9,
+        },
+        async () => ({ stopped: false }),
+      ),
+    ).rejects.toMatchObject({ code: "conflict", message: expect.stringContaining("发生了什么") });
+
+    const view = coord.getSessionView({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-stop-false",
+    });
+    expect(view?.stopState).toBe("cancel_outcome_unknown");
+    expect(view?.stopOutcomeMessage).toContain("停止请求保持待确认");
+    expect(view?.stopRequestedTurnId).toBe("turn-stop-false");
+    expect(view?.stopRequestedGeneration).toBe(9);
+  });
+
+  it("Slice P6: keeps every unknown turn and never lets a malformed first entry erase a valid later entry", async () => {
+    const coord = new TurnRecoveryCoordinator({
+      now: () => Date.parse("2026-11-23T10:45:00.000Z"),
+    });
+
+    const twoUnknown = coord.reconcileFromResume({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-multi-unknown",
+      ownerGeneration: 3,
+      activeTurnId: null,
+      executionGeneration: 6,
+      unknownTurns: [
+        { admissionId: "adm-a", executionGeneration: 4, originalInput: "first" },
+        { admissionId: "adm-b", executionGeneration: 5, originalInput: "second" },
+      ],
+    });
+    expect(twoUnknown.queuePaused).toBe(true);
+    expect(twoUnknown.unknownTurns.map((item) => item.admissionId)).toEqual(["adm-a", "adm-b"]);
+    expect(twoUnknown.unknownTurn?.admissionId).toBe("adm-a");
+
+    await coord.resolveUnknown(
+      { connectionId: "local", profileId: "default", sessionId: "s-multi-unknown", admissionId: "adm-a" },
+      async () => ({ settled: true, status: "interrupted" }),
+    );
+    const afterFirst = coord.getSessionView({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-multi-unknown",
+    });
+    expect(afterFirst?.unknownTurns.map((item) => item.admissionId)).toEqual(["adm-b"]);
+    expect(afterFirst?.queuePaused).toBe(true);
+
+    await coord.resolveUnknown(
+      { connectionId: "local", profileId: "default", sessionId: "s-multi-unknown", admissionId: "adm-b" },
+      async () => ({ settled: true, status: "interrupted" }),
+    );
+    const afterSecond = coord.getSessionView({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-multi-unknown",
+    });
+    expect(afterSecond?.unknownTurns).toEqual([]);
+    expect(afterSecond?.queuePaused).toBe(false);
+
+    const malformedFirst = coord.reconcileFromResume({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-malformed-unknown",
+      ownerGeneration: 4,
+      activeTurnId: null,
+      executionGeneration: 7,
+      unknownTurns: [
+        { executionGeneration: 6 },
+        { admissionId: "adm-valid", executionGeneration: 6, originalInput: "keep me" },
+      ],
+    });
+    expect(malformedFirst.queuePaused).toBe(true);
+    expect(malformedFirst.unknownTurns.map((item) => item.admissionId)).toEqual(["adm-valid"]);
+    expect(malformedFirst.unknownTurn?.originalInput).toBe("keep me");
+    expect(malformedFirst.unknownTurnProtocolError).toContain("无法解析");
+
+    await coord.resolveUnknown(
+      {
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "s-malformed-unknown",
+        admissionId: "adm-valid",
+      },
+      async () => ({ settled: true, status: "interrupted" }),
+    );
+    const afterMalformedDiscard = coord.getSessionView({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-malformed-unknown",
+    });
+    expect(afterMalformedDiscard?.unknownTurns).toEqual([]);
+    expect(afterMalformedDiscard?.queuePaused).toBe(true);
+    expect(afterMalformedDiscard?.unknownTurnProtocolError).toContain("无法解析");
+  });
 });

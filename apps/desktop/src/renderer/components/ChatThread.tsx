@@ -17,6 +17,7 @@ import type {
   ToolExecutionRow,
   TranscriptPendingApprovalView,
   TurnSessionRecoveryView,
+  UnknownTurnRecord,
 } from "@hermes/contracts";
 import { getCopy, getLocalFailureCopy } from "@hermes/domain";
 import { AttributionBadge } from "./AttributionBadge";
@@ -77,7 +78,7 @@ interface ChatThreadProps {
   onRepairLocal: () => void;
   onAddRemote: () => void;
   onAddSsh: () => void;
-  onDiscardUnknown: () => void;
+  onDiscardUnknown: (unknown: UnknownTurnRecord) => void;
   onCancelQueued: (admissionId: string) => void;
   onCheckQueueReceipt: (submissionId: string) => void;
   onRetryQueue: (submissionId: string) => void;

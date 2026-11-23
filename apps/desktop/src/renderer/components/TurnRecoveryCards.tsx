@@ -3,6 +3,7 @@ import type {
   QueuedAdmissionState,
   SteerFailureReason,
   TurnSessionRecoveryView,
+  UnknownTurnRecord,
 } from "@hermes/contracts";
 import { getCopy, type CopyKey } from "@hermes/domain";
 
@@ -11,7 +12,7 @@ interface TurnRecoveryCardsProps {
   busy: boolean;
   canCancelQueue: boolean;
   canSteer: boolean;
-  onDiscardUnknown: () => void;
+  onDiscardUnknown: (unknown: UnknownTurnRecord) => void;
   onCancelQueued: (admissionId: string) => void;
   onCheckQueueReceipt: (submissionId: string) => void;
   onRetryQueue: (submissionId: string) => void;
@@ -76,7 +77,12 @@ export function TurnRecoveryCards({
   const [steerText, setSteerText] = useState("");
   if (!recovery) return null;
 
-  const unknown = recovery.unknownTurn;
+  const unknownTurns =
+    recovery.unknownTurns.length > 0
+      ? recovery.unknownTurns
+      : recovery.unknownTurn
+        ? [recovery.unknownTurn]
+        : [];
   const fallback = recovery.pendingSteerFallback;
   const activeQueue = recovery.queuedAdmissions.filter(
     (item) =>
@@ -91,14 +97,15 @@ export function TurnRecoveryCards({
 
   return (
     <div className="turn-recovery-stack">
-      {unknown && (
+      {unknownTurns.map((unknown, index) => (
         <section
+          key={`${unknown.admissionId}:${unknown.executionGeneration}`}
           className="turn-recovery-card is-blocking"
-          aria-labelledby="unknown-turn-heading"
+          aria-labelledby={`unknown-turn-heading-${index}`}
           data-testid="unknown-turn-card"
         >
           <div className="turn-recovery-head">
-            <h2 id="unknown-turn-heading">{getCopy("turn.unknown.title")}</h2>
+            <h2 id={`unknown-turn-heading-${index}`}>{getCopy("turn.unknown.title")}</h2>
             <span className="status-pill is-blocked">{getCopy("turn.unknown.pausedBadge")}</span>
           </div>
           <p>{getCopy("turn.unknown.body")}</p>
@@ -147,11 +154,26 @@ export function TurnRecoveryCards({
               type="button"
               className="button button-primary"
               disabled={busy || Boolean(unknown.resolving)}
-              onClick={onDiscardUnknown}
+              onClick={() => onDiscardUnknown(unknown)}
             >
               {getCopy(unknown.resolving ? "turn.unknown.discardBusy" : "turn.unknown.discardAction")}
             </button>
           </div>
+        </section>
+      ))}
+
+      {recovery.unknownTurnProtocolError && (
+        <section
+          className="turn-recovery-card is-warn"
+          role="status"
+          aria-labelledby="unknown-turn-protocol-heading"
+          data-testid="unknown-turn-protocol-error"
+        >
+          <div className="turn-recovery-head">
+            <h2 id="unknown-turn-protocol-heading">{getCopy("turn.unknown.title")}</h2>
+            <span className="status-pill is-warn">{getCopy("turn.unknown.pausedBadge")}</span>
+          </div>
+          <p>{recovery.unknownTurnProtocolError}</p>
         </section>
       )}
 
@@ -170,7 +192,7 @@ export function TurnRecoveryCards({
         </section>
       )}
 
-      {recovery.queuePaused && !unknown && (
+      {recovery.queuePaused && unknownTurns.length === 0 && !recovery.unknownTurnProtocolError && (
         <div className="turn-recovery-notice" role="status">
           {getCopy("turn.queue.pausedNotice")}
         </div>
@@ -189,7 +211,11 @@ export function TurnRecoveryCards({
           <p>{getCopy("turn.queue.deliveryUnknownBody")}</p>
           <ul className="turn-recovery-list">
             {recovery.pendingDeliveryUnknown.map((pending) => (
-              <li key={pending.submissionId} className="turn-recovery-row">
+              <li
+                key={pending.submissionId}
+                className="turn-recovery-row"
+                data-state={pending.state}
+              >
                 <span className="turn-recovery-row-text">{pending.text}</span>
                 <code>{pending.submissionId}</code>
                 <div className="turn-recovery-actions">

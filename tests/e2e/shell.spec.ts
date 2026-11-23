@@ -4825,21 +4825,60 @@ test.describe("Ticket #43 Turn & queue recovery", () => {
 
     await deliveryUnknown.getByRole("button", { name: "检查回执" }).click();
     await expect(deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" })).toBeVisible();
+    await page.evaluate(() => {
+      const fixture = (window as unknown as {
+        __HERMES_E2E_FIXTURE__: { turnRecovery: { queueRetryMode?: string } };
+      }).__HERMES_E2E_FIXTURE__;
+      fixture.turnRecovery.queueRetryMode = "delivery_unknown";
+    });
+    await deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" }).click();
+
+    const assertiveRegion = page.getByTestId("live-region-assertive");
+    const politeRegion = page.getByTestId("live-region-polite");
+    const deliveryUnknownRow = deliveryUnknown.getByRole("listitem").first();
+    await expect(deliveryUnknownRow).toHaveAttribute("data-state", "delivery_unknown");
+    await expect(page.getByTestId("queue-card")).toHaveCount(0);
+    await expect(assertiveRegion).toContainText("仍未收到 admission_id 回执");
+    await expect(politeRegion).not.toContainText("已按原 submission ID 重新排队");
+    const retryUnknownSeq = await assertiveRegion.getAttribute("data-announcement-seq");
+
+    // The same submission retry event may fire again, but the live region must dedupe it.
+    await deliveryUnknown.getByRole("button", { name: "检查回执" }).click();
+    await expect(deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" })).toBeVisible();
+    await deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" }).click();
+    await expect(deliveryUnknownRow).toHaveAttribute("data-state", "delivery_unknown");
+    await expect(assertiveRegion).toHaveAttribute(
+      "data-announcement-seq",
+      retryUnknownSeq ?? "1",
+    );
+    await expect(page.getByTestId("queue-card")).toHaveCount(0);
+
+    await deliveryUnknown.getByRole("button", { name: "检查回执" }).click();
+    await expect(deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" })).toBeVisible();
+    await page.evaluate(() => {
+      const fixture = (window as unknown as {
+        __HERMES_E2E_FIXTURE__: { turnRecovery: { queueRetryMode?: string } };
+      }).__HERMES_E2E_FIXTURE__;
+      fixture.turnRecovery.queueRetryMode = "admitted";
+    });
     await deliveryUnknown.getByRole("button", { name: "按原 ID 重试排队" }).click();
 
     const queueCard = page.getByTestId("queue-card");
     await expect(queueCard).toBeVisible();
     await expect(queueCard.locator(".turn-recovery-row")).toHaveCount(1);
     await expect(queueCard).toContainText("Queued receipt prompt");
+    await expect(politeRegion).toContainText("已按原 submission ID 重新排队");
     const queueCounts = await page.evaluate(
       () =>
         (window as unknown as {
           __HERMES_E2E_COUNTS__: { queueSubmittedIds: string[] };
         }).__HERMES_E2E_COUNTS__,
     );
-    expect(queueCounts.queueSubmittedIds).toHaveLength(2);
+    expect(queueCounts.queueSubmittedIds).toHaveLength(4);
     expect(queueCounts.queueSubmittedIds[0]).toBe(firstSubmissionId);
     expect(queueCounts.queueSubmittedIds[1]).toBe(firstSubmissionId);
+    expect(queueCounts.queueSubmittedIds[2]).toBe(firstSubmissionId);
+    expect(queueCounts.queueSubmittedIds[3]).toBe(firstSubmissionId);
 
     await page.evaluate(() => {
       const fixture = (window as unknown as { __HERMES_E2E_FIXTURE__: { turnRecovery: { queueCancelOutcome: string } } })

@@ -1893,7 +1893,9 @@ export interface TurnSessionRecoveryView {
   readonly stopRequestedGeneration?: number;
   readonly stopOutcomeMessage?: string;
   readonly queuePaused: boolean;
+  readonly unknownTurns: readonly UnknownTurnRecord[];
   readonly unknownTurn: UnknownTurnRecord | null;
+  readonly unknownTurnProtocolError?: string;
   readonly queuedAdmissions: readonly QueuedAdmissionView[];
   readonly pendingDeliveryUnknown: readonly QueueDeliveryUnknownView[];
   readonly pendingSteerFallback: SteerFallbackPromptView | null;

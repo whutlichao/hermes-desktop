@@ -51,6 +51,7 @@ import {
   type TerminalSnapshot,
   type TurnRecoveryTopicSnapshot,
   type TurnSessionRecoveryView,
+  type UnknownTurnRecord,
   type WorkspaceAgentItem,
   type WorkspaceArtifactItem,
   type WorkspaceCheckpointItem,
@@ -280,7 +281,7 @@ export default function App() {
     hasReadyConnection &&
     Boolean(state.transcript?.supportedActions.promptSubmit) &&
     !activeTurnRecovery?.queuePaused &&
-    !activeTurnRecovery?.unknownTurn;
+    (activeTurnRecovery?.unknownTurns.length ?? 0) === 0;
 
   const canSteerPrompt = hasReadyConnection && Boolean(state.transcript?.supportedActions.promptSteer);
   const canCancelQueuePrompt =
@@ -2052,18 +2053,37 @@ export default function App() {
       if (!effectiveScope || !state.activeSessionId) return;
       setRecoveryBusy(true);
       try {
-        const res = await host.request<{ status?: string }>(
+        const res = await host.request<{
+          status?: "admitted" | "delivery_unknown";
+          deliveryUnknown?: unknown;
+        }>(
           "prompts.retryQueue",
           { sessionId: state.activeSessionId, submissionId },
           { ...effectiveScope, sessionId: state.activeSessionId },
         );
         if (!res.ok) {
           dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          dispatch({
+            type: "ANNOUNCE",
+            message: res.error.message,
+            eventId: `queue-retry:${submissionId}:error`,
+            priority: "assertive",
+          });
+          return;
+        }
+        if (res.value.status !== "admitted") {
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy("turn.queue.retryDeliveryUnknownNotice"),
+            eventId: `queue-retry:${submissionId}:delivery_unknown`,
+            priority: "assertive",
+          });
           return;
         }
         dispatch({
           type: "ANNOUNCE",
           message: getCopy("turn.queue.retriedNotice"),
+          eventId: `queue-retry:${submissionId}:admitted`,
         });
       } finally {
         setRecoveryBusy(false);
@@ -2110,9 +2130,8 @@ export default function App() {
     [effectiveScope, state.activeSessionId],
   );
 
-  const handleDiscardUnknownTurn = useCallback(async () => {
-    const unknown = activeTurnRecovery?.unknownTurn;
-    if (!unknown || !effectiveScope || !state.activeSessionId) return;
+  const handleDiscardUnknownTurn = useCallback(async (unknown: UnknownTurnRecord) => {
+    if (!effectiveScope || !state.activeSessionId) return;
     setRecoveryBusy(true);
     try {
       const res = await host.request<{ resolved: boolean }>(
@@ -2141,7 +2160,7 @@ export default function App() {
     } finally {
       setRecoveryBusy(false);
     }
-  }, [activeTurnRecovery?.unknownTurn, effectiveScope, state.activeSessionId]);
+  }, [effectiveScope, state.activeSessionId]);
 
   const handleSteerTurn = useCallback(
     async (text: string) => {
@@ -3507,7 +3526,7 @@ export default function App() {
                 onRepairLocal={handleRepairLocalConnection}
                 onAddRemote={() => openSettingsForAdd("remote")}
                 onAddSsh={() => openSettingsForAdd("ssh")}
-                onDiscardUnknown={() => void handleDiscardUnknownTurn()}
+                onDiscardUnknown={(unknown) => void handleDiscardUnknownTurn(unknown)}
                 onCancelQueued={(admissionId) => void handleCancelQueued(admissionId)}
                 onCheckQueueReceipt={(submissionId) => void handleCheckQueueReceipt(submissionId)}
                 onRetryQueue={(submissionId) => void handleRetryQueue(submissionId)}

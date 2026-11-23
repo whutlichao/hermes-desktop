@@ -3823,11 +3823,15 @@ process.exit(1);
 
     let admissionSeq = 0;
     let deliveryUnknownSubmissionId: string | null = "sub-q-2";
+    let alwaysDeliveryUnknownSubmissionId: string | null = "sub-q-3";
     let receiptFound = false;
     const queueAdmissions: Array<Record<string, unknown>> = [];
     const cancelStatuses = new Map<string, string>();
     const promptSubmits: Array<Record<string, unknown>> = [];
     const promptCancels: Array<Record<string, unknown>> = [];
+    let holdCancelForAdmission: string | null = null;
+    let resolveCancelEntered: (() => void) | null = null;
+    let releaseHeldCancel: (() => void) | null = null;
 
     const gw = await startFakeGatewayServer({
       validTickets,
@@ -3864,6 +3868,14 @@ process.exit(1);
           const submissionId = String(params.submission_id ?? "");
           if (params.queued === true && deliveryUnknownSubmissionId === submissionId) {
             deliveryUnknownSubmissionId = null;
+            ctx.replyResult({
+              admitted: true,
+              status: "queued",
+              submission_id: submissionId,
+            });
+            return true;
+          }
+          if (params.queued === true && alwaysDeliveryUnknownSubmissionId === submissionId) {
             ctx.replyResult({
               admitted: true,
               status: "queued",
@@ -3913,16 +3925,27 @@ process.exit(1);
             ctx.replyResult({ stopped: true, status: "stopped" });
             return true;
           }
-          const status = cancelStatuses.get(admissionId) ?? "cancelled";
-          const row = queueAdmissions.find((item) => item.admission_id === admissionId);
-          if (row) row.status = status;
-          ctx.replyResult({
-            status,
-            admission_id: admissionId,
-            ...(status === "cancelled" ? { cancelled: true } : {}),
-            ...(status === "stopped" ? { stopped: true } : {}),
-            ...(status === "already_started" ? { already_started: true, turn_id: "turn-started" } : {}),
-          });
+          const replyCancel = () => {
+            const status = cancelStatuses.get(admissionId) ?? "cancelled";
+            const row = queueAdmissions.find((item) => item.admission_id === admissionId);
+            if (row) row.status = status;
+            ctx.replyResult({
+              status,
+              admission_id: admissionId,
+              ...(status === "cancelled" ? { cancelled: true } : {}),
+              ...(status === "stopped" ? { stopped: true } : {}),
+              ...(status === "already_started"
+                ? { already_started: true, turn_id: "turn-started" }
+                : {}),
+            });
+          };
+          if (holdCancelForAdmission === admissionId) {
+            holdCancelForAdmission = null;
+            releaseHeldCancel = replyCancel;
+            resolveCancelEntered?.();
+            return true;
+          }
+          replyCancel();
           return true;
         }
         return false;
@@ -4016,6 +4039,52 @@ process.exit(1);
         "adm-q-2",
       ]);
 
+      // 3a. Unknown submissionId is not fabricated into an empty retry_ready record.
+      const unknownReceipt = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-queue", submissionId: "sub-does-not-exist" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(unknownReceipt).toEqual({ found: false, canRetrySameSubmission: false });
+      expect(latestRecovery()?.pendingDeliveryUnknown).toHaveLength(0);
+
+      // 3b. A retry that still has no admission_id stays delivery_unknown and never becomes a queue card.
+      const retryUnknown = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-queue", text: "retry stays unknown", submissionId: "sub-q-3" },
+        scope,
+      )) as {
+        status: string;
+        deliveryUnknown: { submissionId: string; canRetrySameSubmission: boolean };
+      };
+      expect(retryUnknown.status).toBe("delivery_unknown");
+      const firstUnknownRetry = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-queue", submissionId: "sub-q-3" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(firstUnknownRetry).toMatchObject({ found: false, canRetrySameSubmission: true });
+      const stillUnknown = (await supervisor.handlers["prompts.retryQueue"](
+        { sessionId: "sess-queue", submissionId: "sub-q-3" },
+        scope,
+      )) as {
+        status: string;
+        deliveryUnknown: { submissionId: string; state: string; canRetrySameSubmission: boolean };
+      };
+      expect(stillUnknown.status).toBe("delivery_unknown");
+      expect(stillUnknown.deliveryUnknown).toMatchObject({
+        submissionId: "sub-q-3",
+        state: "delivery_unknown",
+        canRetrySameSubmission: false,
+      });
+      expect(latestRecovery()?.pendingDeliveryUnknown).toHaveLength(1);
+      expect(latestRecovery()?.pendingDeliveryUnknown[0]).toMatchObject({
+        submissionId: "sub-q-3",
+        state: "delivery_unknown",
+        canRetrySameSubmission: false,
+      });
+      expect(latestRecovery()?.queuedAdmissions.map((item) => item.admissionId)).toEqual([
+        "adm-q-1",
+        "adm-q-2",
+      ]);
+
       // 4. Cancel by admissionId; server terminal states win and are never inferred locally.
       cancelStatuses.set("adm-q-1", "already_started");
       const startedCancel = (await supervisor.handlers["prompts.cancelQueued"](
@@ -4040,6 +4109,62 @@ process.exit(1);
       ]);
       expect(latestRecovery()?.queuedAdmissions.find((q) => q.admissionId === "adm-q-2")?.state).toBe(
         "cancelled",
+      );
+
+      // 5. Another client settles first while this client's cancel is still in flight.
+      //    The Gateway snapshot and cancel reply win; do not infer a local cancelled state,
+      //    duplicate the cancel RPC, or enqueue the prompt again.
+      const fourthQueue = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-queue", text: "first response wins", submissionId: "sub-q-4" },
+        scope,
+      )) as { status: string; admission: { admissionId: string } };
+      expect(fourthQueue.status).toBe("admitted");
+      const fourthAdmissionId = fourthQueue.admission.admissionId;
+      const submitsBeforeRace = promptSubmits.length;
+      const cancelsBeforeRace = promptCancels.length;
+      let markCancelEntered: (() => void) | null = null;
+      const cancelEntered = new Promise<void>((resolve) => {
+        markCancelEntered = resolve;
+      });
+      resolveCancelEntered = markCancelEntered;
+      holdCancelForAdmission = fourthAdmissionId;
+
+      const inFlightCancel = supervisor.handlers["prompts.cancelQueued"](
+        { sessionId: "sess-queue", admissionId: fourthAdmissionId },
+        scope,
+      );
+      await cancelEntered;
+      expect(latestRecovery()?.queuedAdmissions.find((q) => q.admissionId === fourthAdmissionId)?.state).toBe(
+        "cancelling",
+      );
+
+      const settledByOtherClient = queueAdmissions.find(
+        (item) => item.admission_id === fourthAdmissionId,
+      );
+      if (settledByOtherClient) settledByOtherClient.status = "already_started";
+      cancelStatuses.set(fourthAdmissionId, "already_started");
+      await supervisor.handlers["sessions.resume"](
+        { sessionId: "sess-queue", resync: true },
+        scope,
+      );
+      const releaseCancel = releaseHeldCancel as (() => void) | null;
+      expect(releaseCancel).not.toBeNull();
+      releaseCancel?.();
+
+      const firstResponse = (await inFlightCancel) as {
+        outcome: string;
+        admission: { state: string; turnId?: string };
+      };
+      expect(firstResponse).toMatchObject({
+        outcome: "already_started",
+        admission: { state: "already_started", turnId: "turn-started" },
+      });
+      expect(promptCancels.slice(cancelsBeforeRace)).toEqual([
+        { profile_id: "default", session_id: "sess-queue", admission_id: fourthAdmissionId },
+      ]);
+      expect(promptSubmits).toHaveLength(submitsBeforeRace);
+      expect(latestRecovery()?.queuedAdmissions.find((q) => q.admissionId === fourthAdmissionId)?.state).toBe(
+        "already_started",
       );
 
       unsub();

@@ -778,6 +778,7 @@ export const COPY_CATALOG = {
   "turn.unknown.discardBusy": "正在放弃 Turn……",
   "turn.unknown.detailsAction": "查看详情",
   "turn.unknown.hideDetailsAction": "收起详情",
+  "turn.unknown.protocolUnsupportedBody": "Gateway 返回了无法解析的丢失 Turn 记录。Session 与排队已暂停，请检查 Gateway 版本或查看诊断；不会自动放弃或重发。",
   "turn.unknown.pausedBadge": "Session 已暂停",
   "turn.unknown.admissionLabel": "Admission ID",
   "turn.unknown.generationLabel": "Execution 代际",
@@ -792,6 +793,8 @@ export const COPY_CATALOG = {
   "turn.stop.stoppingBadge": "正在等待停止确认",
   "turn.stop.cancelOutcomeUnknownTitle": "停止结果待确认",
   "turn.stop.cancelOutcomeUnknownBody": "发送停止请求后未收到确认或连接发生变更，将在 Session 恢复对账后确认实际终态，不会跨代际自动重发。",
+  "turn.stop.notConfirmedBody": "Gateway 未确认停止当前 Turn，停止请求保持待确认；不会跨代际自动重发，请在 Session 恢复后对账。",
+  "turn.stop.notConfirmedError": "发生了什么：Gateway 未确认停止当前 Turn。可能原因：Turn 已结束或连接中断。下一步：检查 Session 状态后再重试。",
   "turn.queue.sectionTitle": "Gateway 排队队列",
   "turn.queue.pausedNotice": "当前队列已暂停，需先处理丢失的 Turn",
   "turn.queue.queueAction": "加入排队",
@@ -813,6 +816,10 @@ export const COPY_CATALOG = {
   "turn.queue.receiptAdmittedNotice": "回执已确认，排队条目已入队。",
   "turn.queue.receiptMissingNotice": "未找到排队回执，可按原 submission ID 重试。",
   "turn.queue.retriedNotice": "已按原 submission ID 重新排队。",
+  "turn.queue.retryDeliveryUnknownNotice": "重试后仍未收到 admission_id 回执，投递仍未确认；请再次检查回执后再重试。",
+  "turn.queue.rejectedError": "发生了什么：Gateway 拒绝了本次排队请求。可能原因：队列已满或当前 Scope 不允许排队。下一步：稍后重试，或发送为普通 Turn。",
+  "turn.queue.submissionIdRequiredError": "发生了什么：缺少 submissionId。可能原因：排队恢复请求不完整。下一步：重新检查回执后再重试。",
+  "turn.queue.promptSubmitUnavailableError": "发生了什么：当前 Gateway 不支持发送对话。可能原因：Gateway 版本过旧或 prompt.submit 未开放。下一步：升级 Gateway 或改用受支持的入口。",
   "turn.queue.cancelOutcome.cancelled": "排队条目已取消。",
   "turn.queue.cancelOutcome.stopped": "该排队条目已停止。",
   "turn.queue.cancelOutcome.already_started": "该排队条目已开始执行，无法再取消。",
@@ -884,6 +891,10 @@ const ERROR_TEMPLATE_KEYS = new Set<CopyKey>([
   "cron.stateError",
   "turn.unknown.discardFailed",
   "turn.queue.cancelFailed",
+  "turn.stop.notConfirmedError",
+  "turn.queue.rejectedError",
+  "turn.queue.submissionIdRequiredError",
+  "turn.queue.promptSubmitUnavailableError",
 ]);
 
 export interface TerminologyViolation {
