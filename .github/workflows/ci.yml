@@ -145,11 +145,15 @@ jobs:
         run: node scripts/package-mac.mjs --arch=x64
 
   nightly-macos-26:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: Nightly macOS 26 & Real Gateway Smoke (Non-blocking)
-    runs-on: macos-26
+    runs-on: ${{ vars.HERMES_REAL_GATEWAY_RUNNER || 'macos-26' }}
     continue-on-error: true
     timeout-minutes: 45
+    env:
+      CI: "true"
+      PLAYWRIGHT_RETRIES: "0"
+      REAL_GATEWAY_RETRIES: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -174,14 +178,8 @@ jobs:
       - name: Packaged Launch Smoke
         run: pnpm smoke:packaged
 
-      - name: Real Gateway Smoke (skipped unless self-hosted hermes CLI present)
-        run: |
-          if command -v hermes >/dev/null 2>&1; then
-            echo "[nightly] hermes CLI detected; running test:real-gateway when available"
-            pnpm run --if-present test:real-gateway
-          else
-            echo "[nightly] test:real-gateway skipped (hermes CLI not preinstalled on GitHub-hosted runner)"
-          fi
+      - name: Real Gateway Smoke (0 retries; skipped unless hermes CLI present)
+        run: pnpm test:real-gateway -- --ci-allow-skip --report-dir test-results/real-gateway
 
       - name: Upload Nightly Diagnostics & Artifacts (14 days)
         if: always()
@@ -191,5 +189,7 @@ jobs:
           path: |
             apps/desktop/release/
             test-results/
+            test-results/real-gateway/report.json
+            test-results/real-gateway/summary.md
           retention-days: 14
           if-no-files-found: warn
