@@ -181,4 +181,51 @@ describe("ChatSessionStateStore (S1/S3 startup recovery, 0600 persistence, sessi
       sandbox.cleanup(passed);
     }
   });
+
+  it("persists Draft artifact annotations with 0600 atomic writes, preserves them across draft text edits and restarts, and includes them in session_missing export", () => {
+    const sandbox = createTestSandbox("hermes-chatstate-annotations-");
+    let passed = false;
+    try {
+      const store1 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const ref = { connectionId: "local", profileId: "default", sessionId: "sess-art" };
+      store1.recordActiveChat(ref);
+      store1.syncSessionSummaries([session("local", "default", "sess-art", "Artifact Thread")]);
+
+      const ann = {
+        annotationId: "ann-101",
+        artifactId: "art-1",
+        artifactVersion: 1,
+        artifactHash: "h-v1",
+        xPct: 28.4,
+        yPct: 71.9,
+        comment: "Keep this pin on v1",
+        createdAt: "2026-11-23T08:10:00.000Z",
+      };
+
+      store1.saveDraft(ref, "Draft with annotation", { annotations: [ann] });
+
+      // Updating draft text alone preserves existing annotations in Draft
+      store1.saveDraft(ref, "Updated draft text");
+
+      const store2 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const loaded = store2.load();
+      const summary = loaded.sessionSummaries["local::default::sess-art"];
+      expect(summary?.hasDraft).toBe(true);
+      expect(summary?.draftText).toBe("Updated draft text");
+      expect(summary?.annotations).toEqual([ann]);
+
+      // Even if draft text is cleared, remaining annotations keep hasDraft=true so Draft annotations are not lost
+      store2.saveDraft(ref, "");
+      const summaryAfterClearText = store2.getProjection().sessionSummaries["local::default::sess-art"];
+      expect(summaryAfterClearText?.hasDraft).toBe(true);
+      expect(summaryAfterClearText?.annotations).toEqual([ann]);
+
+      const exported = store2.exportMissingSession(ref);
+      expect(exported?.annotations).toEqual([ann]);
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
 });

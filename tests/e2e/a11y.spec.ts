@@ -229,4 +229,116 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await expect(page.locator(".session-missing-card")).toBeVisible();
     await checkAxe("session_missing read-only recovery card");
   });
+
+  test("passes axe-core serious/critical = 0 on populated Workspace Artifacts, Annotations, Files, Git, Agents, and Terminal tabs", async ({
+    page,
+  }) => {
+    const checkAxe = async (label: string) => {
+      const results = await new AxeBuilder({ page }).analyze();
+      const severe = results.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(severe, `axe serious/critical violations on ${label}`).toEqual([]);
+    };
+
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              availability: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a11y",
+              title: "Workspace A11y Session",
+              preview: "Checking tabs",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-a11y" },
+          activeSessionId: "sess-a11y",
+        },
+        artifacts: {
+          "sess-a11y": [
+            {
+              artifactId: "art-a11y",
+              title: "A11y Artifact",
+              kind: "markdown",
+              content: "# Accessible Artifact\nContent body",
+              version: 2,
+              hash: "hash-v2",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              stale: true,
+            },
+          ],
+        },
+        files: {
+          "local::default": [
+            {
+              relativePath: "src",
+              name: "src",
+              kind: "directory",
+              parentPath: null,
+            },
+            {
+              relativePath: "src/index.ts",
+              name: "index.ts",
+              kind: "file",
+              parentPath: "src",
+              hash: "h1",
+              content: "export const ready = true;",
+            },
+          ],
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await page.locator(".route-strip").getByRole("button", { name: /Workspace/ }).click();
+    const drawer = page.getByRole("complementary", { name: "Workspace" });
+    await expect(drawer).toBeVisible();
+    await drawer.getByLabel("标注内容").fill("Accessible annotation");
+    await drawer.getByRole("button", { name: "添加标注到 Draft" }).click();
+    await checkAxe("populated workspace artifacts + annotations");
+
+    await drawer.getByRole("tab", { name: "Files" }).click();
+    await drawer.getByTestId("workspace-dir-src").click();
+    await drawer.getByTestId("workspace-file-src/index.ts").click();
+    await checkAxe("populated workspace files preview");
+
+    await drawer.getByRole("tab", { name: "Git" }).click();
+    await checkAxe("workspace git tab");
+
+    await drawer.getByRole("tab", { name: "Agents" }).click();
+    await checkAxe("workspace agents tab");
+
+    await drawer.getByRole("tab", { name: "Terminal" }).click();
+    await checkAxe("workspace terminal tab");
+  });
 });

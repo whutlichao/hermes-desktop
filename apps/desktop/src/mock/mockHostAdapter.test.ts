@@ -296,3 +296,180 @@ describe("MockHostBridge Ticket #28 chat/session parity", () => {
     unsub();
   });
 });
+
+describe("MockHostBridge Ticket #35 Workspace artifacts, files, and Draft annotations contract (S0)", () => {
+  it("serves session-keyed artifacts.list/read, scope-keyed files.list/read, and persists Draft annotations via chatState.saveDraft", async () => {
+    const prevFixture = (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__;
+    try {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              label: "This device",
+              kind: "local",
+              originDisplay: "127.0.0.1",
+              actual: "ready",
+              degraded: false,
+              latencyMs: 4,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              title: "Session 1",
+              preview: "First",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-2",
+              title: "Session 2",
+              preview: "Second",
+              updatedAt: "2026-11-23T08:01:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+          activeSessionId: "sess-1",
+        },
+        artifacts: {
+          "sess-1": [
+            {
+              artifactId: "art-1",
+              title: "Architecture Spec",
+              kind: "markdown",
+              content: "# Spec v1",
+              version: 1,
+              hash: "hash-v1",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+            },
+          ],
+          "sess-2": [
+            {
+              artifactId: "art-2",
+              title: "Latency SVG",
+              kind: "svg",
+              content: "<svg></svg>",
+              version: 1,
+              hash: "hash-svg-1",
+              updatedAt: "2026-11-23T08:01:00.000Z",
+            },
+          ],
+        },
+        files: {
+          "local::default": [
+            {
+              relativePath: "src",
+              name: "src",
+              kind: "directory",
+              parentPath: null,
+            },
+            {
+              relativePath: "src/app.ts",
+              name: "app.ts",
+              kind: "file",
+              parentPath: "src",
+              hash: "f-hash-1",
+              content: "console.log('ready');",
+              sizeBytes: 21,
+            },
+          ],
+        },
+      };
+
+      const mock = createMockHostBridge();
+
+      const artList1 = await mock.request<{ artifacts: Array<{ artifactId: string }> }>(
+        "artifacts.list",
+        { sessionId: "sess-1" },
+        { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+      );
+      expect(artList1.ok).toBe(true);
+      if (artList1.ok) {
+        expect(artList1.value.artifacts.map((a) => a.artifactId)).toEqual(["art-1"]);
+      }
+
+      const artRead1 = await mock.request<{ artifact: { artifactId: string; content: string } | null }>(
+        "artifacts.read",
+        { sessionId: "sess-1", artifactId: "art-1" },
+        { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+      );
+      expect(artRead1.ok && artRead1.value.artifact?.content).toBe("# Spec v1");
+
+      const filesList = await mock.request<{ files: Array<{ relativePath: string }> }>(
+        "files.list",
+        {},
+        { connectionId: "local", profileId: "default" },
+      );
+      expect(filesList.ok).toBe(true);
+      if (filesList.ok) {
+        expect(filesList.value.files.map((f) => f.relativePath)).toEqual(["src", "src/app.ts"]);
+      }
+
+      const fileRead = await mock.request<{ file: { relativePath: string; content?: string } | null }>(
+        "files.read",
+        { relativePath: "src/app.ts" },
+        { connectionId: "local", profileId: "default" },
+      );
+      expect(fileRead.ok && fileRead.value.file?.content).toBe("console.log('ready');");
+
+      const saveAnn = await mock.request<{
+        sessionSummaries: Record<string, { annotations?: Array<{ annotationId: string }> }>;
+      }>(
+        "chatState.saveDraft",
+        {
+          sessionId: "sess-1",
+          profileId: "default",
+          text: "draft text",
+          annotations: [
+            {
+              annotationId: "ann-mock-1",
+              artifactId: "art-1",
+              artifactVersion: 1,
+              artifactHash: "hash-v1",
+              xPct: 50,
+              yPct: 50,
+              comment: "Center note",
+              createdAt: "2026-11-23T08:02:00.000Z",
+            },
+          ],
+        },
+        { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+      );
+      expect(saveAnn.ok).toBe(true);
+      if (saveAnn.ok) {
+        expect(
+          saveAnn.value.sessionSummaries["local::default::sess-1"]?.annotations?.map(
+            (a) => a.annotationId,
+          ),
+        ).toEqual(["ann-mock-1"]);
+      }
+    } finally {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
+    }
+  });
+});

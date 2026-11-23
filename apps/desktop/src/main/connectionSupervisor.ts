@@ -2722,6 +2722,10 @@ export class ConnectionSupervisor {
     | "chatState.get"
     | "chatState.dismissRouteBanner"
     | "chatState.saveDraft"
+    | "artifacts.list"
+    | "artifacts.read"
+    | "files.list"
+    | "files.read"
     | "chatState.exportMissingSession"
     | "chatState.dismissMissingSession",
     HostCommandHandler
@@ -3232,16 +3236,33 @@ export class ConnectionSupervisor {
       const profileId = this.resolveTargetProfile(payload, scope);
       const sessionId = this.resolveTargetSessionId(payload, scope);
       if (!sessionId) return this.getChatStateProjection();
+      const connectionId = scope?.connectionId ?? this.activeScope?.connectionId ?? "local";
       const ref: ActiveChatRef = {
-        connectionId: scope?.connectionId ?? this.activeScope?.connectionId ?? "local",
+        connectionId,
         profileId,
         sessionId,
       };
-      const text = typeof payload.text === "string" ? payload.text : "";
-      const projection = this.chatSessionStateStore.saveDraft(ref, text);
+      const currentProjection = this.chatSessionStateStore.getProjection();
+      const existingSummary =
+        currentProjection.sessionSummaries[`${connectionId}::${profileId}::${sessionId}`];
+      const text =
+        typeof payload.text === "string" ? payload.text : existingSummary?.draftText ?? "";
+      const annotations = Array.isArray(payload.annotations)
+        ? (payload.annotations as import("@hermes/contracts").ArtifactAnnotation[])
+        : undefined;
+      const projection = this.chatSessionStateStore.saveDraft(
+        ref,
+        text,
+        annotations !== undefined ? { annotations } : undefined,
+      );
       this.emitChatState();
       return projection;
     },
+
+    "artifacts.list": async () => ({ artifacts: [], stale: false, agents: [] }),
+    "artifacts.read": async () => ({ artifact: null }),
+    "files.list": async () => ({ files: [], stale: false, gitDiffs: [] }),
+    "files.read": async () => ({ file: null }),
 
     "chatState.exportMissingSession": async (_payload, scope) => {
       if (!this.chatSessionStateStore) return null;

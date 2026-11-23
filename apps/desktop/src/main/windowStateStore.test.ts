@@ -107,4 +107,31 @@ describe("WindowStateStore (S0/S3 bounds clamp, legacy ID normalization, no sing
       sandboxB.cleanup(passed);
     }
   });
+
+  it("persists pane-scoped WorkspaceFrame { mode, activeTab } across reload and normalizes invalid values", () => {
+    const sandbox = createTestSandbox("hermes-winstate-workspace-");
+    let passed = false;
+    try {
+      const store1 = new WindowStateStore({
+        userDataDir: sandbox.userDataDir,
+        getDisplays: () => [{ x: 0, y: 0, width: 1440, height: 900 }],
+      });
+      store1.savePane({
+        workspace: { mode: "hidden", activeTab: "files" },
+      });
+
+      const store2 = new WindowStateStore({
+        userDataDir: sandbox.userDataDir,
+        getDisplays: () => [{ x: 0, y: 0, width: 1440, height: 900 }],
+      });
+      expect(store2.load().panes[0].workspace).toEqual({
+        mode: "hidden",
+        activeTab: "files",
+      });
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
 });

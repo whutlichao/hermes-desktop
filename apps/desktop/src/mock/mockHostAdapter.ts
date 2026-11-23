@@ -32,6 +32,11 @@ import {
   type SessionSummary,
   type SessionTranscriptSnapshot,
   type SshHostKeyConfirmResult,
+  type ArtifactAnnotation,
+  type WorkspaceAgentItem,
+  type WorkspaceArtifactItem,
+  type WorkspaceFileEntry,
+  type WorkspaceGitDiffItem,
 } from "@hermes/contracts";
 import {
   CapabilityRegistry,
@@ -99,6 +104,12 @@ interface MockE2EFixture {
   transcripts?: Record<string, SessionTranscriptSnapshot>;
   resyncedTranscripts?: Record<string, SessionTranscriptSnapshot>;
   transcriptEventsOnSubscribe?: Record<string, BridgeEvent[]>;
+  artifacts?: Record<string, WorkspaceArtifactItem[]>;
+  artifactsStale?: Record<string, boolean>;
+  files?: Record<string, WorkspaceFileEntry[]>;
+  filesStale?: Record<string, boolean>;
+  gitDiffs?: Record<string, WorkspaceGitDiffItem[]>;
+  agents?: Record<string, WorkspaceAgentItem[]>;
 }
 
 function readE2EFixture(): MockE2EFixture | undefined {
@@ -1516,9 +1527,16 @@ export function createMockHostBridge(): HermesHost {
       const sessionId =
         typeof payload.sessionId === "string" ? payload.sessionId : scope?.sessionId;
       if (!sessionId) return currentChatState;
-      const text = typeof payload.text === "string" ? payload.text : "";
+      const text = typeof payload.text === "string" ? payload.text : undefined;
       const key = `${connectionId}::${profileId}::${sessionId}`;
       const existing = currentChatState.sessionSummaries[key];
+      const nextText = text !== undefined ? text : existing?.draftText ?? "";
+      const nextAnnotations = Array.isArray(payload.annotations)
+        ? (payload.annotations as ArtifactAnnotation[])
+        : existing?.annotations;
+      const hasText = nextText.trim().length > 0;
+      const hasAnnotations = Boolean(nextAnnotations && nextAnnotations.length > 0);
+      const hasDraft = hasText || hasAnnotations;
       currentChatState = {
         ...currentChatState,
         sessionSummaries: {
@@ -1530,14 +1548,91 @@ export function createMockHostBridge(): HermesHost {
             title: existing?.title ?? sessionId,
             preview: existing?.preview,
             updatedAt: existing?.updatedAt,
-            hasDraft: text.trim().length > 0,
-            ...(text.trim().length > 0 ? { draftText: text } : {}),
+            hasDraft,
+            ...(hasText ? { draftText: nextText } : {}),
+            ...(hasAnnotations && nextAnnotations ? { annotations: nextAnnotations } : {}),
             lastKnownMessages: existing?.lastKnownMessages,
           },
         },
       };
       emitChatStatePatch();
       return currentChatState;
+    },
+    "artifacts.list": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const fullKey = `${connectionId}::${profileId}::${sessionId}`;
+      const map = liveFixture?.artifacts ?? {};
+      const list = map[fullKey] ?? (sessionId ? map[sessionId] : undefined) ?? [];
+      const staleMap = liveFixture?.artifactsStale ?? {};
+      const stale = Boolean(staleMap[fullKey] ?? (sessionId ? staleMap[sessionId] : false));
+      const agentsMap = liveFixture?.agents ?? {};
+      const agents = agentsMap[fullKey] ?? (sessionId ? agentsMap[sessionId] : undefined) ?? [];
+      return {
+        artifacts: list.map((item) => ({ ...item, ...(stale ? { stale: true } : {}) })),
+        stale,
+        agents,
+      };
+    },
+    "artifacts.read": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const artifactId = typeof payload.artifactId === "string" ? payload.artifactId : "";
+      const fullKey = `${connectionId}::${profileId}::${sessionId}`;
+      const map = liveFixture?.artifacts ?? {};
+      const list = map[fullKey] ?? (sessionId ? map[sessionId] : undefined) ?? [];
+      const found = list.find((item) => item.artifactId === artifactId) ?? null;
+      return { artifact: found ? { ...found } : null };
+    },
+    "files.list": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const scopeKey = `${connectionId}::${profileId}`;
+      const map = liveFixture?.files ?? {};
+      const list = map[scopeKey] ?? map[connectionId] ?? [];
+      const staleMap = liveFixture?.filesStale ?? {};
+      const stale = Boolean(staleMap[scopeKey] ?? staleMap[connectionId] ?? false);
+      const gitMap = liveFixture?.gitDiffs ?? {};
+      const gitDiffs = gitMap[scopeKey] ?? gitMap[connectionId] ?? [];
+      return {
+        files: list.map((item) => ({ ...item, ...(stale ? { stale: true } : {}) })),
+        stale,
+        gitDiffs,
+      };
+    },
+    "files.read": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const relativePath = typeof payload.relativePath === "string" ? payload.relativePath : "";
+      const scopeKey = `${connectionId}::${profileId}`;
+      const map = liveFixture?.files ?? {};
+      const list = map[scopeKey] ?? map[connectionId] ?? [];
+      const found = list.find((item) => item.relativePath === relativePath) ?? null;
+      return { file: found ? { ...found } : null };
     },
     "chatState.exportMissingSession": async (): Promise<MissingSessionExport | null> => {
       if (!currentChatState.missingSession) return null;
