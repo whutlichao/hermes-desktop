@@ -917,9 +917,22 @@ describe("CapabilityRegistry 21-domain matrix, explicit aliases & invariants (S0
     expect(unsupportedMemory.memory.status).toBe("unsupported");
     expect(unsupportedMemory.memory.degradation?.reason).toBe("method_not_found");
     expect(unsupportedMemory.memory.sections).toEqual([]);
+    registry.markMethodNotFound({
+      method: "session.info",
+      expectedOwnerGeneration: 2,
+      expectedAuthorityEpoch: 1,
+    });
+    const unsupportedMemoryNoFallback = registry.getSnapshot();
     expect(unsupportedMemory.domains.find((d) => d.domain === "memory")?.runtimeStatus).toBe(
-      "unavailable",
+      "read_only",
     );
+    expect(
+      unsupportedMemoryNoFallback.domains.find((d) => d.domain === "memory")?.runtimeStatus,
+    ).toBe("unavailable");
+    expect(
+      unsupportedMemoryNoFallback.entries.find((entry) => entry.actionId === "memory.inspect")
+        ?.runtimeStatus,
+    ).toBe("unavailable");
 
     // Scope/generation invalidation clears stale memory context
     const invalidated = registry.invalidate({

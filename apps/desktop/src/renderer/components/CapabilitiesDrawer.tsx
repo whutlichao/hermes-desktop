@@ -199,7 +199,13 @@ export function CapabilitiesDrawer({
 
       {/* Phase 1 Deferred 4 domains: disclosure footnote ONLY — zero actions, tabs, toggles, or CTAs */}
       <div className="deferred-footnote" data-testid="capabilities-deferred-footnote">
-        {getCopy("capabilities.deferredFootnote")}
+        <p>{getCopy("capabilities.deferredFootnote")}</p>
+        <ul>
+          <li>{getCopy("capabilities.deferred.voice")}</li>
+          <li>{getCopy("capabilities.deferred.bots")}</li>
+          <li>{getCopy("capabilities.deferred.memoryGraph")}</li>
+          <li>{getCopy("capabilities.deferred.kanban")}</li>
+        </ul>
       </div>
     </FocusDialog>
   );

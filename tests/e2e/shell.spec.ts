@@ -529,7 +529,19 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     // Bottom disclosure footnote ONLY; zero buttons/tabs/switches for deferred domains
     const footnote = drawer.getByTestId("capabilities-deferred-footnote");
     await expect(footnote).toBeVisible();
+    await expect(footnote).toContainText("4 延期 · 无 v1 入口");
     await expect(footnote).toContainText("Voice");
+    await expect(footnote).toContainText("TTS 与 wake word");
+    await expect(footnote).toContainText("官方 CLI/Desktop 的 Voice");
+    await expect(footnote).toContainText("Bot Mode");
+    await expect(footnote).toContainText("账号绑定、群聊与投递");
+    await expect(footnote).toContainText("Routines 使用 Cron");
+    await expect(footnote).toContainText("Memory Graph");
+    await expect(footnote).toContainText("learning 与 insights");
+    await expect(footnote).toContainText("只读 Memory 上下文");
+    await expect(footnote).toContainText("Kanban");
+    await expect(footnote).toContainText("稳定 Gateway method");
+    await expect(footnote).toContainText("Workspace 管理产物");
     await expect(footnote.getByRole("button")).toHaveCount(0);
     await expect(drawer.locator('[data-domain="voice"], [data-domain="bots"], [data-domain="memory_graph"], [data-domain="kanban"]')).toHaveCount(0);
 
@@ -4883,7 +4895,7 @@ test.describe("Ticket #44 read-only domains, Cron & capability completeness", ()
     "profiles.list",
     "config.get",
     "config.update",
-    "session.context_breakdown",
+    "session.info",
     "messaging.status",
     "cron.status",
     "cron.submit",
@@ -4980,7 +4992,7 @@ test.describe("Ticket #44 read-only domains, Cron & capability completeness", ()
             servedMethods,
             memory: {
               outcome: "ok",
-              sourceMethod: "session.context_breakdown",
+              sourceMethod: "session.info",
               rawPayload: {
                 total_tokens: 18400,
                 max_tokens: 128000,
@@ -5044,7 +5056,8 @@ test.describe("Ticket #44 read-only domains, Cron & capability completeness", ()
       "能力 17 可达 4 延期",
     );
 
-    // Memory: real read-only context from session.context_breakdown, no write controls
+    // Memory: session.context_breakdown missing, session.info fallback remains read-only and actionable
+    await expect(capabilitiesDrawer.getByTestId("cap-action-memory-inspect")).toBeEnabled();
     await capabilitiesDrawer.getByTestId("cap-action-memory-inspect").click();
     const inspect = page.getByRole("dialog", { name: "只读域与 Cron 管理" });
     await expect(inspect).toBeVisible();
@@ -5120,6 +5133,16 @@ test.describe("Ticket #44 read-only domains, Cron & capability completeness", ()
     await expect(inspect).toBeHidden();
     await page.keyboard.press("Escape");
     await expect(capabilitiesDrawer).toBeHidden();
+
+    // After the fallback probe, the domain/action stay read_only so the drawer entry remains enabled.
+    await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
+    const refreshedCapabilities = page.getByRole("dialog", { name: "能力目录" });
+    await expect(refreshedCapabilities.getByTestId("cap-domain-memory")).toContainText("只读");
+    await expect(
+      refreshedCapabilities.getByTestId("cap-action-memory-inspect"),
+    ).toBeEnabled();
+    await page.keyboard.press("Escape");
+    await expect(refreshedCapabilities).toBeHidden();
   });
 
   test("Ticket #44 & E2E-FAKE-01: Cron without submit stays read-only, and missing cron.status exposes no fake create button", async ({

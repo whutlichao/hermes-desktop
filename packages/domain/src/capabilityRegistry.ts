@@ -42,6 +42,7 @@ export interface CapabilityDomainMeta {
   labelKey: CopyKey;
   probeMethod?: string;
   requiredMethods: string[];
+  requiredAnyMethods?: string[];
   deepLink?: CapabilityDeepLink;
 }
 
@@ -137,7 +138,8 @@ export const CAPABILITY_DOMAIN_CATALOG: readonly CapabilityDomainMeta[] = [
     classification: "read_only",
     labelKey: "capabilities.domain.memory",
     probeMethod: "session.context_breakdown",
-    requiredMethods: ["session.context_breakdown"],
+    requiredMethods: [],
+    requiredAnyMethods: ["session.context_breakdown", "session.info"],
   },
   {
     domain: "cron",
@@ -366,6 +368,7 @@ interface ActionTemplate {
   shortcut?: string;
   classification: Exclude<CapabilityClassification, "deferred">;
   requiredMethods: string[];
+  requiredAnyMethods?: string[];
   handlerId: string;
   evidenceTestId: string;
   localOnly?: boolean;
@@ -583,7 +586,8 @@ const ACTION_TEMPLATES: readonly ActionTemplate[] = [
     labelKey: "cap.action.memory.inspect",
     hintKey: "cap.hint.memory.inspect",
     classification: "read_only",
-    requiredMethods: ["session.context_breakdown"],
+    requiredMethods: [],
+    requiredAnyMethods: ["session.context_breakdown", "session.info"],
     handlerId: "surface.openMemoryInspect",
     evidenceTestId: "cap-action-memory-inspect",
   },
@@ -2542,6 +2546,7 @@ export class CapabilityRegistry {
     options: {
       domain: CapabilityDomainId;
       classification: CapabilityClassification;
+      requiredAnyMethods?: string[];
       localOnly?: boolean;
       localFallbackDegraded?: boolean;
     },
@@ -2600,7 +2605,8 @@ export class CapabilityRegistry {
       };
     }
 
-    if (requiredMethods.length === 0) {
+    const requiredAnyMethods = options.requiredAnyMethods ?? [];
+    if (requiredMethods.length === 0 && requiredAnyMethods.length === 0) {
       return {
         runtimeStatus: "available",
         source: this.probedDomains.has(options.domain) ? "probe" : "static_local",
@@ -2613,7 +2619,15 @@ export class CapabilityRegistry {
     let refusedHit = false;
     let notFoundHit = false;
 
-    for (const req of requiredMethods) {
+    const evaluateMethod = (
+      req: string,
+    ): {
+      satisfied: boolean;
+      older: boolean;
+      refused: boolean;
+      notFound: boolean;
+      aliasUsed?: string;
+    } => {
       const forward = resolveExplicitMethodAlias(req);
       const reverse = EXPLICIT_REVERSE_ALIASES[req];
       if (
@@ -2621,30 +2635,93 @@ export class CapabilityRegistry {
         (forward !== null && this.notFoundMethods.has(forward)) ||
         (reverse !== undefined && this.notFoundMethods.has(reverse))
       ) {
-        notFoundHit = true;
-        missing.push(req);
-        continue;
+        return { satisfied: false, older: false, refused: false, notFound: true };
       }
       const resolved = resolveMethodWithAlias(req, this.methodTiers);
-      if (resolved.aliasUsed) {
-        aliasUsed = resolved.aliasUsed;
-      }
       if (this.notFoundMethods.has(resolved.method)) {
-        notFoundHit = true;
-        missing.push(req);
-        continue;
+        return {
+          satisfied: false,
+          older: false,
+          refused: false,
+          notFound: true,
+          ...(resolved.aliasUsed ? { aliasUsed: resolved.aliasUsed } : {}),
+        };
       }
       if (resolved.tier === "refused") {
-        refusedHit = true;
-        missing.push(req);
-        continue;
+        return {
+          satisfied: false,
+          older: false,
+          refused: true,
+          notFound: false,
+          ...(resolved.aliasUsed ? { aliasUsed: resolved.aliasUsed } : {}),
+        };
       }
       if (resolved.tier === "older") {
-        hasOlder = true;
-        continue;
+        return {
+          satisfied: true,
+          older: true,
+          refused: false,
+          notFound: false,
+          ...(resolved.aliasUsed ? { aliasUsed: resolved.aliasUsed } : {}),
+        };
       }
-      if (resolved.tier === "unknown") {
+      if (resolved.tier === "served") {
+        return {
+          satisfied: true,
+          older: false,
+          refused: false,
+          notFound: false,
+          ...(resolved.aliasUsed ? { aliasUsed: resolved.aliasUsed } : {}),
+        };
+      }
+      return {
+        satisfied: false,
+        older: false,
+        refused: false,
+        notFound: false,
+        ...(resolved.aliasUsed ? { aliasUsed: resolved.aliasUsed } : {}),
+      };
+    };
+
+    for (const req of requiredMethods) {
+      const evaluated = evaluateMethod(req);
+      if (evaluated.aliasUsed) {
+        aliasUsed = evaluated.aliasUsed;
+      }
+      if (evaluated.notFound) {
+        notFoundHit = true;
+      }
+      if (evaluated.refused) {
+        refusedHit = true;
+      }
+      if (evaluated.older) {
+        hasOlder = true;
+      }
+      if (!evaluated.satisfied) {
         missing.push(req);
+      }
+    }
+
+    if (requiredAnyMethods.length > 0) {
+      const anyEvaluated = requiredAnyMethods.map((req) => ({ req, result: evaluateMethod(req) }));
+      for (const { result } of anyEvaluated) {
+        if (result.aliasUsed) {
+          aliasUsed = result.aliasUsed;
+        }
+      }
+      const anySatisfied = anyEvaluated.some(({ result }) => result.satisfied);
+      if (!anySatisfied) {
+        if (anyEvaluated.every(({ result }) => result.refused)) {
+          refusedHit = true;
+        }
+        if (anyEvaluated.some(({ result }) => result.notFound)) {
+          notFoundHit = true;
+        }
+        for (const { req } of anyEvaluated) {
+          missing.push(req);
+        }
+      } else if (anyEvaluated.some(({ result }) => result.older)) {
+        hasOlder = true;
       }
     }
 
@@ -2710,8 +2787,10 @@ export class CapabilityRegistry {
       const evaluated = this.evaluateMethods(meta.requiredMethods, {
         domain: meta.domain,
         classification: meta.classification,
+        requiredAnyMethods: meta.requiredAnyMethods,
         localOnly:
           meta.requiredMethods.length === 0 &&
+          (meta.requiredAnyMethods?.length ?? 0) === 0 &&
           meta.classification === "native" &&
           !this.timedOutDomains.has(meta.domain),
         localFallbackDegraded: meta.domain === "terminal",
@@ -2751,6 +2830,7 @@ export class CapabilityRegistry {
       const evaluated = this.evaluateMethods(tpl.requiredMethods, {
         domain: tpl.domain,
         classification: tpl.classification,
+        requiredAnyMethods: tpl.requiredAnyMethods,
         localOnly: tpl.localOnly,
         localFallbackDegraded: tpl.localFallbackDegraded,
       });

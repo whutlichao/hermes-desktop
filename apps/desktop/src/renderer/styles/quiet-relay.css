@@ -652,6 +652,17 @@ button {
   color: var(--muted);
 }
 
+.deferred-footnote p {
+  margin: 0;
+}
+
+.deferred-footnote ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+
 .shortcut-row {
   display: flex;
   align-items: center;

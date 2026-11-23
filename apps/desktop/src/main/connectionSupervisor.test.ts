@@ -4274,6 +4274,16 @@ process.exit(1);
         sourceMethod: "session.info",
       });
       expect(memoryFallback.memory.sections.length).toBeGreaterThan(0);
+      expect(memoryFallback.domains.find((domain) => domain.domain === "memory")).toMatchObject({
+        classification: "read_only",
+        runtimeStatus: "read_only",
+      });
+      expect(
+        memoryFallback.entries.find((entry) => entry.actionId === "memory.inspect"),
+      ).toMatchObject({
+        classification: "read_only",
+        runtimeStatus: "read_only",
+      });
 
       // No Memory read methods => unsupported, zero invented Memory Graph rows.
       memoryMode = "unsupported";
