@@ -369,6 +369,9 @@ button {
   resize: none;
   background: transparent;
   font-size: 13px;
+  /* Avoid HarfBuzz cross-boundary kerning/ligature O(N*lines) stall on large (1 MiB+) pasted drafts */
+  font-kerning: none;
+  font-variant-ligatures: none;
   color: var(--ink);
 }
 
