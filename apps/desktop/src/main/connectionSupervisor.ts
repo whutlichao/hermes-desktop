@@ -1,6 +1,7 @@
 import type {
   ActivityEventPayload,
   ActiveChatRef,
+  ArtifactAnnotation,
   BackgroundNotificationKind,
   BridgeEvent,
   BridgeScope,
@@ -12,6 +13,10 @@ import type {
   ConnectionDesiredState,
   ConnectionHealthSummary,
   ConnectionLinkSummary,
+  DraftAttachment,
+  DraftComposerState,
+  DraftContextItem,
+  DraftDeliveryStatus,
   ErrorCode,
   FleetSnapshot,
   GatewayConfigSnapshot,
@@ -1210,6 +1215,7 @@ export class ConnectionSupervisor {
         this.transcripts.delete(key);
       }
     }
+    const createdOrphans = this.chatSessionStateStore?.orphanDraftsForRemovedConnection(connectionId) ?? [];
     if (this.activeScope?.connectionId === connectionId) {
       const localProfiles = this.profilesByConnection.get("local") ?? [];
       if (this.localHealth.actual === "ready" || localProfiles.length > 0) {
@@ -1233,6 +1239,8 @@ export class ConnectionSupervisor {
         this.chatSessionStateStore?.recordActiveChat(null);
       }
       this.syncChatStateWithSnapshot();
+    } else if (createdOrphans.length > 0) {
+      this.emitChatState();
     }
     this.emitFleet();
   }
@@ -2887,6 +2895,7 @@ export class ConnectionSupervisor {
       }
 
       // Any profile that disappeared from profiles.list: tear down only its link!
+      let profileOrphansCreated = 0;
       for (const link of this.getLinksForConnection(connectionId)) {
         if (!seenIds.has(link.profileId)) {
           this.clearLinkTimers(link);
@@ -2905,10 +2914,16 @@ export class ConnectionSupervisor {
           if (perProfileEntry) {
             this.disposeTransportEntry(perProfileKey, perProfileEntry);
           }
+          const created =
+            this.chatSessionStateStore?.orphanDraftsForRemovedProfile(connectionId, link.profileId) ?? [];
+          profileOrphansCreated += created.length;
         }
       }
 
       this.profilesByConnection.set(connectionId, nextList);
+      if (profileOrphansCreated > 0) {
+        this.emitChatState();
+      }
     }
 
     this.syncProfileAndConnectionProjections(connectionId);
@@ -2982,7 +2997,30 @@ export class ConnectionSupervisor {
       .map((item) => mapRawSession(item, connectionId, profileId))
       .filter((item): item is SessionSummary => item !== null && item.profileId === profileId);
 
-    this.sessionsByScope.set(scopeKey(connectionId, profileId), mapped);
+    const key = scopeKey(connectionId, profileId);
+    const prevList = this.sessionsByScope.get(key) ?? [];
+    if (prevList.length > 0 && this.chatSessionStateStore) {
+      const nextIds = new Set(mapped.map((s) => s.sessionId));
+      const activeId =
+        this.activeScope?.connectionId === connectionId &&
+        (this.activeScope?.profileId ?? "default") === profileId
+          ? (this.activeSessionId ?? this.activeScope?.sessionId ?? null)
+          : null;
+      const nonActiveRemoved = prevList.filter(
+        (s) => !nextIds.has(s.sessionId) && s.sessionId !== activeId,
+      );
+      if (nonActiveRemoved.length > 0) {
+        const created = this.chatSessionStateStore.orphanDraftsForRemovedSessions(
+          { connectionId, profileId },
+          nonActiveRemoved,
+        );
+        if (created.length > 0) {
+          this.emitChatState();
+        }
+      }
+    }
+
+    this.sessionsByScope.set(key, mapped);
     this.syncProfileAndConnectionProjections(connectionId);
     this.emitSessions(connectionId, profileId);
     return mapped;
@@ -4212,6 +4250,10 @@ export class ConnectionSupervisor {
     | "chatState.get"
     | "chatState.dismissRouteBanner"
     | "chatState.saveDraft"
+    | "chatState.clearDraft"
+    | "chatState.markAttachmentExpired"
+    | "chatState.deleteOrphanedDraft"
+    | "chatState.exportOrphanedDraft"
     | "artifacts.list"
     | "artifacts.read"
     | "files.list"
@@ -4466,6 +4508,10 @@ export class ConnectionSupervisor {
 
       const title =
         typeof payload.title === "string" && payload.title.trim() ? payload.title.trim() : "新对话";
+      const draftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
 
       let res: Record<string, unknown>;
       try {
@@ -4513,6 +4559,15 @@ export class ConnectionSupervisor {
           profileId,
           sessionId: created.sessionId,
         });
+        if (draftId) {
+          this.chatSessionStateStore.migrateNewChatDraftToSession({
+            connectionId,
+            profileId,
+            draftId,
+            sessionId: created.sessionId,
+            title: created.title,
+          });
+        }
         this.syncChatStateWithSnapshot();
       }
 
@@ -4570,6 +4625,19 @@ export class ConnectionSupervisor {
         throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
       }
 
+      const draftRef = {
+        connectionId,
+        profileId,
+        sessionId,
+        ...(typeof payload.draftId === "string" && payload.draftId.trim()
+          ? { draftId: payload.draftId.trim() }
+          : {}),
+      };
+      if (this.chatSessionStateStore) {
+        this.chatSessionStateStore.markDraftDeliveryStatus(draftRef, "submitting");
+        this.emitChatState();
+      }
+
       let res: Record<string, unknown>;
       try {
         res = await entry.client.call<Record<string, unknown>>("prompt.submit", {
@@ -4578,7 +4646,42 @@ export class ConnectionSupervisor {
           text,
         });
       } catch (err) {
+        if (this.chatSessionStateStore && !isJsonRpcMethodNotFound(err)) {
+          const msg = err instanceof Error ? err.message.toLowerCase() : "";
+          const isAmbiguous =
+            msg.includes("timeout") ||
+            msg.includes("closed") ||
+            msg.includes("disconnect") ||
+            msg.includes("unreachable") ||
+            msg.includes("econnreset");
+          this.chatSessionStateStore.markDraftDeliveryStatus(
+            draftRef,
+            isAmbiguous ? "delivery_unknown" : "idle",
+          );
+          this.emitChatState();
+        }
         this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit", profileId);
+      }
+
+      const rawReceipt = asString(res.receipt ?? res.status).toLowerCase();
+      if (rawReceipt === "delivery_unknown" || res.delivery_unknown === true) {
+        if (this.chatSessionStateStore) {
+          this.chatSessionStateStore.markDraftDeliveryStatus(draftRef, "delivery_unknown");
+          this.emitChatState();
+        }
+        return {
+          accepted: false,
+          deliveryUnknown: true,
+          receipt: "delivery_unknown",
+          sessionId,
+        };
+      }
+
+      const receipt =
+        rawReceipt === "admitted" || res.admitted === true ? "admitted" : "accepted";
+      if (this.chatSessionStateStore) {
+        this.chatSessionStateStore.clearDraftOnReceipt(draftRef, receipt);
+        this.emitChatState();
       }
 
       const turnId = asString(res.turn_id ?? res.turnId, `turn-${Date.now()}`);
@@ -4637,6 +4740,7 @@ export class ConnectionSupervisor {
 
       return {
         accepted: true,
+        receipt,
         sessionId,
         turnId,
         userMessageId: userMsgId,
@@ -4774,30 +4878,135 @@ export class ConnectionSupervisor {
     "chatState.saveDraft": async (payload, scope) => {
       this.assertNotShuttingDown();
       if (!this.chatSessionStateStore) return this.getChatStateProjection();
-      const profileId = this.resolveTargetProfile(payload, scope);
-      const sessionId = this.resolveTargetSessionId(payload, scope);
-      if (!sessionId) return this.getChatStateProjection();
-      const connectionId = scope?.connectionId ?? this.activeScope?.connectionId ?? "local";
-      const ref: ActiveChatRef = {
+      const connectionId =
+        typeof payload.connectionId === "string" && payload.connectionId.trim()
+          ? payload.connectionId.trim()
+          : scope?.connectionId ?? this.activeScope?.connectionId ?? "local";
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : scope?.sessionId?.trim() || undefined;
+      const draftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
+      if (!sessionId && !draftId) return this.getChatStateProjection();
+      const res = this.chatSessionStateStore.saveDraftRecord({
         connectionId,
         profileId,
-        sessionId,
-      };
-      const currentProjection = this.chatSessionStateStore.getProjection();
-      const existingSummary =
-        currentProjection.sessionSummaries[`${connectionId}::${profileId}::${sessionId}`];
-      const text =
-        typeof payload.text === "string" ? payload.text : existingSummary?.draftText ?? "";
-      const annotations = Array.isArray(payload.annotations)
-        ? (payload.annotations as import("@hermes/contracts").ArtifactAnnotation[])
-        : undefined;
-      const projection = this.chatSessionStateStore.saveDraft(
-        ref,
-        text,
-        annotations !== undefined ? { annotations } : undefined,
+        ...(sessionId ? { sessionId } : {}),
+        ...(draftId ? { draftId } : {}),
+        ...(typeof payload.text === "string" ? { text: payload.text } : {}),
+        ...(Array.isArray(payload.attachments)
+          ? { attachments: payload.attachments as DraftAttachment[] }
+          : {}),
+        ...(Array.isArray(payload.contexts)
+          ? { contexts: payload.contexts as DraftContextItem[] }
+          : {}),
+        ...(payload.composer && typeof payload.composer === "object"
+          ? { composer: payload.composer as DraftComposerState }
+          : {}),
+        ...(Array.isArray(payload.annotations)
+          ? { annotations: payload.annotations as ArtifactAnnotation[] }
+          : {}),
+        ...(typeof payload.originTitle === "string"
+          ? { originTitle: payload.originTitle }
+          : {}),
+        ...(typeof payload.deliveryStatus === "string"
+          ? { deliveryStatus: payload.deliveryStatus as DraftDeliveryStatus }
+          : {}),
+      });
+      if (!res.ok) {
+        throw makeBridgeError(
+          res.reason === "over_single_limit" ? "invalid_request" : "conflict",
+          res.reason === "over_single_limit"
+            ? getCopy("draft.capacityExceededSingle")
+            : getCopy("draft.capacityExceededTotal"),
+        );
+      }
+      this.emitChatState();
+      return res.projection;
+    },
+
+    "chatState.clearDraft": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      if (!this.chatSessionStateStore) return this.getChatStateProjection();
+      const connectionId =
+        typeof payload.connectionId === "string" && payload.connectionId.trim()
+          ? payload.connectionId.trim()
+          : scope?.connectionId ?? this.activeScope?.connectionId ?? "local";
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : scope?.sessionId?.trim() || undefined;
+      const draftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
+      const projection = this.chatSessionStateStore.clearDraftExplicit({
+        connectionId,
+        profileId,
+        ...(sessionId ? { sessionId } : {}),
+        ...(draftId ? { draftId } : {}),
+      });
+      this.emitChatState();
+      return projection;
+    },
+
+    "chatState.markAttachmentExpired": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      if (!this.chatSessionStateStore) return this.getChatStateProjection();
+      const connectionId =
+        typeof payload.connectionId === "string" && payload.connectionId.trim()
+          ? payload.connectionId.trim()
+          : scope?.connectionId ?? this.activeScope?.connectionId ?? "local";
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId =
+        typeof payload.sessionId === "string" && payload.sessionId.trim()
+          ? payload.sessionId.trim()
+          : scope?.sessionId?.trim() || undefined;
+      const draftId =
+        typeof payload.draftId === "string" && payload.draftId.trim()
+          ? payload.draftId.trim()
+          : undefined;
+      const attachmentRef =
+        typeof payload.attachmentId === "string" && payload.attachmentId.trim()
+          ? payload.attachmentId.trim()
+          : typeof payload.handle === "string"
+            ? payload.handle.trim()
+            : "";
+      if (!attachmentRef) return this.getChatStateProjection();
+      const projection = this.chatSessionStateStore.markAttachmentExpired(
+        {
+          connectionId,
+          profileId,
+          ...(sessionId ? { sessionId } : {}),
+          ...(draftId ? { draftId } : {}),
+        },
+        attachmentRef,
       );
       this.emitChatState();
       return projection;
+    },
+
+    "chatState.deleteOrphanedDraft": async (payload) => {
+      this.assertNotShuttingDown();
+      if (!this.chatSessionStateStore) return this.getChatStateProjection();
+      const orphanedId = typeof payload.orphanedId === "string" ? payload.orphanedId.trim() : "";
+      if (!orphanedId) return this.getChatStateProjection();
+      const projection = this.chatSessionStateStore.deleteOrphanedDraft(orphanedId);
+      this.emitChatState();
+      return projection;
+    },
+
+    "chatState.exportOrphanedDraft": async (payload) => {
+      this.assertNotShuttingDown();
+      if (!this.chatSessionStateStore) return null;
+      const orphanedId = typeof payload.orphanedId === "string" ? payload.orphanedId.trim() : "";
+      if (!orphanedId) return null;
+      return this.chatSessionStateStore.exportOrphanedDraft(orphanedId);
     },
 
     "artifacts.list": async () => ({ artifacts: [], stale: false, agents: [] }),
@@ -5272,7 +5481,9 @@ export class ConnectionSupervisor {
               ...(scope.sessionId ? { sessionId: scope.sessionId } : {}),
             }
           : undefined;
-      return this.chatSessionStateStore.exportMissingSession(ref);
+      const exported = this.chatSessionStateStore.exportMissingSession(ref);
+      this.emitChatState();
+      return exported;
     },
 
     "chatState.dismissMissingSession": async () => {

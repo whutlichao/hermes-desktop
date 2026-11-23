@@ -1,8 +1,13 @@
-import type { RefObject } from "react";
+import { useRef, type RefObject } from "react";
 import type {
   ApprovalView,
   ChatSessionProjection,
   ConnectionHealthSummary,
+  DraftAttachment,
+  DraftContextItem,
+  DraftDeliveryStatus,
+  DraftExportBundle,
+  DraftRecord,
   LocalInspectResult,
   LocalSafeActionId,
   MissingSessionExport,
@@ -17,6 +22,7 @@ import { MarkdownText } from "./MarkdownText";
 interface ChatThreadProps {
   hasReadyConnection: boolean;
   activeConnection?: ConnectionHealthSummary | null;
+  activeSessionId?: string | null;
   transcript: SessionTranscriptSnapshot | null;
   chatState: ChatSessionProjection | null;
   exportedMissing: MissingSessionExport | null;
@@ -24,10 +30,24 @@ interface ChatThreadProps {
   localBusy: boolean;
   chatBusy: boolean;
   composerDraft: string;
+  draftAttachments: DraftAttachment[];
+  draftContexts: DraftContextItem[];
+  draftDeliveryStatus: DraftDeliveryStatus;
+  draftCapacityError: "over_single_limit" | "over_total_limit" | null;
+  exportedDraft: DraftExportBundle | null;
+  scopeNewDrafts: DraftRecord[];
+  activeNewDraftId: string | null;
   stopError: string | null;
   canCreateSession: boolean;
   composerRef: RefObject<HTMLTextAreaElement>;
   onDraftChange: (value: string) => void;
+  onAttachFiles: (files: FileList, reattachId?: string | null) => void;
+  onRemoveAttachment: (attachmentId: string) => void;
+  onRemoveContext: (contextId: string) => void;
+  onClearDraft: () => void;
+  onExportCurrentDraft: () => void;
+  onSelectNewDraft: (draftId: string) => void;
+  onStartNewDraft: () => void;
   onSendPrompt: () => void;
   onStopTurn: () => void;
   onCreateSession: () => void;
@@ -78,6 +98,7 @@ function getApprovalStatusLabel(status: ApprovalView["status"]): string {
 export function ChatThread({
   hasReadyConnection,
   activeConnection,
+  activeSessionId,
   transcript,
   chatState,
   exportedMissing,
@@ -85,10 +106,24 @@ export function ChatThread({
   localBusy,
   chatBusy,
   composerDraft,
+  draftAttachments,
+  draftContexts,
+  draftDeliveryStatus,
+  draftCapacityError,
+  exportedDraft,
+  scopeNewDrafts,
+  activeNewDraftId,
   stopError,
   canCreateSession,
   composerRef,
   onDraftChange,
+  onAttachFiles,
+  onRemoveAttachment,
+  onRemoveContext,
+  onClearDraft,
+  onExportCurrentDraft,
+  onSelectNewDraft,
+  onStartNewDraft,
   onSendPrompt,
   onStopTurn,
   onCreateSession,
@@ -100,6 +135,283 @@ export function ChatThread({
   onOpenShortcuts,
   onOpenRemoteEscape,
 }: ChatThreadProps) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const reattachTargetIdRef = useRef<string | null>(null);
+  const hasExpiredAttachment = draftAttachments.some((att) => Boolean(att.expired));
+  const hasEstablishedScope = Boolean(activeConnection || chatState?.lastActiveChat);
+  const isTrulyUnconnected = !hasReadyConnection && !hasEstablishedScope;
+
+  const renderDraftAlertsAndComposer = () => {
+    if (isTrulyUnconnected) {
+      return (
+        <form
+          className="composer-shell"
+          onSubmit={(event) => {
+            event.preventDefault();
+          }}
+        >
+          <label htmlFor="composer-input" className="sr-only">
+            {getCopy("composer.label")}
+          </label>
+          <textarea
+            id="composer-input"
+            ref={composerRef}
+            className="composer-textarea"
+            rows={2}
+            readOnly
+            aria-disabled="true"
+            placeholder={getCopy("composer.placeholder")}
+          />
+          <div className="composer-bar">
+            <span className="composer-hint">{getCopy("composer.unconnectedHint")}</span>
+            <button type="submit" className="button button-primary" disabled>
+              {getCopy("composer.send")}
+            </button>
+          </div>
+        </form>
+      );
+    }
+
+    const canSubmit =
+      hasReadyConnection && !chatBusy && !hasExpiredAttachment && Boolean(composerDraft.trim());
+
+    return (
+      <>
+        {draftDeliveryStatus === "delivery_unknown" && (
+          <div
+            className="draft-alert-card"
+            role="status"
+            data-testid="draft-delivery-unknown-alert"
+          >
+            <div className="draft-alert-header">
+              <span className="status-pill is-warn">{getCopy("draft.deliveryUnknownBadge")}</span>
+            </div>
+            <span>{getCopy("draft.deliveryUnknownBody")}</span>
+          </div>
+        )}
+
+        {draftCapacityError && (
+          <div
+            className="draft-alert-card"
+            role="alert"
+            data-testid="draft-capacity-alert"
+          >
+            <span>
+              {getCopy(
+                draftCapacityError === "over_total_limit"
+                  ? "draft.capacityExceededTotal"
+                  : "draft.capacityExceededSingle",
+              )}
+            </span>
+            <div className="draft-alert-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={onExportCurrentDraft}
+              >
+                {getCopy("draft.capacityExportAction")}
+              </button>
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={onClearDraft}
+              >
+                {getCopy("draft.capacityCleanupAction")}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {exportedDraft && (
+          <div className="resync-notice" role="status" data-testid="draft-export-preview">
+            <pre className="diagnostics-json">{JSON.stringify(exportedDraft, null, 2)}</pre>
+          </div>
+        )}
+
+        {hasExpiredAttachment && (
+          <div
+            className="draft-alert-card"
+            role="alert"
+            data-testid="draft-attachment-expired-alert"
+          >
+            <span>{getCopy("draft.reattachHint")}</span>
+          </div>
+        )}
+
+        <form
+          className="composer-shell"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (canSubmit) {
+              onSendPrompt();
+            }
+          }}
+        >
+          {!activeSessionId && scopeNewDrafts.length > 0 && (
+            <div className="draft-new-list" data-testid="scope-new-drafts-bar">
+              {scopeNewDrafts.map((d) => (
+                <button
+                  key={d.draftId}
+                  type="button"
+                  className={[
+                    "draft-attachment-btn",
+                    d.draftId === activeNewDraftId && "is-active",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  aria-pressed={d.draftId === activeNewDraftId}
+                  onClick={() => onSelectNewDraft(d.draftId)}
+                >
+                  {d.text.trim() ? d.text.trim().slice(0, 18) : d.draftId}
+                </button>
+              ))}
+              <button
+                type="button"
+                className="draft-attachment-btn"
+                onClick={onStartNewDraft}
+              >
+                {getCopy("draft.newDraftAction")}
+              </button>
+            </div>
+          )}
+
+          {(draftAttachments.length > 0 || draftContexts.length > 0) && (
+            <div className="draft-attachments-bar" data-testid="draft-attachments-bar">
+              {draftAttachments.map((att) => (
+                <span
+                  key={att.attachmentId}
+                  className={["draft-attachment-chip", att.expired && "is-expired"]
+                    .filter(Boolean)
+                    .join(" ")}
+                  data-testid={`draft-attachment-${att.attachmentId}`}
+                >
+                  <span>{att.displayName}</span>
+                  {att.expired && (
+                    <>
+                      <span className="status-pill is-warn">
+                        {getCopy("draft.attachmentExpiredBadge")}
+                      </span>
+                      <button
+                        type="button"
+                        className="draft-attachment-btn"
+                        onClick={() => {
+                          reattachTargetIdRef.current = att.attachmentId;
+                          fileInputRef.current?.click();
+                        }}
+                      >
+                        {getCopy("draft.reattachAction")}
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    className="draft-attachment-btn"
+                    aria-label={`${getCopy("draft.removeAttachmentAction")} ${att.displayName}`}
+                    onClick={() => onRemoveAttachment(att.attachmentId)}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              {draftContexts.map((ctx) => (
+                <span
+                  key={ctx.contextId}
+                  className="draft-attachment-chip"
+                  data-testid={`draft-context-${ctx.contextId}`}
+                >
+                  <span>{ctx.label}</span>
+                  <button
+                    type="button"
+                    className="draft-attachment-btn"
+                    aria-label={`${getCopy("draft.removeAttachmentAction")} ${ctx.label}`}
+                    onClick={() => onRemoveContext(ctx.contextId)}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            hidden
+            multiple
+            data-testid="draft-file-input"
+            onChange={(event) => {
+              const files = event.target.files;
+              if (files && files.length > 0) {
+                onAttachFiles(files, reattachTargetIdRef.current);
+              }
+              reattachTargetIdRef.current = null;
+              event.target.value = "";
+            }}
+          />
+
+          <label htmlFor="composer-input" className="sr-only">
+            {getCopy("composer.label")}
+          </label>
+          <textarea
+            id="composer-input"
+            ref={composerRef}
+            className="composer-textarea"
+            rows={2}
+            value={composerDraft}
+            onChange={(event) => onDraftChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                if (canSubmit) {
+                  onSendPrompt();
+                }
+              }
+            }}
+            placeholder={getCopy("chat.composerPlaceholder")}
+          />
+          <div className="composer-bar">
+            <span className="composer-hint">
+              {!hasReadyConnection
+                ? getCopy("draft.offlineLocalBadge")
+                : transcript?.activeTurnId
+                  ? getCopy("chat.streamingBadge")
+                  : getCopy("route.statusReady")}
+            </span>
+            <div style={{ display: "inline-flex", gap: 8 }}>
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={() => {
+                  reattachTargetIdRef.current = null;
+                  fileInputRef.current?.click();
+                }}
+              >
+                {getCopy("draft.attachAction")}
+              </button>
+              {transcript?.activeTurnId && transcript.supportedActions.promptCancel && (
+                <button
+                  type="button"
+                  className="button button-secondary"
+                  disabled={transcript.turnStopping}
+                  onClick={onStopTurn}
+                >
+                  {getCopy(transcript.turnStopping ? "chat.stoppingAction" : "chat.stopAction")}
+                </button>
+              )}
+              <button
+                type="submit"
+                className="button button-primary"
+                disabled={!canSubmit}
+              >
+                {getCopy("chat.sendAction")}
+              </button>
+            </div>
+          </div>
+        </form>
+      </>
+    );
+  };
+
   if (!hasReadyConnection) {
     const unverifiedChat = chatState?.lastKnownUnverified ? chatState.lastActiveChat : null;
     const unverifiedSummary =
@@ -167,31 +479,7 @@ export function ChatThread({
           </>
         )}
 
-        <form
-          className="composer-shell"
-          onSubmit={(event) => {
-            event.preventDefault();
-          }}
-        >
-          <label htmlFor="composer-input" className="sr-only">
-            {getCopy("composer.label")}
-          </label>
-          <textarea
-            id="composer-input"
-            ref={composerRef}
-            className="composer-textarea"
-            rows={2}
-            readOnly
-            aria-disabled="true"
-            placeholder={getCopy("composer.placeholder")}
-          />
-          <div className="composer-bar">
-            <span className="composer-hint">{getCopy("composer.unconnectedHint")}</span>
-            <button type="submit" className="button button-primary" disabled>
-              {getCopy("composer.send")}
-            </button>
-          </div>
-        </form>
+        {renderDraftAlertsAndComposer()}
       </div>
     );
   }
@@ -371,58 +659,7 @@ export function ChatThread({
           <p>{getCopy("chat.unavailableBody")}</p>
         </section>
       ) : (
-        <form
-          className="composer-shell"
-          onSubmit={(event) => {
-            event.preventDefault();
-            onSendPrompt();
-          }}
-        >
-          <label htmlFor="composer-input" className="sr-only">
-            {getCopy("composer.label")}
-          </label>
-          <textarea
-            id="composer-input"
-            ref={composerRef}
-            className="composer-textarea"
-            rows={2}
-            value={composerDraft}
-            onChange={(event) => onDraftChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                if (!chatBusy && composerDraft.trim()) {
-                  onSendPrompt();
-                }
-              }
-            }}
-            placeholder={getCopy("chat.composerPlaceholder")}
-          />
-          <div className="composer-bar">
-            <span className="composer-hint">
-              {transcript?.activeTurnId ? getCopy("chat.streamingBadge") : getCopy("route.statusReady")}
-            </span>
-            <div style={{ display: "inline-flex", gap: 8 }}>
-              {transcript?.activeTurnId && transcript.supportedActions.promptCancel && (
-                <button
-                  type="button"
-                  className="button button-secondary"
-                  disabled={transcript.turnStopping}
-                  onClick={onStopTurn}
-                >
-                  {getCopy(transcript.turnStopping ? "chat.stoppingAction" : "chat.stopAction")}
-                </button>
-              )}
-              <button
-                type="submit"
-                className="button button-primary"
-                disabled={chatBusy || !composerDraft.trim()}
-              >
-                {getCopy("chat.sendAction")}
-              </button>
-            </div>
-          </div>
-        </form>
+        renderDraftAlertsAndComposer()
       )}
     </div>
   );

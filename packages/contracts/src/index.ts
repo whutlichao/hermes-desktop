@@ -76,6 +76,10 @@ export const HOST_COMMANDS = [
   "chatState.get",
   "chatState.dismissRouteBanner",
   "chatState.saveDraft",
+  "chatState.clearDraft",
+  "chatState.markAttachmentExpired",
+  "chatState.deleteOrphanedDraft",
+  "chatState.exportOrphanedDraft",
   "chatState.exportMissingSession",
   "chatState.dismissMissingSession",
 ] as const;
@@ -848,6 +852,102 @@ export interface SessionRecoverySummary {
   lastKnownMessages?: TranscriptMessage[];
 }
 
+export const DRAFT_MAX_BYTES = 1024 * 1024;
+export const DRAFTS_TOTAL_MAX_BYTES = 50 * 1024 * 1024;
+
+export type DraftAttachmentKind = "file" | "image" | "text" | "binary";
+
+export interface DraftAttachment {
+  attachmentId: string;
+  handle: string;
+  displayName: string;
+  kind: DraftAttachmentKind;
+  sizeBytes?: number;
+  expired?: boolean;
+}
+
+export interface DraftContextItem {
+  contextId: string;
+  kind: "file" | "line_range" | "artifact" | "snippet";
+  ref: string;
+  label: string;
+  version?: string | number;
+}
+
+export interface DraftComposerState {
+  selectionStart?: number;
+  selectionEnd?: number;
+  sendOnEnter?: boolean;
+}
+
+export type DraftDeliveryStatus = "idle" | "submitting" | "delivery_unknown";
+
+export interface DraftOrigin {
+  connectionId: string;
+  profileId: string;
+  sessionId?: string;
+  title?: string;
+}
+
+export interface DraftRecord {
+  draftId: string;
+  sessionId?: string;
+  scope: {
+    connectionId: string;
+    profileId: string;
+  };
+  text: string;
+  attachments: DraftAttachment[];
+  contexts: DraftContextItem[];
+  composer: DraftComposerState;
+  annotations?: ArtifactAnnotation[];
+  updatedAt: string;
+  revision: number;
+  origin: DraftOrigin;
+  deliveryStatus?: DraftDeliveryStatus;
+}
+
+export type OrphanedDraftReason =
+  | "session_deleted"
+  | "profile_removed"
+  | "connection_removed"
+  | "session_missing_closed"
+  | "session_missing_exported";
+
+export interface OrphanedDraftRecord {
+  orphanedId: string;
+  draftId: string;
+  text: string;
+  attachments: DraftAttachment[];
+  contexts: DraftContextItem[];
+  annotations?: ArtifactAnnotation[];
+  origin: DraftOrigin;
+  reason: OrphanedDraftReason;
+  orphanedAt: string;
+}
+
+export interface DraftStorageUsage {
+  totalBytes: number;
+  maxDraftBytes: number;
+  maxTotalBytes: number;
+  overTotalLimit: boolean;
+  draftCount: number;
+  orphanedCount: number;
+}
+
+export interface DraftExportBundle {
+  exportedAt: string;
+  kind: "active_draft" | "orphaned_draft";
+  draftId: string;
+  origin: DraftOrigin;
+  text: string;
+  attachments: DraftAttachment[];
+  contexts: DraftContextItem[];
+  annotations?: ArtifactAnnotation[];
+  reason?: OrphanedDraftReason;
+  orphanedAt?: string;
+}
+
 export interface ChatSessionProjection {
   windowId: "primary";
   paneId: "main";
@@ -860,6 +960,9 @@ export interface ChatSessionProjection {
   lastKnownUnverified: boolean;
   missingSession: SessionRecoverySummary | null;
   routeBanner: RouteBannerState | null;
+  draftsByKey?: Record<string, DraftRecord>;
+  orphanedDrafts?: OrphanedDraftRecord[];
+  draftStorageUsage?: DraftStorageUsage;
 }
 
 export interface MissingSessionExport {
@@ -870,6 +973,8 @@ export interface MissingSessionExport {
   sessionTitle: string;
   draftText: string;
   annotations?: ArtifactAnnotation[];
+  attachments?: DraftAttachment[];
+  contexts?: DraftContextItem[];
   messages: TranscriptMessage[];
 }
 

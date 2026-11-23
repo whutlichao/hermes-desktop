@@ -2686,3 +2686,353 @@ test.describe("Ticket #42 Skills/Tools/MCP/Plugins read-only inventory, states, 
     await expect(extDrawer).toContainText("无法确认 MCP 状态清单，请点击刷新清单探测。");
   });
 });
+
+test.describe("Ticket #38 Drafts and OrphanedDrafts", () => {
+  test("Ticket #38: Draft persistence across Session/Scope switch, expired attachment reattach, multi-draft new chat, receipt clear vs delivery_unknown, atomic migration, capacity limit, and Settings -> Data orphaned drafts", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "Local Hermes",
+              originDisplay: "127.0.0.1:47371",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              profileExceptionCount: 0,
+              latencyMs: 9,
+              nextRetryAt: null,
+              isPrimary: true,
+              isLastUsed: true,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              handle: "default",
+              displayName: "Default",
+              isDefault: true,
+              actual: "ready",
+              degraded: false,
+              isException: false,
+            },
+            {
+              connectionId: "local",
+              profileId: "empty-prof",
+              handle: "empty-prof",
+              displayName: "Empty Profile",
+              actual: "ready",
+              degraded: false,
+              isException: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a",
+              title: "Alpha Session",
+              preview: "first",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-b",
+              title: "Beta Session",
+              preview: "second",
+              updatedAt: "2026-11-23T08:01:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-a" },
+          activeSessionId: "sess-a",
+        },
+        chatState: {
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-a" },
+          lastSessionByScope: { "local::default": "sess-a" },
+          activeStatus: "ready",
+          draftsByKey: {
+            "chat::local::default::sess-a": {
+              draftId: "draft-a",
+              sessionId: "sess-a",
+              scope: { connectionId: "local", profileId: "default" },
+              text: "Draft for Alpha with expired file",
+              attachments: [
+                {
+                  attachmentId: "att-expired",
+                  handle: "opaque://expired-1",
+                  displayName: "spec.pdf",
+                  kind: "file",
+                  expired: true,
+                },
+              ],
+              contexts: [],
+              composer: {},
+              updatedAt: "2026-11-23T08:02:00.000Z",
+              revision: 1,
+              origin: { connectionId: "local", profileId: "default", sessionId: "sess-a" },
+            },
+          },
+          orphanedDrafts: [
+            {
+              orphanedId: "orphan-e2e-1",
+              draftId: "draft-orphan-1",
+              reason: "session_deleted",
+              text: "Recovered orphaned prompt text",
+              attachments: [
+                {
+                  attachmentId: "att-orph-1",
+                  handle: "opaque://orph",
+                  displayName: "trace.log",
+                  kind: "text",
+                },
+              ],
+              contexts: [],
+              origin: {
+                connectionId: "remote-1",
+                profileId: "prod",
+                sessionId: "sess-deleted",
+                title: "Deleted Session",
+              },
+              orphanedAt: "2026-11-23T07:50:00.000Z",
+            },
+          ],
+        },
+        transcripts: {
+          "sess-a": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-a",
+            messages: [],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+          "sess-b": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-b",
+            messages: [],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // 1. Expired attachment shows badge + alert + blocks Send until reattached
+    const composer = page.locator("#composer-input");
+    const sendBtn = page.getByRole("button", { name: "发送消息" });
+    await expect(composer).toHaveValue("Draft for Alpha with expired file");
+    await expect(page.getByTestId("draft-attachment-expired-alert")).toBeVisible();
+    await expect(page.getByTestId("draft-attachment-att-expired")).toContainText("spec.pdf");
+    await expect(page.getByTestId("draft-attachment-att-expired")).toContainText("需重新附加");
+    await expect(sendBtn).toBeDisabled();
+
+    // 2. Switch to Beta Session -> clean composer; write Draft for Beta; switch back -> Alpha Draft still there!
+    await page.locator("nav.sidebar").getByRole("button", { name: /Beta Session/ }).click();
+    await expect(composer).toHaveValue("");
+    await composer.fill("Draft for Beta");
+    await page.locator("nav.sidebar").getByRole("button", { name: /Alpha Session/ }).click();
+    await expect(composer).toHaveValue("Draft for Alpha with expired file");
+
+    // 3. Reattach expired attachment via file chooser -> Send unlocks
+    const fileChooserPromise = page.waitForEvent("filechooser");
+    await page.getByTestId("draft-attachment-att-expired").getByRole("button", { name: "重新附加" }).click();
+    const fileChooser = await fileChooserPromise;
+    await fileChooser.setFiles({
+      name: "spec-v2.pdf",
+      mimeType: "application/pdf",
+      buffer: Buffer.from("pdf-bytes"),
+    });
+    await expect(page.getByTestId("draft-attachment-expired-alert")).toHaveCount(0);
+    await expect(page.getByTestId("draft-attachments-bar")).toContainText("spec-v2.pdf");
+    await expect(sendBtn).toBeEnabled();
+
+    // 4. delivery_unknown retains Draft and marks "未确定是否送达"
+    await page.evaluate(() => {
+      (window as unknown as { __HERMES_E2E_FIXTURE__: { promptReceiptMode?: string } })
+        .__HERMES_E2E_FIXTURE__.promptReceiptMode = "delivery_unknown";
+    });
+    await sendBtn.click();
+    await expect(page.getByTestId("draft-delivery-unknown-alert")).toContainText("未确定是否送达");
+    await expect(composer).toHaveValue("Draft for Alpha with expired file");
+
+    // 5. accepted receipt clears Alpha Draft
+    await page.evaluate(() => {
+      (window as unknown as { __HERMES_E2E_FIXTURE__: { promptReceiptMode?: string } })
+        .__HERMES_E2E_FIXTURE__.promptReceiptMode = "accepted";
+    });
+    await sendBtn.click();
+    await expect(composer).toHaveValue("");
+    await expect(page.getByTestId("draft-delivery-unknown-alert")).toHaveCount(0);
+    await expect(page.getByTestId("draft-attachments-bar")).toHaveCount(0);
+
+    // 6. Capacity limit (> 1 MiB) prompts Export/Clear and does not lose prior Beta Draft
+    await page.locator("nav.sidebar").getByRole("button", { name: /Beta Session/ }).click();
+    await expect(composer).toHaveValue("Draft for Beta");
+    const oversizedText = "x".repeat(1024 * 1024 + 64);
+    await composer.fill(oversizedText);
+    await expect(page.getByTestId("draft-capacity-alert")).toContainText("1 MiB");
+    await page.getByTestId("draft-capacity-alert").getByRole("button", { name: "导出当前 Draft" }).click();
+    await expect(page.getByTestId("draft-export-preview")).toContainText("draftId");
+    await page.getByTestId("draft-capacity-alert").getByRole("button", { name: "清空当前 Draft" }).click();
+    await expect(composer).toHaveValue("");
+    await expect(page.getByTestId("draft-capacity-alert")).toHaveCount(0);
+
+    // 7. Empty Scope supports multiple Scope+draftId drafts + failed session.create retains draft vs success migrates atomically
+    await page.locator(".route-strip").getByRole("button", { name: /已连接/ }).click();
+    const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+    await scopeDialog.getByRole("button", { name: /Empty Profile/ }).click();
+    await composer.fill("New scope first draft");
+    await expect(page.getByTestId("scope-new-drafts-bar")).toBeVisible();
+    await page.getByTestId("scope-new-drafts-bar").getByRole("button", { name: "新建本地 Draft" }).click();
+    await expect(composer).toHaveValue("");
+    await composer.fill("New scope second draft");
+
+    // Switch back to first new-chat draft and verify session.create failure retains draftId & text
+    await page
+      .getByTestId("scope-new-drafts-bar")
+      .getByRole("button", { name: /New scope first/ })
+      .click();
+    await expect(composer).toHaveValue("New scope first draft");
+
+    await page.evaluate(() => {
+      (window as unknown as { __HERMES_E2E_FIXTURE__: { failSessionCreate?: boolean } })
+        .__HERMES_E2E_FIXTURE__.failSessionCreate = true;
+    });
+    await sendBtn.click();
+    await expect(composer).toHaveValue("New scope first draft");
+
+    // Allow session.create -> atomic migration + accepted receipt clears draft and starts transcript
+    await page.evaluate(() => {
+      (window as unknown as { __HERMES_E2E_FIXTURE__: { failSessionCreate?: boolean } })
+        .__HERMES_E2E_FIXTURE__.failSessionCreate = false;
+    });
+    await sendBtn.click();
+    await expect(composer).toHaveValue("");
+    await expect(page.locator(".transcript-list")).toContainText("New scope first draft");
+
+    // 8. Settings -> Data lists OrphanedDraft with Copy, Export JSON, Delete
+    await page.getByRole("button", { name: "管理连接" }).click();
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    const dataSection = settings.locator('[data-settings-section="data"]');
+    await expect(dataSection).toContainText("本地 Draft");
+    await expect(dataSection).toContainText("Recovered orphaned prompt text");
+    await expect(dataSection).toContainText("trace.log");
+    await expect(dataSection).toContainText("原 Session 已删除");
+
+    await dataSection.getByRole("button", { name: "复制文本" }).click();
+    await expect(page.locator('[aria-live="polite"]')).toContainText("已复制本地 Draft 文本");
+
+    await dataSection.getByRole("button", { name: "导出 JSON" }).click();
+    await expect(settings.getByTestId("orphaned-draft-export-preview")).toContainText(
+      "Recovered orphaned prompt text",
+    );
+
+    await dataSection.getByRole("button", { name: "删除本地 Draft" }).click();
+    await expect(settings.getByTestId("orphaned-drafts-empty")).toBeVisible();
+  });
+
+  test("Ticket #38: offline established Scope keeps local Draft editable while Send stays disabled", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "Local Hermes",
+              originDisplay: "127.0.0.1:47371",
+              actual: "reconnecting",
+              aggregateState: "reconnecting",
+              degraded: true,
+              profileExceptionCount: 0,
+              latencyMs: null,
+              nextRetryAt: "2026-11-23T08:05:00.000Z",
+              isPrimary: true,
+              isLastUsed: true,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              label: "Default",
+              actual: "reconnecting",
+              degraded: true,
+              isException: false,
+            },
+          ],
+          sessions: [],
+          activeScope: { connectionId: "local", profileId: "default" },
+          activeSessionId: null,
+        },
+        chatState: {
+          lastActiveChat: { connectionId: "local", profileId: "default" },
+          activeStatus: "offline",
+          draftsByKey: {
+            "new::local::default::draft-offline-1": {
+              draftId: "draft-offline-1",
+              scope: { connectionId: "local", profileId: "default" },
+              text: "Offline saved local draft",
+              attachments: [],
+              contexts: [],
+              composer: {},
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              revision: 1,
+              origin: { connectionId: "local", profileId: "default" },
+            },
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const composer = page.locator("#composer-input");
+    await expect(composer).toHaveValue("Offline saved local draft");
+    await expect(composer).toBeEditable();
+    await composer.fill("Offline saved local draft + updated locally");
+    await expect(page.locator(".composer-hint")).toContainText("离线 · 仅保存本地 Draft");
+    await expect(page.getByRole("button", { name: "发送消息" })).toBeDisabled();
+  });
+});
