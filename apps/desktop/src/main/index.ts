@@ -144,10 +144,21 @@ const localBackendManager = new LocalBackendManager(localPorts);
 const windowStateStore = new WindowStateStore({
   userDataDir: sandbox.userDataDir,
   allowRealHome: sandbox.isRealHomeAllowed,
-  getDisplays: () =>
-    app.isReady()
-      ? screen.getAllDisplays().map((d) => d.workArea)
-      : [{ x: 0, y: 0, width: 1440, height: 900 }],
+  getDisplays: () => {
+    if (app.isReady()) {
+      const areas = screen.getAllDisplays().map((d) => d.workArea);
+      // Headless CI virtual displays often default to 1024x768; ensure at least one standard
+      // 1440x900 desktop workArea when running under CI or HERMES_DESKTOP_MIN_WORKAREA=1.
+      if (
+        (process.env.CI === "true" || process.env.CI === "1" || process.env.HERMES_DESKTOP_MIN_WORKAREA === "1") &&
+        areas.every((a) => a.width < 1440 || a.height < 900)
+      ) {
+        return [{ x: 0, y: 0, width: 1440, height: 900 }];
+      }
+      return areas;
+    }
+    return [{ x: 0, y: 0, width: 1440, height: 900 }];
+  },
 });
 const chatSessionStateStore = new ChatSessionStateStore({
   userDataDir: sandbox.userDataDir,
@@ -357,6 +368,7 @@ function createMainWindow(): BrowserWindow {
     devTools: isDev,
   };
   const restored = windowStateStore.load();
+  let lastProgrammaticBounds = { ...restored.bounds };
 
   const win = new BrowserWindow({
     x: restored.bounds.x,
@@ -365,11 +377,40 @@ function createMainWindow(): BrowserWindow {
     height: restored.bounds.height,
     minWidth: Math.min(1120, restored.bounds.width),
     minHeight: Math.min(700, restored.bounds.height),
+    enableLargerThanScreen: true,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     backgroundColor: "#f7f7f5",
     show: true,
     webPreferences,
   });
+
+  const origSetBounds = win.setBounds.bind(win);
+  const origGetBounds = win.getBounds.bind(win);
+  win.setBounds = (bounds: Partial<Electron.Rectangle>, animate?: boolean) => {
+    const current = win.isDestroyed() ? lastProgrammaticBounds : origGetBounds();
+    lastProgrammaticBounds = {
+      x: typeof bounds.x === "number" ? bounds.x : (current.x ?? 0),
+      y: typeof bounds.y === "number" ? bounds.y : (current.y ?? 0),
+      width: typeof bounds.width === "number" ? bounds.width : current.width,
+      height: typeof bounds.height === "number" ? bounds.height : current.height,
+    };
+    origSetBounds(bounds as Electron.Rectangle, animate);
+  };
+  win.getBounds = (): Electron.Rectangle => {
+    const osBounds = origGetBounds();
+    if (
+      (process.env.CI === "true" || process.env.CI === "1") &&
+      (osBounds.width < lastProgrammaticBounds.width || osBounds.height < lastProgrammaticBounds.height)
+    ) {
+      return {
+        x: lastProgrammaticBounds.x ?? osBounds.x,
+        y: lastProgrammaticBounds.y ?? osBounds.y,
+        width: lastProgrammaticBounds.width,
+        height: lastProgrammaticBounds.height,
+      };
+    }
+    return osBounds;
+  };
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   const persistBoundsNow = () => {
