@@ -415,6 +415,9 @@ test.describe("Electron hardened smoke", () => {
     try {
       const page = await electronApp.firstWindow();
       await page.waitForLoadState("domcontentloaded");
+      // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
+      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      await page.setViewportSize({ width: 1440, height: 900 });
 
       // Wait for real Local connection over UDS ticket + WS
       const routeStrip = page.locator(".route-strip");
