@@ -8,6 +8,7 @@ import {
 import type {
   AppCommand,
   FleetSnapshot,
+  RegistrySnapshotView,
   WorkspaceTab,
 } from "@hermes/contracts";
 import {
@@ -19,6 +20,7 @@ import {
   shellReducer,
 } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
+import { GatewaysSettings } from "./components/GatewaysSettings";
 import { HermesMark } from "./components/HermesMark";
 import { FocusDialog } from "./components/Modal";
 
@@ -34,9 +36,11 @@ export default function App() {
   const [state, dispatch] = useReducer(shellReducer, undefined, createInitialShellState);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [paletteQuery, setPaletteQuery] = useState("");
+  const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const trackerRef = useRef(createSequenceTracker());
+  const registryTrackerRef = useRef(createSequenceTracker());
 
   const viewportMode = deriveViewportMode(viewportWidth);
   const topmostSurface = getTopmostSurface(state);
@@ -111,10 +115,21 @@ export default function App() {
       }
     });
 
+    const unsubRegistry = host.subscribe("registry", null, (event) => {
+      const accepted = registryTrackerRef.current.accept(event);
+      if (accepted.status === "applied") {
+        const payload = event.payload as { snapshot?: RegistrySnapshotView };
+        if (payload?.snapshot) {
+          setRegistrySnapshot(payload.snapshot);
+        }
+      }
+    });
+
     const unsubCmd = host.onCommand(handleAppCommand);
     return () => {
       active = false;
       unsubFleet();
+      unsubRegistry();
       unsubCmd();
     };
   }, [handleAppCommand]);
@@ -540,7 +555,11 @@ export default function App() {
         closeLabel={getCopy("settings.close")}
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "settings" })}
       >
-        <p>{getCopy("settings.emptyGateways")}</p>
+        <GatewaysSettings
+          snapshot={registrySnapshot}
+          onSnapshotChange={setRegistrySnapshot}
+          onAnnounce={(message) => dispatch({ type: "ANNOUNCE", message })}
+        />
       </FocusDialog>
 
       <FocusDialog
