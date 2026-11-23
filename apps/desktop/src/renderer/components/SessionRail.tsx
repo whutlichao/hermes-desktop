@@ -1,19 +1,76 @@
-import type { SessionSummary } from "@hermes/contracts";
+import { useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { Plus } from "lucide-react";
+import type { BridgeScope, SessionSummary, SupportedChatActions } from "@hermes/contracts";
 import { getCopy } from "@hermes/domain";
 
 interface SessionRailListProps {
   hasReadyConnection: boolean;
   sessions: SessionSummary[];
   activeSessionId: string | null;
+  activeScope?: BridgeScope | null;
+  supportedActions?: SupportedChatActions | null;
+  canCreateSession?: boolean;
+  showNewChatButton?: boolean;
+  onCreateSession?: () => void;
   onSelectSession: (session: SessionSummary) => void;
 }
+
+const CAPABILITY_ENTRIES: Array<{ key: keyof SupportedChatActions; label: string }> = [
+  { key: "promptSubmit", label: "prompt.submit" },
+  { key: "promptCancel", label: "prompt.cancel" },
+  { key: "promptSteer", label: "session.steer" },
+  { key: "sessionCreate", label: "session.create" },
+  { key: "sessionResume", label: "session.resume" },
+];
 
 export function SessionRailList({
   hasReadyConnection,
   sessions,
   activeSessionId,
+  activeScope,
+  supportedActions,
+  canCreateSession = false,
+  showNewChatButton = false,
+  onCreateSession,
   onSelectSession,
 }: SessionRailListProps) {
+  const [query, setQuery] = useState("");
+  const searchInputId = useId();
+  const rowRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  const filteredSessions = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        (s.preview && s.preview.toLowerCase().includes(q)),
+    );
+  }, [query, sessions]);
+
+  const handleListKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
+    if (filteredSessions.length === 0) return;
+    const currentIndex = rowRefs.current.findIndex((el) => el === document.activeElement);
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      const nextIdx = currentIndex < 0 ? 0 : (currentIndex + 1) % filteredSessions.length;
+      rowRefs.current[nextIdx]?.focus();
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      const prevIdx =
+        currentIndex < 0
+          ? filteredSessions.length - 1
+          : (currentIndex - 1 + filteredSessions.length) % filteredSessions.length;
+      rowRefs.current[prevIdx]?.focus();
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      rowRefs.current[0]?.focus();
+    } else if (event.key === "End") {
+      event.preventDefault();
+      rowRefs.current[filteredSessions.length - 1]?.focus();
+    }
+  };
+
   if (!hasReadyConnection) {
     return (
       <div className="sidebar-empty">
@@ -23,33 +80,115 @@ export function SessionRailList({
     );
   }
 
-  if (sessions.length === 0) {
-    return (
-      <div className="sidebar-empty">
-        <strong>{getCopy("nav.sessionsEmptyTitle")}</strong>
-        <p>{getCopy("chat.emptyBody")}</p>
-      </div>
-    );
-  }
+  const servedCapLabels = supportedActions
+    ? CAPABILITY_ENTRIES.filter((entry) => supportedActions[entry.key]).map((entry) => entry.label)
+    : [];
 
   return (
-    <ul className="session-list" aria-label={getCopy("nav.sessionsLandmark")}>
-      {sessions.map((session) => {
-        const isActive = session.sessionId === activeSessionId;
-        return (
-          <li key={`${session.connectionId}:${session.profileId}:${session.sessionId}`}>
-            <button
-              type="button"
-              className={["session-item", isActive && "is-active"].filter(Boolean).join(" ")}
-              aria-current={isActive ? "true" : undefined}
-              onClick={() => onSelectSession(session)}
-            >
-              <span className="session-item-title">{session.title}</span>
-              {session.preview && <span className="session-item-preview">{session.preview}</span>}
-            </button>
-          </li>
-        );
-      })}
-    </ul>
+    <div className="session-rail-body">
+      {showNewChatButton && onCreateSession && (
+        <button
+          type="button"
+          className="sidebar-new-btn"
+          disabled={!canCreateSession}
+          onClick={onCreateSession}
+        >
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <Plus size={13} aria-hidden="true" />
+            {getCopy("nav.newSession")}
+          </span>
+          <kbd className="kbd">⌘N</kbd>
+        </button>
+      )}
+
+      {sessions.length > 0 && (
+        <div className="session-search-wrap">
+          <label htmlFor={searchInputId} className="sr-only">
+            {getCopy("nav.searchLabel")}
+          </label>
+          <input
+            id={searchInputId}
+            type="search"
+            className="session-search-input"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={getCopy("nav.searchPlaceholder")}
+          />
+        </div>
+      )}
+
+      {sessions.length === 0 ? (
+        <div className="sidebar-empty">
+          <strong>{getCopy("nav.sessionsEmptyTitle")}</strong>
+          <p>{getCopy("chat.emptyBody")}</p>
+        </div>
+      ) : filteredSessions.length === 0 ? (
+        <div className="sidebar-empty">
+          <p>{getCopy("nav.searchNoResults")}</p>
+        </div>
+      ) : (
+        <ul
+          className="session-list"
+          aria-label={getCopy("nav.sessionsLandmark")}
+          onKeyDown={handleListKeyDown}
+        >
+          {filteredSessions.map((session, idx) => {
+            const isActive = session.sessionId === activeSessionId;
+            return (
+              <li key={`${session.connectionId}:${session.profileId}:${session.sessionId}`}>
+                <button
+                  ref={(el) => {
+                    rowRefs.current[idx] = el;
+                  }}
+                  type="button"
+                  className={["session-item", isActive && "is-active"].filter(Boolean).join(" ")}
+                  aria-current={isActive ? "page" : undefined}
+                  onClick={(event) => {
+                    event.currentTarget.focus();
+                    onSelectSession(session);
+                  }}
+                >
+                  <span className="session-item-title">{session.title}</span>
+                  {session.preview && <span className="session-item-preview">{session.preview}</span>}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      <section className="session-details-card" aria-label={getCopy("nav.sessionDetailsTitle")}>
+        <h3 className="session-details-heading">{getCopy("nav.sessionDetailsTitle")}</h3>
+        {activeScope ? (
+          <dl className="session-details-dl">
+            <div>
+              <dt>{getCopy("nav.sessionDetailsScope")}</dt>
+              <dd>
+                {activeScope.connectionId} / {activeScope.profileId ?? "default"}
+                {activeSessionId ? ` / ${activeSessionId}` : ` (${getCopy("nav.sessionDetailsNoSession")})`}
+              </dd>
+            </div>
+            <div>
+              <dt>{getCopy("nav.sessionDetailsCapabilities")}</dt>
+              <dd>
+                {servedCapLabels.length > 0 ? (
+                  <span className="session-cap-list">
+                    {servedCapLabels.map((cap) => (
+                      <span key={cap} className="session-cap-tag">
+                        {cap}
+                      </span>
+                    ))}
+                  </span>
+                ) : (
+                  <span>—</span>
+                )}
+              </dd>
+            </div>
+          </dl>
+        ) : (
+          <p className="session-details-empty">{getCopy("nav.sessionDetailsEmpty")}</p>
+        )}
+      </section>
+    </div>
   );
 }

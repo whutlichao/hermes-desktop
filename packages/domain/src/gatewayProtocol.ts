@@ -510,3 +510,120 @@ export function reduceTranscriptEvent(
       };
   }
 }
+
+export type TranscriptSyncApplyResult =
+  | { status: "applied"; snapshot: SessionTranscriptSnapshot }
+  | { status: "discarded_duplicate"; seq: number }
+  | { status: "resync_required"; expectedSeq: number; receivedSeq: number }
+  | { status: "ignored" };
+
+/**
+ * Enforces snapshot-before-patch transcript resync discipline:
+ * discards duplicate pre-snapshot patches (seq <= snapshotSeq),
+ * applies contiguous seq-ordered patches (seq > snapshotSeq),
+ * and requires full snapshot replacement on gap or resync_required / possible_event_loss.
+ */
+export function createTranscriptSyncController() {
+  let current: SessionTranscriptSnapshot | null = null;
+  let snapshotSeq = -1;
+  let lastSeq = -1;
+  let needsResync = false;
+
+  const applySnapshot = (
+    snapshot: SessionTranscriptSnapshot,
+    seq: number = snapshot.snapshotSeq ?? 0,
+    options?: { replace?: boolean; resynced?: boolean },
+  ): { status: "applied"; snapshot: SessionTranscriptSnapshot } => {
+    const next: SessionTranscriptSnapshot = {
+      ...snapshot,
+      messages: [...snapshot.messages],
+      snapshotSeq: seq,
+      ...(options?.resynced !== undefined ? { resynced: options.resynced } : {}),
+    };
+    current = next;
+    snapshotSeq = seq;
+    lastSeq = seq;
+    needsResync = false;
+    return { status: "applied", snapshot: current };
+  };
+
+  const applyPatch = (seq: number, patch: TranscriptPatchPayload): TranscriptSyncApplyResult => {
+    if (!current || needsResync) {
+      return { status: "resync_required", expectedSeq: Math.max(0, lastSeq + 1), receivedSeq: seq };
+    }
+    if (seq <= snapshotSeq || seq <= lastSeq) {
+      return { status: "discarded_duplicate", seq };
+    }
+    if (seq !== lastSeq + 1) {
+      needsResync = true;
+      return { status: "resync_required", expectedSeq: lastSeq + 1, receivedSeq: seq };
+    }
+    const next = reduceTranscriptEvent(current, {
+      topic: "session.transcript",
+      scope: {
+        connectionId: current.connectionId,
+        profileId: current.profileId,
+        sessionId: current.sessionId,
+      },
+      kind: "patch",
+      seq,
+      revision: 0,
+      payload: patch,
+    });
+    if (!next) {
+      return { status: "ignored" };
+    }
+    current = next;
+    lastSeq = seq;
+    return { status: "applied", snapshot: current };
+  };
+
+  const acceptEvent = (event: BridgeEvent): TranscriptSyncApplyResult => {
+    if (event.topic !== "session.transcript") {
+      return { status: "ignored" };
+    }
+    const rawPayload = event.payload as Record<string, unknown> | null | undefined;
+    const possibleLoss = Boolean(
+      rawPayload &&
+        typeof rawPayload === "object" &&
+        (rawPayload.possible_event_loss === true || rawPayload.possibleEventLoss === true),
+    );
+    if (event.kind === "resync_required" || possibleLoss) {
+      needsResync = true;
+      return {
+        status: "resync_required",
+        expectedSeq: Math.max(0, lastSeq + 1),
+        receivedSeq: event.seq,
+      };
+    }
+    if (event.kind === "snapshot") {
+      const snap = event.payload as SessionTranscriptSnapshot;
+      return applySnapshot(snap, event.seq, {
+        replace: true,
+        resynced: snap.resynced,
+      });
+    }
+    if (event.kind === "patch") {
+      return applyPatch(event.seq, event.payload as TranscriptPatchPayload);
+    }
+    return { status: "ignored" };
+  };
+
+  return {
+    applySnapshot,
+    applyPatch,
+    acceptEvent,
+    getSnapshot(): SessionTranscriptSnapshot | null {
+      return current;
+    },
+    isResyncRequired(): boolean {
+      return needsResync;
+    },
+    reset() {
+      current = null;
+      snapshotSeq = -1;
+      lastSeq = -1;
+      needsResync = false;
+    },
+  };
+}

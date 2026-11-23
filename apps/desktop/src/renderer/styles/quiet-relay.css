@@ -554,6 +554,11 @@ button {
   width: 378px;
 }
 
+.dialog-panel.is-popover.sessions-popover {
+  width: 378px;
+  min-height: 456px;
+}
+
 .dialog-header {
   display: flex;
   align-items: flex-start;
@@ -1302,4 +1307,124 @@ button {
 
 .palette-item.is-active-scope {
   border-color: var(--ink);
+}
+
+.session-rail-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+.session-search-wrap {
+  margin-top: 4px;
+}
+
+.session-search-input {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--control-line);
+  border-radius: 5px;
+  background: var(--surface);
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.session-details-card {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--paper-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.session-details-heading {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.session-details-dl {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.session-details-dl dt {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.session-details-dl dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.session-details-empty {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.session-cap-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.session-cap-tag {
+  padding: 1px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--surface);
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+
+.route-fallback-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.route-fallback-banner-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.resync-notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.missing-draft-preview {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--paper-deep);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

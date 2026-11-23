@@ -64,4 +64,158 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await expect(page.getByRole("dialog", { name: "改连 Remote / SSH" })).toBeVisible();
     await checkAxe("remote escape modal");
   });
+
+  test("passes axe-core serious/critical = 0 on populated session rail, route banner, 1280 popover, and session_missing recovery card", async ({
+    page,
+  }) => {
+    const checkAxe = async (label: string) => {
+      const results = await new AxeBuilder({ page }).analyze();
+      const severe = results.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(severe, `axe serious/critical violations on ${label}`).toEqual([]);
+    };
+
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              availability: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-a",
+              title: "Session A",
+              preview: "First",
+              updatedAt: "2026-11-23T06:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-b",
+              title: "Session B",
+              preview: "Second",
+              updatedAt: "2026-11-23T06:01:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-a" },
+          activeSessionId: "sess-a",
+        },
+        chatState: {
+          windowId: "primary",
+          paneId: "main",
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-a" },
+          lastSessionByScope: { "local::default": "sess-a" },
+          lastValidProfileByConnection: { local: "default" },
+          lastValidScopes: [{ connectionId: "local", profileId: "default" }],
+          sessionSummaries: {},
+          activeStatus: "ready",
+          lastKnownUnverified: false,
+          missingSession: null,
+          routeBanner: {
+            id: "rb-a11y",
+            fromScope: { connectionId: "vps", profileId: "prod" },
+            toScope: { connectionId: "local", profileId: "default" },
+            reason: "connection_removed",
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await expect(page.locator(".route-fallback-banner")).toBeVisible();
+    await checkAxe("populated 1440 rail + route banner");
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.getByRole("button", { name: /Sessions\s+2/ }).click();
+    await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
+    await checkAxe("populated 1280 sessions popover");
+    await page.keyboard.press("Escape");
+
+    // session_missing recovery card a11y
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              targetDisplay: "local-control-socket",
+              actual: "ready",
+              activeProfileId: "default",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              availability: "ready",
+            },
+          ],
+          sessions: [],
+          activeScope: { connectionId: "local", profileId: "default" },
+          activeSessionId: null,
+        },
+        chatState: {
+          windowId: "primary",
+          paneId: "main",
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-missing" },
+          lastSessionByScope: { "local::default": "sess-missing" },
+          lastValidProfileByConnection: { local: "default" },
+          lastValidScopes: [{ connectionId: "local", profileId: "default" }],
+          sessionSummaries: {},
+          activeStatus: "session_missing",
+          lastKnownUnverified: false,
+          missingSession: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-missing",
+            title: "Missing Session",
+            hasDraft: true,
+            draftText: "Important unsent prompt",
+            lastKnownMessages: [],
+          },
+          routeBanner: null,
+        },
+      };
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+    await expect(page.locator(".session-missing-card")).toBeVisible();
+    await checkAxe("session_missing read-only recovery card");
+  });
 });
