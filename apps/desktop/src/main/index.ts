@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, ipcMain, Menu, session, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } from "electron";
 import {
   HOST_BRIDGE_VERSION,
   type AppCommand,
@@ -12,6 +12,7 @@ import {
   type HostTopic,
 } from "@hermes/contracts";
 import { createBridgeDispatcher, validateHostTopic } from "@hermes/domain";
+import { LocalBackendManager, createNodeLocalBackendPorts } from "./localBackendManager";
 import {
   buildAppMenuSpec,
   buildCspHeader,
@@ -73,6 +74,37 @@ const emptyFleetSnapshot: FleetSnapshot = {
   activeSessionId: null,
 };
 
+const defaultDevHermesHome = path.join(repoRoot, ".dev", "hermes-home");
+const hermesHomeKind: "sandbox" | "real" | "temp" = sandbox.isRealHomeAllowed
+  ? "real"
+  : path.resolve(sandbox.hermesHomeDir) === path.resolve(defaultDevHermesHome)
+    ? "sandbox"
+    : "temp";
+
+const localBackendManager = new LocalBackendManager(
+  createNodeLocalBackendPorts({
+    userDataDir: sandbox.userDataDir,
+    hermesHomeDir: sandbox.hermesHomeDir,
+    hermesHomeKind,
+    appVersion: app.getVersion(),
+    buildMode: app.isPackaged ? "packaged" : "dev",
+    pickCliFile: async () => {
+      const targetWin = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+      const openOptions: Electron.OpenDialogOptions = {
+        title: "选择 hermes CLI 可执行文件",
+        properties: ["openFile"],
+      };
+      const result = targetWin
+        ? await dialog.showOpenDialog(targetWin, openOptions)
+        : await dialog.showOpenDialog(openOptions);
+      if (result.canceled || result.filePaths.length === 0) {
+        return { cancelled: true };
+      }
+      return { cancelled: false, filePath: result.filePaths[0] };
+    },
+  }),
+);
+
 const dispatcher = createBridgeDispatcher({
   "bridge.hello": async (): Promise<AppInfo> => {
     rendererReady = true;
@@ -90,14 +122,10 @@ const dispatcher = createBridgeDispatcher({
   "connections.list": async () => ({ connections: emptyFleetSnapshot.connections }),
   "profiles.list": async () => ({ profiles: emptyFleetSnapshot.profiles }),
   "sessions.list": async () => ({ sessions: emptyFleetSnapshot.sessions }),
-  "diagnostics.export": async () => ({
-    appName: "Hermes Desktop",
-    appVersion: app.getVersion(),
-    bridgeVersion: HOST_BRIDGE_VERSION,
-    mode: "electron",
-    sandboxed: !sandbox.isRealHomeAllowed,
-    connectionsCount: 0,
-  }),
+  "local.inspect": async () => localBackendManager.inspect(),
+  "local.selectCli": async () => localBackendManager.selectCli(),
+  "local.diagnose": async () => localBackendManager.diagnose(),
+  "diagnostics.export": async () => localBackendManager.diagnose(),
   "links.openExternal": async (payload) => {
     const rawUrl = typeof payload.url === "string" ? payload.url : "";
     if (!isAllowedExternalUrl(rawUrl)) {
