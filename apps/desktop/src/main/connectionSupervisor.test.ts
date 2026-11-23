@@ -3711,11 +3711,7 @@ process.exit(1);
 
       // Reconnect and resume: the server says the turn is terminal; never auto-resend the stop.
       await supervisor.handlers["connections.retry"]({ connectionId: "local" }, null);
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        if (supervisor.getLocalHealth().actual === "ready") break;
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      expect(supervisor.getLocalHealth().actual).toBe("ready");
+      await expect.poll(() => supervisor.getLocalHealth().actual).toBe("ready");
       interruptAckLoss = false;
       activeTurnId = null;
       lastTurnOutcome = "interrupted";

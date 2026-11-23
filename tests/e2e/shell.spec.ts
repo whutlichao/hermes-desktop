@@ -3153,17 +3153,18 @@ test.describe("Ticket #42 Skills/Tools/MCP/Plugins read-only inventory, states, 
     await page.getByRole("button", { name: /能力 17 可达 4 延期/ }).click();
     const capDrawer = page.getByRole("dialog", { name: "能力目录" });
     await expect(capDrawer).toBeVisible();
+    await page.clock.install();
     await capDrawer.getByTestId("capabilities-open-extensions-drawer").click();
 
     const extDrawer = page.getByRole("dialog", { name: "扩展清单（只读）" });
     await expect(extDrawer).toBeVisible();
+    await page.clock.fastForward(450);
     await expect(extDrawer.getByTestId("ext-drawer-plugins-state")).toHaveAttribute(
       "data-inventory-status",
       "available",
     );
 
     // Only plugins was fetched once; no polling after waiting
-    await page.waitForTimeout(450);
     const afterPluginsOpen = await page.evaluate(
       () => (window as unknown as { __HERMES_E2E_COUNTS__: Record<string, number> }).__HERMES_E2E_COUNTS__,
     );
@@ -4532,7 +4533,6 @@ test.describe("Ticket #43 Turn & queue recovery", () => {
     await expect(page.locator(".transcript-list")).toContainText("Deploy the staging build");
     await expect(page.getByTestId("queue-item-adm-lost-follow")).toBeVisible();
 
-    await page.waitForTimeout(400);
     const beforeDiscard = await page.evaluate(
       () =>
         (window as unknown as { __HERMES_E2E_COUNTS__: { resolveUnknownCalls: number } })
@@ -4684,7 +4684,15 @@ test.describe("Ticket #43 Turn & queue recovery", () => {
     await expect(page.locator(".transcript-list")).toContainText("Still running the migration");
     await expect(page.getByRole("button", { name: "已停止" })).toHaveCount(0);
 
-    await page.waitForTimeout(500);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { __HERMES_E2E_COUNTS__: { promptsStopCalls: number } })
+              .__HERMES_E2E_COUNTS__.promptsStopCalls,
+        ),
+      )
+      .toBe(1);
     const stopPayloads = await page.evaluate(
       () =>
         (window as unknown as {

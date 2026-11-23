@@ -1389,7 +1389,39 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
       { width: 1120, height: 700 },
     ]) {
       await page.setViewportSize(viewport);
-      await page.waitForTimeout(60);
+
+      await expect
+        .poll(
+          () =>
+            page.evaluate(() => {
+              const column = document.querySelector<HTMLElement>(".thread-column");
+              const root = getComputedStyle(document.documentElement);
+              const heading = document.querySelector<HTMLElement>(
+                ".transcript-message, .empty-relay-card h1",
+              );
+              const pageOverflow =
+                document.documentElement.scrollWidth > window.innerWidth ||
+                document.body.scrollWidth > document.body.clientWidth;
+              const columnWidth = column?.getBoundingClientRect().width ?? 0;
+              return {
+                rootFont: root.fontSize,
+                pageOverflow,
+                columnReady: columnWidth > 680 && columnWidth <= 721,
+                headingReady:
+                  heading !== null &&
+                  Number.parseFloat(getComputedStyle(heading).fontSize) >= 24,
+                railVisible: Boolean(document.querySelector("nav.sidebar")),
+              };
+            }),
+          { message: `layout settles at ${viewport.width}x${viewport.height}` },
+        )
+        .toEqual({
+          rootFont: "26px",
+          pageOverflow: false,
+          columnReady: true,
+          headingReady: true,
+          railVisible: viewport.width > 1340,
+        });
 
       const metrics = await page.evaluate(() => {
         const column = document.querySelector<HTMLElement>(".thread-column");

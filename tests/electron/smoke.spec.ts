@@ -637,7 +637,6 @@ test.describe("Electron hardened smoke", () => {
         const win = BrowserWindow.getAllWindows()[0];
         win.setBounds({ x: 120, y: 90, width: 1240, height: 760 });
       });
-      await page1.waitForTimeout(220);
       await app1.close();
 
       // Verify 0600 window-state.json & chat-session-state.json
