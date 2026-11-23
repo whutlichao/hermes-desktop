@@ -128,9 +128,21 @@ export default function App() {
     : false;
 
   useEffect(() => {
-    const onResize = () => setViewportWidth(window.innerWidth);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    const syncViewportWidth = () => {
+      const next = window.innerWidth;
+      setViewportWidth((prev) => (prev === next ? prev : next));
+    };
+    syncViewportWidth();
+    window.addEventListener("resize", syncViewportWidth);
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined" && document.documentElement) {
+      observer = new ResizeObserver(syncViewportWidth);
+      observer.observe(document.documentElement);
+    }
+    return () => {
+      window.removeEventListener("resize", syncViewportWidth);
+      observer?.disconnect();
+    };
   }, []);
 
   // Keep background inert when a modal dialog is open (useLayoutEffect ensures inert is cleared before focus returns)
