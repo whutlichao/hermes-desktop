@@ -16,6 +16,9 @@
   --accent-text: #a73826;
   --accent-soft: #faede8;
   --focus-ring-color: #c8442e;
+  --status-ready: #1f7a4c;
+  --status-connecting: #a36a00;
+  --status-blocked: #c8442e;
   --font-ui: "Schibsted Grotesk", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-mono: "Spline Sans Mono", "SFMono-Regular", "Cascadia Mono", monospace;
   --shadow-pop: 0 12px 40px rgb(22 24 27 / 14%), 0 2px 8px rgb(22 24 27 / 7%);
@@ -1155,16 +1158,16 @@ button {
 }
 
 .status-dot.is-ready {
-  background: #1f7a4c;
+  background: var(--status-ready);
 }
 
 .status-dot.is-connecting,
 .status-dot.is-reconnecting {
-  background: #a36a00;
+  background: var(--status-connecting);
 }
 
 .status-dot.is-blocked {
-  background: var(--accent);
+  background: var(--status-blocked);
 }
 
 .session-list {

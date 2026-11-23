@@ -254,6 +254,7 @@ interface MockE2EFixture {
   approvals?: ApprovalIngestInput[];
   highRiskConfirmResult?: boolean;
   approvalRespondOutcome?: "settled" | "settled_elsewhere_by_server";
+  approvalRespondFailure?: boolean;
   terminal?: {
     denyFirstGrant?: boolean;
     denyRootGrant?: boolean;
@@ -5070,6 +5071,11 @@ export function createMockHostBridge(): HermesHost {
     "approvals.respond": async (payload) => {
       e2eCounts.approvalRespondCalls += 1;
       const { approvalKey, choice } = assertApprovalRespondPayloadSafe(payload);
+      if ((readE2EFixture() ?? fixture)?.approvalRespondFailure) {
+        const err = new Error("Approval action failed");
+        (err as { code?: string }).code = "conflict";
+        throw err;
+      }
       return await approvalCoordinator.respond(approvalKey, choice);
     },
     "approvals.dismissOrphaned": async (payload) => {

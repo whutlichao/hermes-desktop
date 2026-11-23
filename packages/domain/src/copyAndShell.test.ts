@@ -211,5 +211,29 @@ describe("Quiet Relay shell state & layout invariants", () => {
       eventId: "scope-switch-2",
     });
     expect(state.liveAnnouncement).toBe("已切换到当前 Scope");
+
+    state = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "发生了什么：停止失败。可能原因：连接中断。下一步：恢复连接后重试。",
+      eventId: "stop-error-1",
+      priority: "assertive",
+    });
+    expect(state.assertiveAnnouncement).toContain("停止失败");
+    const duplicatedAssertive = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "发生了什么：停止失败。可能原因：连接中断。下一步：恢复连接后重试。",
+      eventId: "stop-error-1",
+      priority: "assertive",
+    });
+    expect(duplicatedAssertive).toBe(state);
+
+    state = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "发生了什么：投递状态未知。可能原因：回执丢失。下一步：检查回执。",
+      eventId: "queue-error-2",
+      priority: "assertive",
+    });
+    expect(state.assertiveAnnouncement).toContain("投递状态未知");
+    expect(state.liveAnnouncement).toBe("已切换到当前 Scope");
   });
 });

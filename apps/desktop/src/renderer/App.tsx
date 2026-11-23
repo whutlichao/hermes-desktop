@@ -1852,6 +1852,11 @@ export default function App() {
       }
       if (!targetSessionId) {
         dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.sendFailed") });
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy("chat.sendFailed"),
+          priority: "assertive",
+        });
         return;
       }
       const targetScope: BridgeScope = {
@@ -1898,7 +1903,9 @@ export default function App() {
           dispatch({ type: "ANNOUNCE", message: getCopy("draft.deliveryUnknownBadge") });
         }
       } else {
-        dispatch({ type: "SET_STOP_ERROR", message: res.error.message || getCopy("chat.sendFailed") });
+        const message = res.error.message || getCopy("chat.sendFailed");
+        dispatch({ type: "SET_STOP_ERROR", message });
+        dispatch({ type: "ANNOUNCE", message, priority: "assertive" });
       }
     } finally {
       dispatch({ type: "SET_CHAT_BUSY", busy: false });
@@ -1968,6 +1975,7 @@ export default function App() {
         );
         if (!res.ok) {
           dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          dispatch({ type: "ANNOUNCE", message: res.error.message, priority: "assertive" });
           return "failed";
         }
         const receipt = res.value.receipt ?? res.value.receiptStatus;
@@ -1976,6 +1984,7 @@ export default function App() {
           dispatch({
             type: "ANNOUNCE",
             message: getCopy("turn.queue.deliveryUnknownTitle"),
+            priority: "assertive",
           });
           return "delivery_unknown";
         }
@@ -2020,6 +2029,7 @@ export default function App() {
         );
         if (!res.ok) {
           dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          dispatch({ type: "ANNOUNCE", message: res.error.message, priority: "assertive" });
           return;
         }
         dispatch({
@@ -2074,6 +2084,11 @@ export default function App() {
         );
         if (!res.ok) {
           dispatch({ type: "SET_STOP_ERROR", message: getCopy("turn.queue.cancelFailed") });
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy("turn.queue.cancelFailed"),
+            priority: "assertive",
+          });
           return;
         }
         const outcome = res.value.outcome ?? "cancel_unknown";
@@ -2111,6 +2126,11 @@ export default function App() {
       );
       if (!res.ok) {
         dispatch({ type: "SET_STOP_ERROR", message: getCopy("turn.unknown.discardFailed") });
+        dispatch({
+          type: "ANNOUNCE",
+          message: getCopy("turn.unknown.discardFailed"),
+          priority: "assertive",
+        });
         return;
       }
         dispatch({
@@ -2149,6 +2169,7 @@ export default function App() {
         );
         if (!res.ok) {
           dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
+          dispatch({ type: "ANNOUNCE", message: res.error.message, priority: "assertive" });
           return;
         }
         if (res.value.steered) {
@@ -2220,10 +2241,16 @@ export default function App() {
     );
     if (!res.ok) {
       dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.stopFailed") });
+      dispatch({
+        type: "ANNOUNCE",
+        message: getCopy("chat.stopFailed"),
+        priority: "assertive",
+      });
     } else if (res.value.status === "cancel_outcome_unknown") {
       dispatch({
         type: "ANNOUNCE",
         message: getCopy("turn.stop.cancelOutcomeUnknownBody"),
+        priority: "assertive",
       });
     }
   }, [
@@ -2248,6 +2275,7 @@ export default function App() {
             type: "ANNOUNCE",
             message: getCopy("approval.actionFailedNotice"),
             eventId: `approval-error:${approval.approvalKey}:${choice}`,
+            priority: "assertive",
           });
           return;
         }
@@ -3572,8 +3600,25 @@ export default function App() {
 
       </div>
 
-      <div className="sr-only" aria-live="polite" aria-atomic="false" role="status">
+      <div
+        className="sr-only"
+        aria-live="polite"
+        aria-atomic="false"
+        role="status"
+        data-testid="live-region-polite"
+        data-announcement-seq={state.liveAnnouncementSeq}
+      >
         {state.liveAnnouncement}
+      </div>
+      <div
+        className="sr-only"
+        aria-live="assertive"
+        aria-atomic="false"
+        role="alert"
+        data-testid="live-region-assertive"
+        data-announcement-seq={state.assertiveAnnouncementSeq}
+      >
+        {state.assertiveAnnouncement}
       </div>
 
       {/* Modal surfaces live outside the inert app shell */}

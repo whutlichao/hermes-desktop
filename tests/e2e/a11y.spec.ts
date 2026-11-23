@@ -119,6 +119,7 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await expect(page.locator("main#main-content")).toBeVisible();
     await expect(page.locator("footer.status-footer")).toBeVisible();
     await expect(page.locator('[aria-live="polite"]')).toBeAttached();
+    await expect(page.locator('[aria-live="assertive"]')).toBeAttached();
 
     const checkAxe = async (label: string) => {
       const results = await new AxeBuilder({ page }).analyze();
@@ -1512,19 +1513,30 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
     await expect(page.locator("main#main-content")).toBeVisible();
     await expect(page.locator("nav.sidebar")).toBeVisible();
     await expect(page.locator("footer.status-footer")).toBeVisible();
-    const liveRegion = page.locator('[aria-live="polite"]');
+    const liveRegion = page.getByTestId("live-region-polite");
+    const assertiveRegion = page.getByTestId("live-region-assertive");
     await expect(liveRegion).toHaveAttribute("aria-atomic", "false");
     await expect(liveRegion).toHaveText("");
+    await expect(liveRegion).toHaveAttribute("data-announcement-seq", "0");
+    await expect(assertiveRegion).toHaveAttribute("aria-atomic", "false");
+    await expect(assertiveRegion).toHaveText("");
+    await expect(assertiveRegion).toHaveAttribute("data-announcement-seq", "0");
 
     const tokenValues = await page.evaluate(() => {
       const style = getComputedStyle(document.documentElement);
       return {
         controlLine: style.getPropertyValue("--control-line").trim(),
         focusRing: style.getPropertyValue("--focus-ring-color").trim(),
+        statusReady: style.getPropertyValue("--status-ready").trim(),
+        statusConnecting: style.getPropertyValue("--status-connecting").trim(),
+        statusBlocked: style.getPropertyValue("--status-blocked").trim(),
       };
     });
     expect(tokenValues.controlLine).toBe("#8a8a80");
     expect(tokenValues.focusRing).toBe("#c8442e");
+    expect(tokenValues.statusReady).toBe("#1f7a4c");
+    expect(tokenValues.statusConnecting).toBe("#a36a00");
+    expect(tokenValues.statusBlocked).toBe("#c8442e");
 
     const paletteButton = page.getByRole("button", { name: /命令面板/ });
     await paletteButton.focus();
@@ -1605,6 +1617,147 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
     });
     expect(forcedStyle.outlineStyle).toBe("solid");
     expect(forcedStyle.outlineWidth).toBe("2px");
+  });
+
+  test("E2E-A11Y-06: polite and assertive live regions stay mounted, start empty, and dedupe the same event id", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local-control-socket",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-live-region",
+              title: "Live Region Session",
+              preview: "Waiting for approval",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-live-region",
+              status: "running",
+            },
+          ],
+          activeScope: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-live-region",
+          },
+          activeSessionId: "sess-live-region",
+        },
+        approvalRespondFailure: true,
+        approvals: [
+          {
+            gateway: {
+              approvalId: "apr-live-region",
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-live-region",
+              turnId: "turn-live-region",
+              executionGeneration: 1,
+              command: "sudo systemctl restart hermes",
+              description: "Restart the local service",
+              choices: ["once", "deny"],
+            },
+            main: {
+              connectionLabel: "This device",
+              connectionKind: "local",
+              hostDisplay: "local-control-socket",
+              profileDisplayName: "Default",
+              sessionTitle: "Live Region Session",
+              cwd: "/srv/hermes/app",
+              ownerGeneration: 1,
+              authorityEpoch: 1,
+              connectionOnline: true,
+            },
+          },
+        ],
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const politeRegion = page.getByTestId("live-region-polite");
+    const assertiveRegion = page.getByTestId("live-region-assertive");
+    await expect(politeRegion).toHaveCount(1);
+    await expect(assertiveRegion).toHaveCount(1);
+    await expect(politeRegion).toHaveAttribute("aria-atomic", "false");
+    await expect(assertiveRegion).toHaveAttribute("aria-atomic", "false");
+    await expect(politeRegion).toHaveText("");
+    await expect(assertiveRegion).toHaveText("");
+    await expect(politeRegion).toHaveAttribute("data-announcement-seq", "0");
+    await expect(assertiveRegion).toHaveAttribute("data-announcement-seq", "0");
+    await expect(page.locator(".status-dot.is-ready")).toHaveCSS(
+      "background-color",
+      "rgb(31, 122, 76)",
+    );
+    for (const region of [politeRegion, assertiveRegion]) {
+      const style = await region.evaluate((element) => {
+        const computed = getComputedStyle(element);
+        return {
+          display: computed.display,
+          visibility: computed.visibility,
+          position: computed.position,
+          width: computed.width,
+          height: computed.height,
+          overflow: computed.overflow,
+        };
+      });
+      expect(style.display).not.toBe("none");
+      expect(style.visibility).not.toBe("hidden");
+      expect(style.position).toBe("absolute");
+      expect(style.width).toBe("1px");
+      expect(style.height).toBe("1px");
+      expect(style.overflow).toBe("hidden");
+    }
+
+    const scopeButton = page.locator(".route-strip").getByRole("button", {
+      name: /未连接|已连接/,
+    });
+    await scopeButton.click();
+    const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+    await scopeDialog.getByRole("button", { name: /This device/ }).click();
+    await expect(politeRegion).toHaveText("已切换当前 Scope");
+    const politeSeq = await politeRegion.getAttribute("data-announcement-seq");
+    await scopeButton.click();
+    await scopeDialog.getByRole("button", { name: /This device/ }).click();
+    await expect(politeRegion).toHaveAttribute("data-announcement-seq", politeSeq ?? "1");
+
+    const approve = page.getByTestId("approval-choice-once");
+    await expect(approve).toBeEnabled();
+    await approve.click();
+    await expect(assertiveRegion).toContainText("审批操作未完成");
+    const assertiveSeq = await assertiveRegion.getAttribute("data-announcement-seq");
+    await expect(approve).toBeEnabled();
+    await approve.click();
+    await expect(assertiveRegion).toHaveAttribute(
+      "data-announcement-seq",
+      assertiveSeq ?? "1",
+    );
   });
 });
 

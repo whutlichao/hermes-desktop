@@ -59,6 +59,10 @@ export interface ShellState {
   surfaceStack: OverlaySurface[];
   liveAnnouncement: string;
   liveAnnouncementEventId: string | null;
+  liveAnnouncementSeq: number;
+  assertiveAnnouncement: string;
+  assertiveAnnouncementEventId: string | null;
+  assertiveAnnouncementSeq: number;
 }
 
 export type ShellAction =
@@ -92,7 +96,7 @@ export type ShellAction =
   | { type: "TOGGLE_WORKSPACE" }
   | { type: "SET_WORKSPACE_MODE"; mode: WorkspaceMode }
   | { type: "SET_WORKSPACE_TAB"; tab: WorkspaceTab }
-  | { type: "ANNOUNCE"; message: string; eventId?: string };
+  | { type: "ANNOUNCE"; message: string; eventId?: string; priority?: "polite" | "assertive" };
 
 export function deriveViewportMode(width: number): ViewportMode {
   return width <= 1340 ? "popover" : "rail";
@@ -130,6 +134,10 @@ export function createInitialShellState(): ShellState {
     surfaceStack: [],
     liveAnnouncement: "",
     liveAnnouncementEventId: null,
+    liveAnnouncementSeq: 0,
+    assertiveAnnouncement: "",
+    assertiveAnnouncementEventId: null,
+    assertiveAnnouncementSeq: 0,
   };
 }
 
@@ -290,6 +298,17 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         },
       };
     case "ANNOUNCE":
+      if (action.priority === "assertive") {
+        if (action.eventId && state.assertiveAnnouncementEventId === action.eventId) {
+          return state;
+        }
+        return {
+          ...state,
+          assertiveAnnouncement: action.message,
+          assertiveAnnouncementEventId: action.eventId ?? null,
+          assertiveAnnouncementSeq: state.assertiveAnnouncementSeq + 1,
+        };
+      }
       if (action.eventId && state.liveAnnouncementEventId === action.eventId) {
         return state;
       }
@@ -297,6 +316,7 @@ export function shellReducer(state: ShellState, action: ShellAction): ShellState
         ...state,
         liveAnnouncement: action.message,
         liveAnnouncementEventId: action.eventId ?? null,
+        liveAnnouncementSeq: state.liveAnnouncementSeq + 1,
       };
   }
 }

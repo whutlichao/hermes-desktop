@@ -42,6 +42,11 @@ describe("Quiet Relay contrast & accessibility tokens", () => {
     const controlLine = readToken("--control-line");
     const focusRing = readToken("--focus-ring-color");
     const accentText = readToken("--accent-text");
+    const statusColors = [
+      readToken("--status-ready"),
+      readToken("--status-connecting"),
+      readToken("--status-blocked"),
+    ];
     const surfaces = ["--paper", "--paper-raised", "--paper-deep", "--surface"].map(readToken);
 
     for (const surface of surfaces) {
@@ -49,6 +54,9 @@ describe("Quiet Relay contrast & accessibility tokens", () => {
       expect(contrast(muted, surface)).toBeGreaterThanOrEqual(4.5);
       expect(contrast(controlLine, surface)).toBeGreaterThanOrEqual(3);
       expect(contrast(focusRing, surface)).toBeGreaterThanOrEqual(3);
+      for (const statusColor of statusColors) {
+        expect(contrast(statusColor, surface)).toBeGreaterThanOrEqual(3);
+      }
     }
     expect(contrast(accentText, readToken("--accent-soft"))).toBeGreaterThanOrEqual(4.5);
   });
