@@ -9,6 +9,7 @@ import {
   SETTINGS_SECTION_IDS,
   type AppCommand,
   type ArtifactAnnotation,
+  type AttentionTarget,
   type BridgeScope,
   type CapabilityDomainId,
   type CapabilityEntry,
@@ -41,6 +42,7 @@ import {
   HERMES_INSTALL_DOCS_URL,
   HERMES_UPDATE_DOCS_URL,
   addWorkspaceAnnotation,
+  aggregateAttentionState,
   closeWorkspace,
   createInitialShellState,
   createInitialWorkspaceSessionState,
@@ -178,6 +180,26 @@ export default function App() {
     () => (hasReadyConnection ? filterSessionsForScope(state.sessions, effectiveScope) : []),
     [effectiveScope, hasReadyConnection, state.sessions],
   );
+
+  const attentionSummary = useMemo(
+    () => aggregateAttentionState(state.sessions, effectiveScope, state.activeSessionId),
+    [effectiveScope, state.activeSessionId, state.sessions],
+  );
+
+  useEffect(() => {
+    const syncFocus = (focused: boolean) => {
+      void host.request("app.setFocused", { focused });
+    };
+    const onFocus = () => syncFocus(true);
+    const onBlur = () => syncFocus(false);
+    syncFocus(typeof document !== "undefined" ? document.hasFocus() : true);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
 
   const canCreateSession = hasReadyConnection
     ? state.transcript
@@ -862,18 +884,37 @@ export default function App() {
       };
       dispatch({ type: "SET_STOP_ERROR", message: null });
       setExportedMissing(null);
-      const res = await host.request<{ transcript?: SessionTranscriptSnapshot }>(
+      const res = await host.request<{
+        fleet?: FleetSnapshot;
+        transcript?: SessionTranscriptSnapshot | null;
+        resyncRequired?: boolean;
+      }>(
         "sessions.select",
         { sessionId: session.sessionId, profileId: session.profileId },
         targetScope,
       );
-      if (res.ok && res.value.transcript) {
-        const applied = transcriptSyncRef.current.applySnapshot(
-          res.value.transcript,
-          res.value.transcript.snapshotSeq ?? 0,
-          { replace: true, resynced: res.value.transcript.resynced },
-        );
-        dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
+      if (res.ok) {
+        if (res.value.fleet) {
+          dispatch({
+            type: "APPLY_FLEET_SNAPSHOT",
+            connections: res.value.fleet.connections,
+            profiles: res.value.fleet.profiles,
+            sessions: res.value.fleet.sessions,
+            activeScope: res.value.fleet.activeScope,
+            activeSessionId: res.value.fleet.activeSessionId,
+          });
+        }
+        if (res.value.transcript) {
+          const applied = transcriptSyncRef.current.applySnapshot(
+            res.value.transcript,
+            res.value.transcript.snapshotSeq ?? 0,
+            { replace: true, resynced: res.value.transcript.resynced },
+          );
+          dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
+        } else if (res.value.resyncRequired || res.value.transcript === null) {
+          transcriptSyncRef.current.reset();
+          dispatch({ type: "CLEAR_TRANSCRIPT" });
+        }
       }
       if (state.surfaceStack.includes("sessionsPopover")) {
         dispatch({ type: "CLOSE_SURFACE", surface: "sessionsPopover" });
@@ -962,6 +1003,7 @@ export default function App() {
         ok?: boolean;
         fleet?: FleetSnapshot;
         transcript?: SessionTranscriptSnapshot | null;
+        resyncRequired?: boolean;
       }>("scopes.switch", { connectionId: effectiveScope.connectionId, profileId }, targetScope);
       if (res.ok && res.value.fleet) {
         const fleet = res.value.fleet;
@@ -983,6 +1025,9 @@ export default function App() {
             type: "REPLACE_TRANSCRIPT_SNAPSHOT",
             snapshot: applied.snapshot,
           });
+        } else if (res.value.resyncRequired || res.value.transcript === null) {
+          transcriptSyncRef.current.reset();
+          dispatch({ type: "CLEAR_TRANSCRIPT" });
         }
       }
       dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" });
@@ -1157,6 +1202,7 @@ export default function App() {
               ok?: boolean;
               fleet?: FleetSnapshot;
               transcript?: SessionTranscriptSnapshot | null;
+              resyncRequired?: boolean;
             }>(
               "scopes.switch",
               {
@@ -1185,6 +1231,9 @@ export default function App() {
                   { replace: true, resynced: res.value.transcript.resynced },
                 );
                 dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
+              } else if (res.value.resyncRequired || res.value.transcript === null) {
+                transcriptSyncRef.current.reset();
+                dispatch({ type: "CLEAR_TRANSCRIPT" });
               }
               dispatch({ type: "ANNOUNCE", message: getCopy("scope.switchNotice") });
             });
@@ -1197,6 +1246,59 @@ export default function App() {
 
   const handleAppCommandRef = useRef(handleAppCommand);
   handleAppCommandRef.current = handleAppCommand;
+
+  const handleMarkSessionRead = useCallback(async (session: SessionSummary) => {
+    const targetScope: BridgeScope = {
+      connectionId: session.connectionId,
+      profileId: session.profileId,
+      sessionId: session.sessionId,
+    };
+    const res = await host.request(
+      "sessions.markRead",
+      {
+        connectionId: session.connectionId,
+        profileId: session.profileId,
+        sessionId: session.sessionId,
+      },
+      targetScope,
+    );
+    if (res.ok) {
+      dispatch({
+        type: "ANNOUNCE",
+        message: `${session.title} · ${getCopy("nav.markReadAction")}`,
+      });
+    }
+  }, []);
+
+  const handleFocusAttentionTarget = useCallback(
+    async (target: AttentionTarget) => {
+      const sameScope =
+        effectiveScope &&
+        effectiveScope.connectionId === target.connectionId &&
+        (effectiveScope.profileId ?? "default") === target.profileId;
+      if (sameScope) {
+        const match = state.sessions.find(
+          (s) =>
+            s.connectionId === target.connectionId &&
+            s.profileId === target.profileId &&
+            s.sessionId === target.sessionId,
+        );
+        if (match) {
+          await handleSelectSession(match);
+          return;
+        }
+      }
+      handleAppCommand({
+        type: "focus_scope",
+        scope: {
+          connectionId: target.connectionId,
+          profileId: target.profileId,
+          sessionId: target.sessionId,
+        },
+      });
+    },
+    [effectiveScope, handleAppCommand, handleSelectSession, state.sessions],
+  );
 
   // HostBridge bootstrap: hello -> chatState.get + local.inspect + fleet/chat.state/registry/capabilities subscriptions + commands
   useEffect(() => {
@@ -1673,6 +1775,7 @@ export default function App() {
                 supportedActions={state.transcript?.supportedActions ?? null}
                 methodTiers={state.capabilities.methodTiers}
                 onSelectSession={(s) => void handleSelectSession(s)}
+                onMarkSessionRead={(s) => void handleMarkSessionRead(s)}
                 onCopyCliCommand={() =>
                   dispatch({ type: "ANNOUNCE", message: getCopy("session.cli.copiedNotice") })
                 }
@@ -1832,6 +1935,45 @@ export default function App() {
                   )}
                 </>
               )}
+
+              {(() => {
+                const needsInputTarget =
+                  attentionSummary.needsInputTargets.find((t) => !t.isActive) ??
+                  attentionSummary.needsInputTargets[0] ??
+                  null;
+                const unreadTarget =
+                  attentionSummary.unreadTargets.find((t) => !t.isActive) ??
+                  attentionSummary.unreadTargets[0] ??
+                  null;
+                return (
+                  <>
+                    {attentionSummary.totalNeedsInput > 0 && needsInputTarget && (
+                      <button
+                        type="button"
+                        className="route-chip route-attention-chip is-needs-input"
+                        data-testid="route-strip-attention-needs-input"
+                        onClick={() => void handleFocusAttentionTarget(needsInputTarget)}
+                      >
+                        <span>
+                          {attentionSummary.totalNeedsInput} {getCopy("route.attentionNeedsInput")}
+                        </span>
+                      </button>
+                    )}
+                    {attentionSummary.totalUnread > 0 && unreadTarget && (
+                      <button
+                        type="button"
+                        className="route-chip route-attention-chip is-unread"
+                        data-testid="route-strip-attention-unread"
+                        onClick={() => void handleFocusAttentionTarget(unreadTarget)}
+                      >
+                        <span>
+                          {attentionSummary.totalUnread} {getCopy("route.attentionUnread")}
+                        </span>
+                      </button>
+                    )}
+                  </>
+                );
+              })()}
 
               <div className="route-actions">
                 <button
@@ -2220,6 +2362,7 @@ export default function App() {
             void handleCreateSession();
           }}
           onSelectSession={(s) => void handleSelectSession(s)}
+          onMarkSessionRead={(s) => void handleMarkSessionRead(s)}
           onCopyCliCommand={() =>
             dispatch({ type: "ANNOUNCE", message: getCopy("session.cli.copiedNotice") })
           }

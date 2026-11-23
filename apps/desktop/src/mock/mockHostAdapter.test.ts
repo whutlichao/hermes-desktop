@@ -776,3 +776,287 @@ describe("MockHostBridge Ticket #41 Subagents and Checkpoints contract (S0)", ()
     }
   });
 });
+
+describe("MockHostBridge Ticket #37 Background journal, attention, markRead, and resync_required contract (S0)", () => {
+  it("handles app.setFocused, sessions.markRead without switching active session, resync_required whole replacement, and cross-scope focus", async () => {
+    const prevFixture = (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__;
+    try {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              label: "This device",
+              kind: "local",
+              originDisplay: "127.0.0.1",
+              actual: "ready",
+              degraded: false,
+              latencyMs: 2,
+              nextRetryAt: null,
+            },
+            {
+              connectionId: "remote-ops",
+              label: "Remote Ops",
+              kind: "remote",
+              originDisplay: "https://ops.example.com",
+              actual: "ready",
+              degraded: false,
+              latencyMs: 18,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+            {
+              connectionId: "remote-ops",
+              profileId: "ops",
+              displayName: "Ops",
+              handle: "ops",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "s-fg",
+              title: "Foreground Session",
+              preview: "Active",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "s-bg-unread",
+              title: "Background Unread",
+              preview: "2 updates",
+              updatedAt: "2026-11-23T09:01:00.000Z",
+              pinned: true,
+              pinnedReasons: { unread: true },
+              unreadCount: 2,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "s-bg-overflow",
+              title: "Overflowed Session",
+              preview: "Needs resync",
+              updatedAt: "2026-11-23T09:02:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "remote-ops",
+              profileId: "ops",
+              sessionId: "s-remote-approval",
+              title: "Remote Approval",
+              preview: "Needs approval",
+              updatedAt: "2026-11-23T09:03:00.000Z",
+              pinned: true,
+              pinnedReasons: { pendingInput: true, unread: true },
+              unreadCount: 1,
+              needsInput: true,
+              activeTurnId: "turn-remote-1",
+              status: "running",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "s-fg" },
+          activeSessionId: "s-fg",
+        },
+        resyncRequiredSessions: {
+          "local::default::s-bg-overflow": true,
+        },
+        transcripts: {
+          "local::default::s-bg-overflow": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "s-bg-overflow",
+            messages: [
+              {
+                messageId: "m-stale",
+                sessionId: "s-bg-overflow",
+                role: "assistant",
+                text: "Stale partial history",
+                createdAt: "2026-11-23T09:00:00.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+          "remote-ops::ops::s-remote-approval": {
+            connectionId: "remote-ops",
+            profileId: "ops",
+            sessionId: "s-remote-approval",
+            messages: [
+              {
+                messageId: "m-remote",
+                sessionId: "s-remote-approval",
+                role: "assistant",
+                text: "Remote scope awaiting user decision",
+                createdAt: "2026-11-23T09:03:00.000Z",
+              },
+            ],
+            activeTurnId: "turn-remote-1",
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        resyncedTranscripts: {
+          "local::default::s-bg-overflow": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "s-bg-overflow",
+            messages: [
+              {
+                messageId: "m-clean",
+                sessionId: "s-bg-overflow",
+                role: "assistant",
+                text: "Whole replaced gateway history",
+                createdAt: "2026-11-23T09:02:30.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+      };
+
+      const mock = createMockHostBridge();
+      const fleetSnapshots: Array<{ activeSessionId: string | null; sessions: Array<{ sessionId: string; unreadCount: number; pinned: boolean }> }> = [];
+      const unsubFleet = mock.subscribe("fleet", null, (ev) => {
+        fleetSnapshots.push(ev.payload as (typeof fleetSnapshots)[number]);
+      });
+
+      const blurRes = await mock.request<{ ok: boolean; focused: boolean }>("app.setFocused", {
+        focused: false,
+      });
+      expect(blurRes.ok && blurRes.value.focused).toBe(false);
+      const focusRes = await mock.request<{ ok: boolean; focused: boolean }>("app.setFocused", {
+        focused: true,
+      });
+      expect(focusRes.ok && focusRes.value.focused).toBe(true);
+
+      // Mark background session read without switching active session
+      const markRes = await mock.request<{ ok: boolean; sessionId: string; unreadCount: number }>(
+        "sessions.markRead",
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-unread" },
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-unread" },
+      );
+      expect(markRes.ok && markRes.value.unreadCount).toBe(0);
+
+      await new Promise((r) => setTimeout(r, 0));
+      const latestFleet = fleetSnapshots[fleetSnapshots.length - 1];
+      expect(latestFleet.activeSessionId).toBe("s-fg");
+      const bgAfterMark = latestFleet.sessions.find((s) => s.sessionId === "s-bg-unread");
+      expect(bgAfterMark?.unreadCount).toBe(0);
+      expect(bgAfterMark?.pinned).toBe(false);
+
+      // Selecting overflowed session emits resyncRequired and stream emits resync_required -> sessions.resume returns whole replacement
+      const selectOverflow = await mock.request<{
+        transcript?: { messages: Array<{ text: string }> } | null;
+        resyncRequired?: boolean;
+      }>(
+        "sessions.select",
+        { sessionId: "s-bg-overflow", profileId: "default" },
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
+      );
+      expect(selectOverflow.ok).toBe(true);
+      if (selectOverflow.ok) {
+        expect(selectOverflow.value.resyncRequired).toBe(true);
+        expect(selectOverflow.value.transcript).toBeNull();
+      }
+
+      const subEvents: BridgeEvent[] = [];
+      const unsubTx = mock.subscribe(
+        "session.transcript",
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
+        (ev) => subEvents.push(ev),
+      );
+      await new Promise((r) => setTimeout(r, 0));
+      expect(subEvents.some((e) => e.kind === "resync_required")).toBe(true);
+      unsubTx();
+
+      const resumeRes = await mock.request<{
+        transcript: { messages: Array<{ text: string }>; resynced?: boolean };
+      }>(
+        "sessions.resume",
+        { sessionId: "s-bg-overflow", profileId: "default", resync: true },
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
+      );
+      expect(resumeRes.ok).toBe(true);
+      if (resumeRes.ok) {
+        expect(resumeRes.value.transcript.resynced).toBe(true);
+        expect(resumeRes.value.transcript.messages[0]?.text).toBe("Whole replaced gateway history");
+      }
+
+      // Cross-scope focus to remote-ops/ops/s-remote-approval
+      const switchRes = await mock.request<{
+        ok: boolean;
+        fleet: { activeScope: { connectionId: string; profileId?: string; sessionId?: string } | null; activeSessionId: string | null };
+        transcript: { messages: Array<{ text: string }> } | null;
+      }>(
+        "scopes.switch",
+        { connectionId: "remote-ops", profileId: "ops", sessionId: "s-remote-approval" },
+        { connectionId: "remote-ops", profileId: "ops", sessionId: "s-remote-approval" },
+      );
+      expect(switchRes.ok).toBe(true);
+      if (switchRes.ok) {
+        expect(switchRes.value.fleet.activeScope?.connectionId).toBe("remote-ops");
+        expect(switchRes.value.fleet.activeScope?.profileId).toBe("ops");
+        expect(switchRes.value.fleet.activeSessionId).toBe("s-remote-approval");
+        expect(switchRes.value.transcript?.messages[0]?.text).toBe(
+          "Remote scope awaiting user decision",
+        );
+      }
+
+      unsubFleet();
+    } finally {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
+    }
+  });
+});

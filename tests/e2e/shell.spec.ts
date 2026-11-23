@@ -2198,3 +2198,287 @@ test.describe("Ticket #41 Subagents (list/steer/interrupt/tail) and Checkpoint (
     );
   });
 });
+
+test.describe("Ticket #37 Background journal, attention badges, unread mark-read, and resync_required", () => {
+  test("never fetches full transcript for background sessions on boot, clears unread without switching active session, resyncs overflowed session cleanly, and focuses exact Scope from route strip badges without global approval actions", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              desired: "enabled",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 3,
+              nextRetryAt: null,
+            },
+            {
+              connectionId: "remote-ops",
+              kind: "remote",
+              label: "Remote Ops",
+              originDisplay: "https://ops.example.com",
+              desired: "enabled",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 14,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              desired: "enabled",
+              actual: "ready",
+              degraded: false,
+            },
+            {
+              connectionId: "remote-ops",
+              profileId: "ops",
+              displayName: "Ops",
+              handle: "ops",
+              isDefault: true,
+              desired: "enabled",
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "s-fg",
+              title: "当前前台会话",
+              preview: "Active foreground",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "s-bg-unread",
+              title: "后台未读会话",
+              preview: "2 条新进展",
+              updatedAt: "2026-11-23T09:01:00.000Z",
+              pinned: true,
+              pinnedReasons: { unread: true },
+              unreadCount: 2,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "s-bg-overflow",
+              title: "溢出待同步会话",
+              preview: "需要重同步",
+              updatedAt: "2026-11-23T09:02:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "remote-ops",
+              profileId: "ops",
+              sessionId: "s-remote-approval",
+              title: "远程审批会话",
+              preview: "等待确认",
+              updatedAt: "2026-11-23T09:03:00.000Z",
+              pinned: true,
+              pinnedReasons: { pendingInput: true, unread: true },
+              unreadCount: 1,
+              needsInput: true,
+              activeTurnId: "turn-remote-1",
+              status: "running",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "s-fg" },
+          activeSessionId: "s-fg",
+        },
+        resyncRequiredSessions: {
+          "local::default::s-bg-overflow": true,
+        },
+        transcripts: {
+          "local::default::s-fg": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "s-fg",
+            messages: [
+              {
+                messageId: "m-fg",
+                sessionId: "s-fg",
+                role: "assistant",
+                text: "Foreground session ready",
+                createdAt: "2026-11-23T09:00:00.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+          "local::default::s-bg-overflow": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "s-bg-overflow",
+            messages: [
+              {
+                messageId: "m-stale",
+                sessionId: "s-bg-overflow",
+                role: "assistant",
+                text: "Stale partial history",
+                createdAt: "2026-11-23T09:00:30.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+          "remote-ops::ops::s-remote-approval": {
+            connectionId: "remote-ops",
+            profileId: "ops",
+            sessionId: "s-remote-approval",
+            messages: [
+              {
+                messageId: "m-remote",
+                sessionId: "s-remote-approval",
+                role: "assistant",
+                text: "Remote scope awaiting user decision",
+                createdAt: "2026-11-23T09:03:00.000Z",
+              },
+            ],
+            activeTurnId: "turn-remote-1",
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        resyncedTranscripts: {
+          "local::default::s-bg-overflow": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "s-bg-overflow",
+            messages: [
+              {
+                messageId: "m-clean",
+                sessionId: "s-bg-overflow",
+                role: "assistant",
+                text: "Whole replaced gateway history",
+                createdAt: "2026-11-23T09:02:30.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await expect(page.locator(".transcript-list")).toContainText("Foreground session ready");
+    // Background sessions must NOT trigger sessions.resume on boot
+    const bootCounts = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__?: { sessionsResumeCalls: number } }).__HERMES_E2E_COUNTS__,
+    );
+    expect(bootCounts?.sessionsResumeCalls ?? 0).toBe(0);
+
+    // Rail renders unread badge + pinned badge + sibling 标记已读 button, with zero Approve/Deny buttons
+    const sidebar = page.locator("nav.sidebar");
+    await expect(sidebar).toContainText("后台未读会话");
+    await expect(sidebar).toContainText("2 条未读");
+    await expect(sidebar).toContainText("已固定");
+    await expect(sidebar.getByRole("button", { name: /Approve|Deny|批准|拒绝/ })).toHaveCount(0);
+
+    const markReadBtn = sidebar.getByTestId("session-mark-read-s-bg-unread");
+    await expect(markReadBtn).toBeVisible();
+    await markReadBtn.click();
+
+    // Unread clears while staying on active foreground session
+    await expect(sidebar.getByTestId("session-mark-read-s-bg-unread")).toHaveCount(0);
+    await expect(sidebar).not.toContainText("2 条未读");
+    await expect(page.locator(".transcript-list")).toContainText("Foreground session ready");
+
+    // Switching to overflowed background session triggers resync_required -> sessions.resume -> whole replacement
+    await sidebar.getByRole("button", { name: /溢出待同步会话/ }).click();
+    await expect(page.locator(".transcript-list")).toContainText("Whole replaced gateway history");
+    await expect(page.locator(".transcript-list")).not.toContainText("Stale partial history");
+
+    const afterResyncCounts = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__?: { sessionsResumeCalls: number } }).__HERMES_E2E_COUNTS__,
+    );
+    expect(afterResyncCounts?.sessionsResumeCalls).toBe(1);
+
+    // Route strip renders attention badges (navigation only, no approval action controls)
+    const routeStrip = page.locator(".route-strip");
+    await expect(routeStrip.getByRole("button", { name: /Approve|Deny|批准|拒绝/ })).toHaveCount(0);
+    const needsInputBadge = routeStrip.getByTestId("route-strip-attention-needs-input");
+    await expect(needsInputBadge).toBeVisible();
+    await expect(needsInputBadge).toContainText("1");
+
+    // 1280x800 popover still exposes session badges cleanly without global approval inbox
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await routeStrip.getByRole("button", { name: /Sessions\s+3/ }).click();
+    const popover = page.getByRole("dialog", { name: "Sessions" });
+    await expect(popover).toBeVisible();
+    await expect(popover).toContainText("后台未读会话");
+    await expect(popover.getByRole("button", { name: /Approve|Deny|批准|拒绝/ })).toHaveCount(0);
+    await page.keyboard.press("Escape");
+
+    // Clicking route strip needsInput badge focuses exact cross-Scope remote-ops/ops/s-remote-approval
+    await needsInputBadge.click();
+    await expect(routeStrip).toContainText("Remote Ops");
+    await expect(routeStrip).toContainText("Ops");
+    await expect(page.locator(".transcript-list")).toContainText("Remote scope awaiting user decision");
+  });
+});

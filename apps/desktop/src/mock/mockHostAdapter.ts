@@ -52,6 +52,7 @@ import {
   CapabilityRegistry,
   SETTINGS_FIELD_CATALOG,
   boundSubagentTailLines,
+  computeSessionPinned,
   createBridgeDispatcher,
   createEmptyRegistryDocument,
   diffRegistries,
@@ -117,6 +118,7 @@ interface MockE2EFixture {
   chatState?: ChatSessionProjection;
   transcripts?: Record<string, SessionTranscriptSnapshot>;
   resyncedTranscripts?: Record<string, SessionTranscriptSnapshot>;
+  resyncRequiredSessions?: Record<string, boolean>;
   transcriptEventsOnSubscribe?: Record<string, BridgeEvent[]>;
   artifacts?: Record<string, WorkspaceArtifactItem[]>;
   artifactsStale?: Record<string, boolean>;
@@ -266,12 +268,27 @@ export function createMockHostBridge(): HermesHost {
   const resyncedTranscriptMap = new Map<string, SessionTranscriptSnapshot>(
     Object.entries(fixture?.resyncedTranscripts ?? {}),
   );
+  const resyncRequiredSet = new Set<string>(
+    Object.entries(fixture?.resyncRequiredSessions ?? {})
+      .filter(([, required]) => Boolean(required))
+      .map(([key]) => key),
+  );
   const emittedTranscriptSubs = new Set<string>();
+  let mockWindowFocused = true;
+
+  const isResyncRequired = (cid: string, pid: string, sid: string): boolean =>
+    resyncRequiredSet.has(`${cid}::${pid}::${sid}`) || resyncRequiredSet.has(sid);
+
+  const clearResyncRequired = (cid: string, pid: string, sid: string): void => {
+    resyncRequiredSet.delete(`${cid}::${pid}::${sid}`);
+    resyncRequiredSet.delete(sid);
+  };
 
   const e2eCounts = {
     sessionsCreateCalls: 0,
     sessionsResumeCalls: 0,
     sessionsSelectCalls: 0,
+    sessionsMarkReadCalls: 0,
     connectionsRetryCalls: 0,
   };
   if (fixture) {
@@ -1493,13 +1510,20 @@ export function createMockHostBridge(): HermesHost {
           activeStatus: nextSessionId ? "ready" : "empty",
           missingSession: null,
         };
-        const transcript = nextSessionId
-          ? lookupTranscript(transcriptMap, cid, pid, nextSessionId) ??
-            makeEmptyTranscript(cid, pid, nextSessionId)
-          : null;
+        const needsResync = nextSessionId ? isResyncRequired(cid, pid, nextSessionId) : false;
+        const transcript =
+          nextSessionId && !needsResync
+            ? lookupTranscript(transcriptMap, cid, pid, nextSessionId) ??
+              makeEmptyTranscript(cid, pid, nextSessionId)
+            : null;
         emitFleetSnapshot();
         emitChatStatePatch();
-        return { ok: true, fleet: currentFleet, transcript };
+        return {
+          ok: true,
+          fleet: currentFleet,
+          transcript,
+          ...(needsResync ? { resyncRequired: true } : {}),
+        };
       }
       const cid =
         typeof payload.connectionId === "string" && payload.connectionId
@@ -1746,10 +1770,14 @@ export function createMockHostBridge(): HermesHost {
           },
           activeSessionId: nextSessionId,
         };
-        const transcript = nextSessionId
-          ? lookupTranscript(transcriptMap, connectionId, profileId, nextSessionId) ??
-            makeEmptyTranscript(connectionId, profileId, nextSessionId)
-          : undefined;
+        const needsResync = nextSessionId
+          ? isResyncRequired(connectionId, profileId, nextSessionId)
+          : false;
+        const transcript =
+          nextSessionId && !needsResync
+            ? lookupTranscript(transcriptMap, connectionId, profileId, nextSessionId) ??
+              makeEmptyTranscript(connectionId, profileId, nextSessionId)
+            : null;
         currentChatState = {
           ...currentChatState,
           lastActiveChat: {
@@ -1762,7 +1790,11 @@ export function createMockHostBridge(): HermesHost {
         };
         emitFleetSnapshot();
         emitChatStatePatch();
-        return { transcript, fleet: currentFleet };
+        return {
+          transcript,
+          fleet: currentFleet,
+          ...(needsResync ? { resyncRequired: true } : {}),
+        };
       }
 
       const cid =
@@ -1814,6 +1846,7 @@ export function createMockHostBridge(): HermesHost {
           snapshotSeq: 0,
           ...(resync ? { resynced: true } : {}),
         };
+        clearResyncRequired(connectionId, profileId, sessionId);
         transcriptMap.set(`${connectionId}::${profileId}::${sessionId}`, transcript);
         return { transcript };
       }
@@ -1838,6 +1871,99 @@ export function createMockHostBridge(): HermesHost {
       return {
         transcript: mockTranscripts.get(transcriptKey(cid, pid, sid)) ?? null,
       };
+    },
+    "sessions.markRead": async (payload, scope) => {
+      e2eCounts.sessionsMarkReadCalls += 1;
+      if (fixture) {
+        const connectionId =
+          typeof payload.connectionId === "string" && payload.connectionId
+            ? payload.connectionId
+            : scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+        const profileId =
+          typeof payload.profileId === "string" && payload.profileId
+            ? payload.profileId
+            : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+        const sessionId =
+          typeof payload.sessionId === "string" && payload.sessionId
+            ? payload.sessionId
+            : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+        if (!sessionId) {
+          const err = new Error("Missing target sessionId");
+          (err as { code?: string }).code = "invalid_request";
+          throw err;
+        }
+        currentFleet = {
+          ...currentFleet,
+          sessions: currentFleet.sessions.map((s) => {
+            if (
+              s.connectionId !== connectionId ||
+              s.profileId !== profileId ||
+              s.sessionId !== sessionId
+            ) {
+              return s;
+            }
+            const nextPinnedReasons = {
+              ...(s.pinnedReasons ?? {}),
+              runningTurn: s.status === "running" || Boolean(s.activeTurnId),
+              pendingInput: s.needsInput,
+              unread: false,
+              queuedAdmission: s.queuedAdmission,
+            };
+            return {
+              ...s,
+              unreadCount: 0,
+              lastReadSeq: s.progressSeq ?? s.lastReadSeq,
+              pinnedReasons: nextPinnedReasons,
+              pinned: computeSessionPinned(nextPinnedReasons, 0),
+            };
+          }),
+        };
+        emitSessionsSnapshot();
+        emitFleetSnapshot();
+        return { ok: true, connectionId, profileId, sessionId, unreadCount: 0 };
+      }
+
+      const cid =
+        typeof payload.connectionId === "string" && payload.connectionId
+          ? payload.connectionId
+          : scope?.connectionId ?? mockActiveScope?.connectionId ?? "local";
+      const pid =
+        typeof payload.profileId === "string" && payload.profileId
+          ? payload.profileId
+          : scope?.profileId ?? mockActiveScope?.profileId ?? "default";
+      const sid =
+        typeof payload.sessionId === "string" && payload.sessionId
+          ? payload.sessionId
+          : scope?.sessionId ?? mockActiveSessionId ?? "";
+      if (!sid) {
+        const err = new Error("Missing target sessionId");
+        (err as { code?: string }).code = "invalid_request";
+        throw err;
+      }
+      for (let i = 0; i < mockSessions.length; i += 1) {
+        const s = mockSessions[i];
+        if (s.connectionId === cid && s.profileId === pid && s.sessionId === sid) {
+          const nextPinnedReasons = {
+            ...(s.pinnedReasons ?? {}),
+            runningTurn: s.status === "running" || Boolean(s.activeTurnId),
+            pendingInput: s.needsInput,
+            unread: false,
+            queuedAdmission: s.queuedAdmission,
+          };
+          mockSessions[i] = {
+            ...s,
+            unreadCount: 0,
+            pinnedReasons: nextPinnedReasons,
+            pinned: computeSessionPinned(nextPinnedReasons, 0),
+          };
+        }
+      }
+      emitMockFleet();
+      return { ok: true, connectionId: cid, profileId: pid, sessionId: sid, unreadCount: 0 };
+    },
+    "app.setFocused": async (payload) => {
+      mockWindowFocused = Boolean(payload.focused);
+      return { ok: true, focused: mockWindowFocused };
     },
     "chatState.get": async () => currentChatState,
     "chatState.dismissRouteBanner": async () => {
@@ -2728,11 +2854,22 @@ export function createMockHostBridge(): HermesHost {
         const sid = scope.sessionId;
         const cid = scope.connectionId ?? "local";
         const pid = scope.profileId ?? "default";
-        const snap =
-          lookupTranscript(transcriptMap, cid, pid, sid) ?? makeEmptyTranscript(cid, pid, sid);
         let active = true;
         queueMicrotask(() => {
           if (!active) return;
+          if (isResyncRequired(cid, pid, sid)) {
+            listener({
+              topic: "session.transcript",
+              scope,
+              kind: "resync_required",
+              seq: 0,
+              revision: 1,
+              payload: { reason: "overflow" },
+            });
+            return;
+          }
+          const snap =
+            lookupTranscript(transcriptMap, cid, pid, sid) ?? makeEmptyTranscript(cid, pid, sid);
           listener({
             topic: "session.transcript",
             scope,

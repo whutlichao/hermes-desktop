@@ -375,4 +375,120 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await drawer.getByRole("tab", { name: "Terminal" }).click();
     await checkAxe("workspace terminal tab");
   });
+
+  test("passes axe-core serious/critical = 0 on background attention badges, mark-read action, route attention chips, and 1280 popover (Ticket #37)", async ({
+    page,
+  }) => {
+    const checkAxe = async (label: string) => {
+      const results = await new AxeBuilder({ page }).analyze();
+      const severe = results.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(severe, `axe serious/critical violations on ${label}`).toEqual([]);
+    };
+
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              desired: "enabled",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 3,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              desired: "enabled",
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-active",
+              title: "Active Session",
+              preview: "Ready",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-unread-input",
+              title: "Needs Attention Session",
+              preview: "Waiting decision",
+              updatedAt: "2026-11-23T09:01:00.000Z",
+              pinned: true,
+              pinnedReasons: { pendingInput: true, unread: true },
+              unreadCount: 3,
+              needsInput: true,
+              activeTurnId: "t-1",
+              status: "running",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-active" },
+          activeSessionId: "sess-active",
+        },
+        transcripts: {
+          "local::default::sess-active": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-active",
+            messages: [
+              {
+                messageId: "m-1",
+                sessionId: "sess-active",
+                role: "assistant",
+                text: "Foreground thread",
+                createdAt: "2026-11-23T09:00:00.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    await expect(page.getByTestId("session-mark-read-sess-unread-input")).toBeVisible();
+    await expect(page.getByTestId("route-strip-attention-needs-input")).toBeVisible();
+    await expect(page.getByTestId("route-strip-attention-unread")).toBeVisible();
+    await checkAxe("1440 rail + route strip attention badges");
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.getByRole("button", { name: /Sessions\s+2/ }).click();
+    await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
+    await checkAxe("1280 popover with attention badges");
+  });
 });

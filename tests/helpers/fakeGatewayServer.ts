@@ -67,6 +67,11 @@ export interface FakeGatewayServerHandle {
   wsUrl: string;
   connections: FakeGatewayConnectionRecord[];
   rpcCalls: Array<{ method: string; params: Record<string, unknown> }>;
+  sendNotification: (method: string, params: Record<string, unknown>) => void;
+  setTranscriptMessages: (
+    sessionId: string,
+    messages: Array<{ message_id: string; role: "user" | "assistant" | "system"; text: string; created_at: string }>,
+  ) => void;
   closeAllClients: () => void;
   close: () => Promise<void>;
 }
@@ -358,6 +363,17 @@ export async function startFakeGatewayServer(
     wsUrl: `ws://127.0.0.1:${addr.port}/api/ws`,
     connections,
     rpcCalls,
+    sendNotification(method: string, params: Record<string, unknown>) {
+      const frame = encodeServerTextFrame(JSON.stringify({ jsonrpc: "2.0", method, params }));
+      for (const sock of activeSockets) {
+        if (!sock.destroyed) {
+          sock.write(frame);
+        }
+      }
+    },
+    setTranscriptMessages(sessionId, messages) {
+      transcripts.set(sessionId, [...messages]);
+    },
     closeAllClients() {
       for (const sock of activeSockets) {
         sock.destroy();

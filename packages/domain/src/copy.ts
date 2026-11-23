@@ -464,6 +464,13 @@ export const COPY_CATALOG = {
   "settings.field.chat.stream_tokens": "流式输出响应",
   "settings.diagnosticsOpenModalAction": "打开完整诊断视图",
   "settings.diagnosticsExportAction": "刷新并复制脱敏诊断 JSON",
+  "nav.markReadAction": "标记已读",
+  "nav.markReadAria": "标记为已读",
+  "nav.unreadBadge": "条未读",
+  "nav.needsInputBadge": "待处理 Approval",
+  "nav.pinnedBadge": "已固定",
+  "route.attentionNeedsInput": "待处理 Approval",
+  "route.attentionUnread": "未读进展",
 } as const;
 
 export type CopyKey = keyof typeof COPY_CATALOG;

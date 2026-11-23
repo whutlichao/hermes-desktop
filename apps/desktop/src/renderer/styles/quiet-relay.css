@@ -256,8 +256,9 @@ button {
 
 .route-strip {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px 10px;
   min-height: 44px;
   padding: 6px 16px;
   border-bottom: 1px solid var(--line);
@@ -2059,5 +2060,54 @@ button {
 .workspace-line-num {
   color: var(--muted);
   user-select: none;
+}
+
+.session-item-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-item-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.session-item-badges .status-pill {
+  min-height: 20px;
+  padding: 0 6px;
+  font-size: 10.5px;
+}
+
+.session-mark-read-btn {
+  align-self: flex-start;
+  min-height: 28px;
+  padding: 2px 8px;
+  border: 1px solid var(--control-line);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.session-mark-read-btn:hover {
+  background: var(--paper-deep);
+}
+
+.route-attention-chip.is-needs-input {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.route-attention-chip.is-unread {
+  border-color: var(--control-line);
+  background: var(--paper-deep);
+  color: var(--ink);
+  font-weight: 500;
 }
 
