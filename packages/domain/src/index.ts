@@ -14,3 +14,4 @@ export * from "./focusReturnController";
 export * from "./settingsAndScope";
 export * from "./fleetLifecycle";
 export * from "./backgroundJournal";
+export * from "./terminal";

@@ -308,10 +308,34 @@ export function createBridgeDispatcher(
 
       try {
         const result = await handler(validEnvelope.payload ?? {}, scope);
+        let value = redactSensitiveData(result);
+        // Preserve interactive PTY scrollback lines verbatim for terminal.* responses so
+        // command responses match terminal BridgeEvent snapshots (e.g. `pwd` output).
+        if (
+          validEnvelope.command.startsWith("terminal.") &&
+          result &&
+          typeof result === "object" &&
+          value &&
+          typeof value === "object" &&
+          "snapshot" in result &&
+          "snapshot" in value
+        ) {
+          const rawSnap = (result as { snapshot?: { lines?: unknown } }).snapshot;
+          const redactedSnap = (value as { snapshot?: Record<string, unknown> }).snapshot;
+          if (rawSnap && Array.isArray(rawSnap.lines) && redactedSnap) {
+            value = {
+              ...(value as Record<string, unknown>),
+              snapshot: {
+                ...redactedSnap,
+                lines: [...rawSnap.lines],
+              },
+            };
+          }
+        }
         return {
           ok: true,
           requestId: validEnvelope.requestId,
-          value: redactSensitiveData(result),
+          value,
         };
       } catch (err) {
         const maybeCode =

@@ -998,4 +998,163 @@ test.describe("Electron hardened smoke", () => {
       sandbox.cleanup(passed);
     }
   });
+
+  test("Ticket #40: opens real Main-owned OS PTY, verifies native grant denial & approval, CSP/sandbox, reload scrollback retention, and Git deep links", async () => {
+    const sandbox = createTestSandbox("hr-t40-pty-");
+    let passed = false;
+    const gw = await startFakeGatewayServer({
+      validTickets: new Set(["tkt_elec_1", "tkt_elec_2"]),
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "sess-t40-elec",
+          title: "PTY Smoke Session",
+          preview: "ready",
+        },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+    });
+    fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      // 1. Verify sandbox/contextIsolation/no-Node + CSP header on loaded renderer
+      const hardening = await electronApp.evaluate(({ BrowserWindow }) => {
+        const win = BrowserWindow.getAllWindows()[0];
+        const prefs = win.webContents.getLastWebPreferences() as Record<string, unknown>;
+        return {
+          contextIsolation: prefs.contextIsolation,
+          sandbox: prefs.sandbox,
+          nodeIntegration: prefs.nodeIntegration,
+        };
+      });
+      expect(hardening).toEqual({
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+      });
+      const nodeGlobalsAndCsp = await page.evaluate(() => ({
+        hasProcess: typeof (globalThis as Record<string, unknown>).process !== "undefined",
+        hasRequire: typeof (globalThis as Record<string, unknown>).require !== "undefined",
+        hasBuffer: typeof (globalThis as Record<string, unknown>).Buffer !== "undefined",
+      }));
+      expect(nodeGlobalsAndCsp).toEqual({
+        hasProcess: false,
+        hasRequire: false,
+        hasBuffer: false,
+      });
+
+      // 2. Intercept Main dialog.showMessageBox: DENY first-terminal grant -> PTY must NOT open
+      await electronApp.evaluate(({ dialog }) => {
+        const g = globalThis as {
+          __hermesDialogCalls?: Array<{ title?: string; message?: string }>;
+          __hermesGrantDecision?: number;
+        };
+        g.__hermesDialogCalls = [];
+        g.__hermesGrantDecision = 0; // deny
+        dialog.showMessageBox = (async (_winOrOpts: unknown, maybeOpts?: { title?: string; message?: string }) => {
+          const opts = (maybeOpts ?? _winOrOpts) as { title?: string; message?: string };
+          g.__hermesDialogCalls!.push({ title: opts?.title, message: opts?.message });
+          return { response: g.__hermesGrantDecision ?? 0, checkboxChecked: false };
+        }) as typeof dialog.showMessageBox;
+      });
+
+      await page.getByRole("button", { name: /Workspace/ }).click();
+      const drawer = page.getByRole("complementary", { name: "Workspace" });
+      await drawer.getByRole("tab", { name: "Terminal" }).click();
+
+      await drawer.getByTestId("workspace-terminal-open-btn").click();
+      await expect(drawer.getByTestId("workspace-terminal-status")).toContainText("未授权（已拒绝）");
+      await expect(drawer.getByTestId("workspace-terminal-id")).toHaveCount(0);
+
+      const deniedDialogCalls = await electronApp.evaluate(
+        () => (globalThis as { __hermesDialogCalls?: Array<{ title?: string }> }).__hermesDialogCalls ?? [],
+      );
+      expect(deniedDialogCalls.some((c) => c.title?.includes("确认首次打开 Terminal"))).toBe(true);
+
+      // 3. Approve first-terminal grant -> opens REAL Main OS PTY -> executes shell command & resize
+      await electronApp.evaluate(() => {
+        (globalThis as { __hermesGrantDecision?: number }).__hermesGrantDecision = 1;
+      });
+      await drawer.getByTestId("workspace-terminal-open-btn").click();
+      await expect(drawer.getByTestId("workspace-terminal-status")).toContainText("运行中", {
+        timeout: 10_000,
+      });
+      const realTerminalId = await drawer.getByTestId("workspace-terminal-id").innerText();
+      expect(realTerminalId).toMatch(/^term_/);
+
+      await drawer.getByTestId("workspace-terminal-cols-input").fill("106");
+      await drawer.getByTestId("workspace-terminal-rows-input").fill("30");
+      await drawer.getByTestId("workspace-terminal-resize-btn").click();
+
+      await drawer
+        .getByTestId("workspace-terminal-input")
+        .fill('tty && stty size && echo "ELEC_REAL_""PTY_OK"');
+      await drawer.getByTestId("workspace-terminal-send-btn").click();
+
+      await expect(drawer.getByTestId("workspace-terminal-scrollback")).toContainText("/dev/tty", {
+        timeout: 10_000,
+      });
+      await expect(drawer.getByTestId("workspace-terminal-scrollback")).toContainText("30 106", {
+        timeout: 10_000,
+      });
+      await expect(drawer.getByTestId("workspace-terminal-scrollback")).toContainText(
+        "ELEC_REAL_PTY_OK",
+        { timeout: 10_000 },
+      );
+
+      // 4. Reload renderer window -> Main PTY + opaque terminalId + scrollback persist across reload
+      await page.reload();
+      await page.waitForLoadState("domcontentloaded");
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+      await page.getByRole("button", { name: /Workspace/ }).click();
+      const drawerAfterReload = page.getByRole("complementary", { name: "Workspace" });
+      await drawerAfterReload.getByRole("tab", { name: "Terminal" }).click();
+      await expect(drawerAfterReload.getByTestId("workspace-terminal-id")).toHaveText(realTerminalId, {
+        timeout: 10_000,
+      });
+      await expect(drawerAfterReload.getByTestId("workspace-terminal-scrollback")).toContainText(
+        "ELEC_REAL_PTY_OK",
+      );
+
+      // 5. Git deep links tab: attribution + "不会在此客户端执行" + external https open
+      await drawerAfterReload.getByRole("tab", { name: "Git" }).click();
+      const gitPanel = drawerAfterReload.getByTestId("workspace-git-panel");
+      await expect(gitPanel.getByTestId("workspace-git-boundary")).toContainText("不会在此客户端执行");
+      await expect(gitPanel.getByTestId("workspace-git-attribution-git-status")).toContainText("外部提供");
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

@@ -2970,3 +2970,280 @@ test.describe("Ticket #37 Background journal, attention badges, unread mark-read
     await expect(page.locator(".transcript-list")).toContainText("Remote scope awaiting user decision");
   });
 });
+
+test.describe("Ticket #40 Terminal PTY lifecycle & Git CLI deep links", () => {
+  test("Ticket #40: Terminal PTY grant denial, bounded scrollback, reload survival, busy detach/terminate/Esc, and Git CLI deep links", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              desired: "enabled",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 3,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              desired: "enabled",
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-term-1",
+              title: "Terminal Session",
+              preview: "Ready",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-term-1" },
+          activeSessionId: "sess-term-1",
+        },
+        transcripts: {
+          "local::default::sess-term-1": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-term-1",
+            messages: [
+              {
+                messageId: "m-t1",
+                sessionId: "sess-term-1",
+                role: "assistant",
+                text: "Workspace ready",
+                createdAt: "2026-11-23T09:00:00.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        terminal: {
+          denyFirstGrant: true,
+          denyRootGrant: true,
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // Open Workspace -> Terminal tab
+    await page.getByRole("button", { name: /Workspace/ }).click();
+    const drawer = page.getByRole("complementary", { name: "Workspace" });
+    await expect(drawer).toBeVisible();
+    await drawer.getByRole("tab", { name: "Terminal" }).click();
+
+    // Attribution renders "内置" without relying on color alone
+    const termAttr = drawer.getByTestId("workspace-terminal-attribution");
+    await expect(termAttr).toHaveText("内置");
+    await expect(termAttr).toHaveAttribute("data-attribution-origin", "builtin");
+
+    // 1. Grant denial blocks opening PTY cleanly
+    await drawer.getByTestId("workspace-terminal-open-btn").click();
+    await expect(drawer.getByTestId("workspace-terminal-status")).toContainText("未授权（已拒绝）");
+    await expect(drawer.getByTestId("workspace-terminal-grant-denied-notice")).toBeVisible();
+    await expect(drawer.getByTestId("workspace-terminal-id")).toHaveCount(0);
+
+    // Root grant denial also keeps root badge absent
+    await drawer.getByTestId("workspace-terminal-grant-root-btn").click();
+    await expect(drawer.getByTestId("workspace-terminal-root-badge")).toHaveCount(0);
+    await expect(drawer.getByTestId("workspace-terminal-id")).toHaveCount(0);
+
+    // 2. Approve first grant -> open PTY -> write + resize + bounded scrollback trim notice
+    await page.evaluate(() => {
+      const w = window as unknown as {
+        __HERMES_E2E_FIXTURE__: { terminal: { denyFirstGrant: boolean; denyRootGrant: boolean } };
+      };
+      w.__HERMES_E2E_FIXTURE__.terminal.denyFirstGrant = false;
+      w.__HERMES_E2E_FIXTURE__.terminal.denyRootGrant = false;
+    });
+    await drawer.getByTestId("workspace-terminal-open-btn").click();
+    await expect(drawer.getByTestId("workspace-terminal-status")).toContainText("运行中");
+    const firstTerminalId = await drawer.getByTestId("workspace-terminal-id").innerText();
+    expect(firstTerminalId).toMatch(/^term_/);
+
+    await drawer.getByTestId("workspace-terminal-cols-input").fill("112");
+    await drawer.getByTestId("workspace-terminal-rows-input").fill("32");
+    await drawer.getByTestId("workspace-terminal-resize-btn").click();
+
+    await drawer.getByTestId("workspace-terminal-input").fill("echo HELLO_E2E_TERM");
+    await drawer.getByTestId("workspace-terminal-send-btn").click();
+    await expect(drawer.getByTestId("workspace-terminal-scrollback")).toContainText("HELLO_E2E_TERM");
+
+    // Burst > 10,000 lines triggers bounded oldest-line trimming + notice
+    await drawer.getByTestId("workspace-terminal-input").fill("burst:10050");
+    await drawer.getByTestId("workspace-terminal-send-btn").click();
+    await expect(drawer.getByTestId("workspace-terminal-trimmed-notice")).toContainText("更早输出已修剪");
+    const trimmedText = await drawer.getByTestId("workspace-terminal-scrollback").innerText();
+    const lines = trimmedText.split("\n");
+    expect(lines).toHaveLength(10_000);
+    expect(lines[lines.length - 1]).toBe("burst-line-10050");
+
+    // 3. Reload preserves terminalId + bounded scrollback
+    await page.reload();
+    await page.getByRole("button", { name: /Workspace/ }).click();
+    const drawerAfterReload = page.getByRole("complementary", { name: "Workspace" });
+    await drawerAfterReload.getByRole("tab", { name: "Terminal" }).click();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-id")).toHaveText(firstTerminalId);
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-trimmed-notice")).toContainText("更早输出已修剪");
+
+    // 4. Busy foreground close -> inline confirmation defaulting to "仅分离，保留运行", Esc cancels safely
+    await drawerAfterReload.getByTestId("workspace-terminal-input").fill("sleep 30");
+    await drawerAfterReload.getByTestId("workspace-terminal-send-btn").click();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-fg-badge")).toContainText("前台进程运行中");
+
+    const closeTermBtn = drawerAfterReload.getByTestId("workspace-terminal-close-btn");
+    await closeTermBtn.click();
+    const busyConfirm = drawerAfterReload.getByTestId("workspace-terminal-busy-confirm");
+    await expect(busyConfirm).toBeVisible();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-detach-btn")).toBeFocused();
+
+    // Esc cancels inline confirmation WITHOUT closing Workspace or altering PTY state, and returns focus
+    await page.keyboard.press("Escape");
+    await expect(busyConfirm).toBeHidden();
+    await expect(drawerAfterReload).toBeVisible();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-status")).toContainText("运行中");
+    await expect(closeTermBtn).toBeFocused();
+
+    // Re-open busy confirm -> choose default "仅分离，保留运行" -> re-attach retains same terminalId
+    await closeTermBtn.click();
+    await drawerAfterReload.getByTestId("workspace-terminal-detach-btn").click();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-status")).toContainText("detached");
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-id")).toHaveText(firstTerminalId);
+
+    await drawerAfterReload.getByTestId("workspace-terminal-reattach-btn").click();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-status")).toContainText("运行中");
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-id")).toHaveText(firstTerminalId);
+
+    // Choose "结束终端" -> kills PTY + clears scrollback + requires explicit "新建 Terminal"
+    await drawerAfterReload.getByTestId("workspace-terminal-close-btn").click();
+    await drawerAfterReload.getByTestId("workspace-terminal-terminate-btn").click();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-status")).toContainText("ended");
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-empty")).toBeVisible();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-input")).toHaveCount(0);
+
+    // Explicit "新建 Terminal" -> fresh terminalId -> natural "exit" shows ended
+    await drawerAfterReload.getByTestId("workspace-terminal-new-btn").click();
+    const secondTerminalId = await drawerAfterReload.getByTestId("workspace-terminal-id").innerText();
+    expect(secondTerminalId).not.toBe(firstTerminalId);
+    await drawerAfterReload.getByTestId("workspace-terminal-input").fill("exit");
+    await drawerAfterReload.getByTestId("workspace-terminal-send-btn").click();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-status")).toContainText("ended");
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-ended-notice")).toBeVisible();
+
+    // 5. Git/Worktree deep_link tab: exact copyable CLI + "不会在此客户端执行" + https docs + ExternalAttribution
+    await drawerAfterReload.getByRole("tab", { name: "Git" }).click();
+    const gitPanel = drawerAfterReload.getByTestId("workspace-git-panel");
+    await expect(gitPanel.getByTestId("workspace-git-boundary")).toContainText("不会在此客户端执行");
+    await expect(gitPanel.getByTestId("workspace-git-never-executed-git-worktree-list")).toContainText("不会在此客户端执行");
+
+    const gitAttr = gitPanel.getByTestId("workspace-git-attribution-git-worktree-list");
+    await expect(gitAttr).toContainText("外部提供");
+    await expect(gitAttr).toHaveAttribute("data-attribution-origin", "external");
+
+    const countsBeforeGit = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: { terminalWriteCalls: number; externalLinksOpened: string[] } }).__HERMES_E2E_COUNTS__,
+    );
+    await gitPanel.getByTestId("workspace-git-copy-git-worktree-list").click();
+    await expect(gitPanel.getByTestId("workspace-git-copied-notice")).toContainText("不会在此客户端执行");
+
+    await gitPanel.getByTestId("workspace-git-doc-git-worktree-docs").click();
+    const countsAfterGit = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: { terminalWriteCalls: number; externalLinksOpened: string[] } }).__HERMES_E2E_COUNTS__,
+    );
+    expect(countsAfterGit.terminalWriteCalls).toBe(countsBeforeGit.terminalWriteCalls);
+    expect(countsAfterGit.externalLinksOpened).toContain("https://git-scm.com/docs/git-worktree");
+
+    // "打开 Terminal 面板" navigates without auto-pasting/executing git commands
+    await gitPanel.getByTestId("workspace-git-open-terminal-btn").click();
+    await expect(drawerAfterReload.getByTestId("workspace-terminal-panel")).toBeVisible();
+    const countsAfterOpenTerm = await page.evaluate(
+      () => (window as unknown as { __HERMES_E2E_COUNTS__: { terminalWriteCalls: number } }).__HERMES_E2E_COUNTS__,
+    );
+    expect(countsAfterOpenTerm.terminalWriteCalls).toBe(countsBeforeGit.terminalWriteCalls);
+
+    // 6. Verify unknown ExternalAttribution state renders "来源未知" cleanly
+    await page.addInitScript(() => {
+      window.sessionStorage.removeItem("hermes-mock-terminal-state");
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              desired: "enabled",
+              actual: "ready",
+              aggregateState: "ready",
+              degraded: false,
+              latencyMs: 3,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              desired: "enabled",
+              actual: "ready",
+              degraded: false,
+            },
+          ],
+          sessions: [],
+          activeScope: { connectionId: "local", profileId: "default" },
+          activeSessionId: null,
+        },
+        terminal: {
+          attribution: {
+            origin: "unknown",
+            sourceLabel: "来源未知",
+            accessibleLabel: "来源未知",
+          },
+        },
+      };
+    });
+    await page.goto("/");
+    await page.getByRole("button", { name: /Workspace/ }).click();
+    const drawerUnknown = page.getByRole("complementary", { name: "Workspace" });
+    await drawerUnknown.getByRole("tab", { name: "Terminal" }).click();
+    const unknownAttr = drawerUnknown.getByTestId("workspace-terminal-attribution");
+    await expect(unknownAttr).toHaveText("来源未知");
+    await expect(unknownAttr).toHaveAttribute("data-attribution-origin", "unknown");
+  });
+});

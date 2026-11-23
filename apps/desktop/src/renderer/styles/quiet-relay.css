@@ -2062,6 +2062,132 @@ button {
   user-select: none;
 }
 
+/* Ticket #40: Terminal PTY & Git Deep-link styles */
+.git-deeplink-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.git-deeplink-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--paper);
+}
+
+.git-deeplink-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.git-deeplink-command {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--paper-deep);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  word-break: break-all;
+}
+
+.git-deeplink-row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.git-never-executed {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.terminal-status-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.terminal-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.terminal-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.terminal-id-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--paper-deep);
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.terminal-action-bar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.workspace-terminal-screen {
+  min-height: 140px;
+  max-height: 300px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.terminal-controls-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.terminal-resize-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.terminal-dim-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.terminal-dim-input {
+  width: 72px;
+}
+
 /* Ticket #42: ExternalAttribution badges, ExtensionInventoryView, and Approval cards */
 .attribution-badge {
   display: inline-flex;

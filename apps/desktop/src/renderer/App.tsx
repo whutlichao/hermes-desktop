@@ -30,6 +30,9 @@ import {
   type SessionSummary,
   type SessionTranscriptSnapshot,
   type SubagentTailSnapshot,
+  type TerminalCloseResult,
+  type TerminalOpenResult,
+  type TerminalSnapshot,
   type WorkspaceAgentItem,
   type WorkspaceArtifactItem,
   type WorkspaceCheckpointItem,
@@ -53,6 +56,7 @@ import {
   filterSessionsForScope,
   formatAppInfoDisplay,
   getActiveChatWorkspaceView,
+  getActiveScopeWorkspaceView,
   getCopy,
   getTopmostSurface,
   hideWorkspace,
@@ -85,6 +89,7 @@ import {
   setWorkspaceCheckpointDiff,
   setWorkspaceCheckpointError,
   setWorkspaceCheckpointRestorePending,
+  setWorkspaceTerminalSnapshot,
   shellReducer,
   switchWorkspaceContext,
   toggleWorkspaceDirectory,
@@ -122,6 +127,10 @@ export default function App() {
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const [configSnapshot, setConfigSnapshot] = useState<GatewayConfigSnapshot | null>(null);
   const [agentInterrupting, setAgentInterrupting] = useState(false);
+  const [terminalBusyConfirmOpen, setTerminalBusyConfirmOpen] = useState(false);
+  const terminalBusyConfirmOpenRef = useRef(terminalBusyConfirmOpen);
+  terminalBusyConfirmOpenRef.current = terminalBusyConfirmOpen;
+  const terminalCloseBtnRef = useRef<HTMLButtonElement>(null);
   const [extensionDrawerDomain, setExtensionDrawerDomain] =
     useState<ExtensionDomainTab>("plugins");
   const [settingsExtDomain, setSettingsExtDomain] =
@@ -338,7 +347,7 @@ export default function App() {
           )
         : Promise.resolve(null);
 
-      const [filesRes, artifactsRes, subagentsRes, checkpointsRes] = await Promise.all([
+      const [filesRes, artifactsRes, subagentsRes, checkpointsRes, terminalRes] = await Promise.all([
         filesPromise,
         artifactsPromise,
         targetChatScope.sessionId
@@ -368,6 +377,11 @@ export default function App() {
               targetChatScope,
             )
           : Promise.resolve(null),
+        host.request<{ snapshot?: TerminalSnapshot }>(
+          "terminal.get",
+          { profileId: scopeOnly.profileId },
+          scopeOnly,
+        ),
       ]);
 
       setWorkspaceState((prev) => {
@@ -380,6 +394,9 @@ export default function App() {
           if (filesRes.value.stale) {
             next = markWorkspaceFilesExternalStale(next, scopeOnly);
           }
+        }
+        if (terminalRes.ok && terminalRes.value.snapshot) {
+          next = setWorkspaceTerminalSnapshot(next, terminalRes.value.snapshot, scopeOnly);
         }
         if (artifactsRes && artifactsRes.ok) {
           next = reconcileWorkspaceArtifacts(
@@ -802,6 +819,109 @@ export default function App() {
       void handleDiffCheckpoint();
     }
   }, [handleConfirmRestoreCheckpoint, handleDiffCheckpoint]);
+
+  const handleOpenTerminal = useCallback(
+    async (options?: { mode?: "open" | "new" | "grant_root"; grantRoot?: boolean }) => {
+      if (!activeChatScope?.connectionId) return;
+      const scopeOnly: BridgeScope = {
+        connectionId: activeChatScope.connectionId,
+        profileId: activeChatScope.profileId ?? "default",
+      };
+      const scopeView = getActiveScopeWorkspaceView(workspaceStateRef.current);
+      const cols = scopeView.terminalSnapshot?.cols ?? 80;
+      const rows = scopeView.terminalSnapshot?.rows ?? 24;
+      const res = await host.request<TerminalOpenResult>(
+        "terminal.open",
+        {
+          cols,
+          rows,
+          mode: options?.mode ?? "open",
+          grantRoot: Boolean(options?.grantRoot),
+        },
+        scopeOnly,
+      );
+      if (res.ok && res.value.snapshot) {
+        setWorkspaceState((prev) =>
+          setWorkspaceTerminalSnapshot(prev, res.value.snapshot, scopeOnly),
+        );
+        setTerminalBusyConfirmOpen(false);
+        if (!res.value.granted) {
+          dispatch({
+            type: "ANNOUNCE",
+            message: getCopy("workspace.terminal.grantDeniedNotice"),
+          });
+        }
+      }
+    },
+    [activeChatScope?.connectionId, activeChatScope?.profileId],
+  );
+
+  const handleWriteTerminal = useCallback(
+    async (data: string) => {
+      if (!activeChatScope?.connectionId) return;
+      const scopeOnly: BridgeScope = {
+        connectionId: activeChatScope.connectionId,
+        profileId: activeChatScope.profileId ?? "default",
+      };
+      const scopeView = getActiveScopeWorkspaceView(workspaceStateRef.current);
+      const terminalId = scopeView.terminalSnapshot?.terminalId ?? undefined;
+      await host.request("terminal.write", { terminalId, data }, scopeOnly);
+    },
+    [activeChatScope?.connectionId, activeChatScope?.profileId],
+  );
+
+  const handleResizeTerminal = useCallback(
+    async (cols: number, rows: number) => {
+      if (!activeChatScope?.connectionId) return;
+      const scopeOnly: BridgeScope = {
+        connectionId: activeChatScope.connectionId,
+        profileId: activeChatScope.profileId ?? "default",
+      };
+      const scopeView = getActiveScopeWorkspaceView(workspaceStateRef.current);
+      const terminalId = scopeView.terminalSnapshot?.terminalId ?? undefined;
+      await host.request("terminal.resize", { terminalId, cols, rows }, scopeOnly);
+    },
+    [activeChatScope?.connectionId, activeChatScope?.profileId],
+  );
+
+  const handleCloseTerminal = useCallback(
+    async (mode: "auto" | "detach" | "terminate" = "auto") => {
+      if (!activeChatScope?.connectionId) return;
+      const scopeOnly: BridgeScope = {
+        connectionId: activeChatScope.connectionId,
+        profileId: activeChatScope.profileId ?? "default",
+      };
+      const scopeView = getActiveScopeWorkspaceView(workspaceStateRef.current);
+      const terminalId = scopeView.terminalSnapshot?.terminalId ?? undefined;
+      const res = await host.request<TerminalCloseResult>(
+        "terminal.close",
+        { terminalId, mode },
+        scopeOnly,
+      );
+      if (!res.ok) return;
+      setWorkspaceState((prev) =>
+        setWorkspaceTerminalSnapshot(prev, res.value.snapshot, scopeOnly),
+      );
+      if (res.value.outcome === "confirm_required") {
+        setTerminalBusyConfirmOpen(true);
+      } else {
+        setTerminalBusyConfirmOpen(false);
+      }
+    },
+    [activeChatScope?.connectionId, activeChatScope?.profileId],
+  );
+
+  const handleCopyGitCommand = useCallback((command: string) => {
+    void navigator.clipboard?.writeText?.(command);
+    dispatch({
+      type: "ANNOUNCE",
+      message: getCopy("workspace.git.copiedNotice"),
+    });
+  }, []);
+
+  const handleOpenExternalDocUrl = useCallback(async (url: string) => {
+    await host.request("links.openExternal", { url }, null);
+  }, []);
 
   const activeChatViewForEffects = getActiveChatWorkspaceView(workspaceState);
   const selectedAgentIdForTail =
@@ -1538,6 +1658,34 @@ export default function App() {
     state.chatState?.activeStatus,
   ]);
 
+  // Subscribe to Main-owned Terminal snapshots for the active Scope (retained across reload)
+  useEffect(() => {
+    const cid = state.activeScope?.connectionId;
+    if (!cid) {
+      setTerminalBusyConfirmOpen(false);
+      return;
+    }
+    const scopeTarget: BridgeScope = {
+      connectionId: cid,
+      profileId: state.activeScope?.profileId ?? "default",
+    };
+    setTerminalBusyConfirmOpen(false);
+    let active = true;
+    const unsub = host.subscribe("terminal", scopeTarget, (event) => {
+      if (!active) return;
+      const snap = event.payload as TerminalSnapshot | undefined;
+      if (!snap) return;
+      setWorkspaceState((prev) => setWorkspaceTerminalSnapshot(prev, snap, scopeTarget));
+      if (snap.status !== "running") {
+        setTerminalBusyConfirmOpen(false);
+      }
+    });
+    return () => {
+      active = false;
+      unsub();
+    };
+  }, [state.activeScope?.connectionId, state.activeScope?.profileId]);
+
   // Global keyboard handler (Esc single-layer dismissal; web-mode shortcuts)
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1547,6 +1695,18 @@ export default function App() {
         if (state.surfaceStack.length > 0) {
           event.preventDefault();
           dispatch({ type: "CLOSE_TOPMOST_SURFACE" });
+          return;
+        }
+        if (
+          terminalBusyConfirmOpenRef.current &&
+          state.workspace.mode === "open" &&
+          workspaceStateRef.current.frame.activeTab === "terminal"
+        ) {
+          event.preventDefault();
+          setTerminalBusyConfirmOpen(false);
+          queueMicrotask(() => {
+            terminalCloseBtnRef.current?.focus();
+          });
           return;
         }
         if (state.workspace.mode === "open") {
@@ -2262,6 +2422,15 @@ export default function App() {
               )
             }
             onRetryCheckpointAction={handleRetryCheckpointAction}
+            terminalBusyConfirmOpen={terminalBusyConfirmOpen}
+            terminalCloseBtnRef={terminalCloseBtnRef}
+            onOpenTerminal={(opts) => void handleOpenTerminal(opts)}
+            onWriteTerminal={(data) => void handleWriteTerminal(data)}
+            onResizeTerminal={(cols, rows) => void handleResizeTerminal(cols, rows)}
+            onCloseTerminal={(mode) => void handleCloseTerminal(mode)}
+            onCancelTerminalBusyConfirm={() => setTerminalBusyConfirmOpen(false)}
+            onCopyGitCommand={handleCopyGitCommand}
+            onOpenExternalUrl={(url) => void handleOpenExternalDocUrl(url)}
           />
         </div>
 

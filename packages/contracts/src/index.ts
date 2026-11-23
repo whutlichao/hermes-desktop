@@ -57,6 +57,7 @@ export const HOST_COMMANDS = [
   "config.update",
   "files.list",
   "files.read",
+  "terminal.get",
   "terminal.open",
   "terminal.write",
   "terminal.resize",
@@ -1368,5 +1369,60 @@ export interface GatewayConfigUpdateResult {
   ok: boolean;
   snapshot: GatewayConfigSnapshot;
   errorCode?: ErrorCode;
+}
+
+export type TerminalStatus = "idle" | "grant_denied" | "running" | "detached" | "ended";
+
+export interface TerminalSnapshot {
+  terminalId: string | null;
+  scope: BridgeScope;
+  status: TerminalStatus;
+  cols: number;
+  rows: number;
+  granted: boolean;
+  rootGranted: boolean;
+  hasForegroundProcess: boolean;
+  foregroundProcessName?: string;
+  lines: string[];
+  trimmedOldest: boolean;
+  totalBytes: number;
+  lineCount: number;
+  exitCode?: number | null;
+  attribution: ExternalAttribution;
+  updatedAt: string;
+}
+
+export interface TerminalOpenResult {
+  ok: boolean;
+  granted: boolean;
+  deniedReason?: "user_denied" | "root_denied" | "scope_mismatch";
+  snapshot: TerminalSnapshot;
+}
+
+export interface TerminalCloseResult {
+  ok: boolean;
+  outcome: "closed" | "detached" | "terminated" | "confirm_required";
+  snapshot: TerminalSnapshot;
+}
+
+export interface GitWorktreeCliItem {
+  id: string;
+  labelKey: string;
+  command: string;
+  executionNote: string;
+  attribution?: ExternalAttribution;
+}
+
+export interface GitWorktreeDocLink {
+  id: string;
+  labelKey: string;
+  url: string;
+  attribution?: ExternalAttribution;
+}
+
+export interface GitWorktreeDeepLinkCatalog {
+  boundaryNote: string;
+  cliItems: GitWorktreeCliItem[];
+  docLinks: GitWorktreeDocLink[];
 }
 
