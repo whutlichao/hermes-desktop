@@ -238,12 +238,26 @@ export const EXPLICIT_METHOD_ALIASES: Readonly<Record<string, string>> = Object.
   "session.status": "session.info",
   "sessions.list": "session.list",
   "prompt.steer": "session.steer",
+  "subagents.list": "subagent.list",
+  "subagents.steer": "subagent.steer",
+  "subagents.interrupt": "subagent.interrupt",
+  "subagents.tail": "subagent.tail",
+  "checkpoint.list": "rollback.list",
+  "checkpoint.diff": "rollback.diff",
+  "checkpoint.restore": "rollback.restore",
 });
 
 const EXPLICIT_REVERSE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
   "session.list": "sessions.list",
   "session.steer": "prompt.steer",
   "session.info": "session.status",
+  "subagent.list": "subagents.list",
+  "subagent.steer": "subagents.steer",
+  "subagent.interrupt": "subagents.interrupt",
+  "subagent.tail": "subagents.tail",
+  "rollback.list": "checkpoint.list",
+  "rollback.diff": "checkpoint.diff",
+  "rollback.restore": "checkpoint.restore",
 });
 
 export function resolveExplicitMethodAlias(method: string): string | null {
@@ -579,8 +593,30 @@ const ACTION_TEMPLATES: readonly ActionTemplate[] = [
     hintKey: "cap.hint.checkpoint.list",
     classification: "native",
     requiredMethods: ["checkpoint.list"],
-    handlerId: "capabilities.probeDomain",
+    handlerId: "workspace.openCheckpoints",
     evidenceTestId: "cap-action-checkpoint-list",
+  },
+  {
+    domain: "checkpoint",
+    group: "exec",
+    actionId: "checkpoint.diff",
+    labelKey: "cap.action.checkpoint.diff",
+    hintKey: "cap.hint.checkpoint.diff",
+    classification: "native",
+    requiredMethods: ["checkpoint.diff"],
+    handlerId: "workspace.openCheckpoints",
+    evidenceTestId: "cap-action-checkpoint-diff",
+  },
+  {
+    domain: "checkpoint",
+    group: "exec",
+    actionId: "checkpoint.restore",
+    labelKey: "cap.action.checkpoint.restore",
+    hintKey: "cap.hint.checkpoint.restore",
+    classification: "native",
+    requiredMethods: ["checkpoint.restore"],
+    handlerId: "workspace.openCheckpoints",
+    evidenceTestId: "cap-action-checkpoint-restore",
   },
   {
     domain: "files_artifacts",
@@ -633,6 +669,39 @@ const ACTION_TEMPLATES: readonly ActionTemplate[] = [
     requiredMethods: ["subagents.list"],
     handlerId: "workspace.openAgents",
     evidenceTestId: "cap-action-subagents-list",
+  },
+  {
+    domain: "subagents",
+    group: "exec",
+    actionId: "subagents.steer",
+    labelKey: "cap.action.subagents.steer",
+    hintKey: "cap.hint.subagents.steer",
+    classification: "native",
+    requiredMethods: ["subagents.steer"],
+    handlerId: "workspace.openAgents",
+    evidenceTestId: "cap-action-subagents-steer",
+  },
+  {
+    domain: "subagents",
+    group: "exec",
+    actionId: "subagents.interrupt",
+    labelKey: "cap.action.subagents.interrupt",
+    hintKey: "cap.hint.subagents.interrupt",
+    classification: "native",
+    requiredMethods: ["subagents.interrupt"],
+    handlerId: "workspace.openAgents",
+    evidenceTestId: "cap-action-subagents-interrupt",
+  },
+  {
+    domain: "subagents",
+    group: "exec",
+    actionId: "subagents.tail",
+    labelKey: "cap.action.subagents.tail",
+    hintKey: "cap.hint.subagents.tail",
+    classification: "native",
+    requiredMethods: ["subagents.tail"],
+    handlerId: "workspace.openAgents",
+    evidenceTestId: "cap-action-subagents-tail",
   },
 ];
 
@@ -794,7 +863,15 @@ export class CapabilityRegistry {
   }
 
   getMethodTier(method: string): CapabilityMethodTier {
-    if (this.notFoundMethods.has(method)) return "unknown";
+    const forward = resolveExplicitMethodAlias(method);
+    const reverse = EXPLICIT_REVERSE_ALIASES[method];
+    if (
+      this.notFoundMethods.has(method) ||
+      (forward !== null && this.notFoundMethods.has(forward)) ||
+      (reverse !== undefined && this.notFoundMethods.has(reverse))
+    ) {
+      return "unknown";
+    }
     return resolveMethodWithAlias(method, this.methodTiers).tier;
   }
 
@@ -985,7 +1062,13 @@ export class CapabilityRegistry {
     let notFoundHit = false;
 
     for (const req of requiredMethods) {
-      if (this.notFoundMethods.has(req)) {
+      const forward = resolveExplicitMethodAlias(req);
+      const reverse = EXPLICIT_REVERSE_ALIASES[req];
+      if (
+        this.notFoundMethods.has(req) ||
+        (forward !== null && this.notFoundMethods.has(forward)) ||
+        (reverse !== undefined && this.notFoundMethods.has(reverse))
+      ) {
         notFoundHit = true;
         missing.push(req);
         continue;

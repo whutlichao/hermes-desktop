@@ -7,6 +7,7 @@ import type {
   CapabilityDomainId,
   CapabilitySnapshot,
   ChatSessionProjection,
+  CheckpointDiffSnapshot,
   ConnectionActualState,
   ConnectionDesiredState,
   ConnectionHealthSummary,
@@ -27,10 +28,13 @@ import type {
   SessionSummary,
   SessionTranscriptSnapshot,
   SshFailureCode,
+  SubagentTailSnapshot,
   SupportedChatActions,
   ToolExecutionRow,
   TranscriptMessage,
   TranscriptPatchPayload,
+  WorkspaceAgentItem,
+  WorkspaceCheckpointItem,
 } from "@hermes/contracts";
 import {
   aggregateConnectionHealth,
@@ -40,6 +44,7 @@ import {
   computeResumeStaggerMs,
   CORE_CAPABILITY_DOMAINS,
   CapabilityRegistry,
+  boundSubagentTailLines,
   classifyRuntimeCapabilities,
   getCopy,
   getLocalFailureCopy,
@@ -48,7 +53,9 @@ import {
   isProfileLinkException,
   reduceTranscriptEvent,
   resolveExplicitMethodAlias,
+  resolveMethodWithAlias,
   toSupportedChatActions,
+  validateCheckpointRestoreBinding,
   validateRemoteEndpointUrl,
   type ClassifiedRuntimeCapabilities,
   type HostCommandHandler,
@@ -332,6 +339,7 @@ export class ConnectionSupervisor {
   private readonly profilesByConnection = new Map<string, ProfileSummary[]>();
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
   private readonly transcripts = new Map<string, SessionTranscriptSnapshot>();
+  private readonly lastKnownSubagentsBySession = new Map<string, WorkspaceAgentItem[]>();
   private readonly transports = new Map<string, GatewayTransportEntry>();
   private readonly connectingByKey = new Map<string, Promise<SupervisorConnectResult>>();
   private readonly subscribers = new Map<number, SubscriberRecord>();
@@ -3783,6 +3791,13 @@ export class ConnectionSupervisor {
     | "artifacts.read"
     | "files.list"
     | "files.read"
+    | "subagents.list"
+    | "subagents.tail"
+    | "subagents.steer"
+    | "subagents.interrupt"
+    | "checkpoints.list"
+    | "checkpoints.diff"
+    | "checkpoints.restore"
     | "chatState.exportMissingSession"
     | "chatState.dismissMissingSession"
     | "config.get"
@@ -4362,6 +4377,462 @@ export class ConnectionSupervisor {
     "artifacts.read": async () => ({ artifact: null }),
     "files.list": async () => ({ files: [], stale: false, gitDiffs: [] }),
     "files.read": async () => ({ file: null }),
+
+    "subagents.list": async (payload, scope) => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const generation = this.capabilityRegistry.getSnapshot().generation;
+      if (!sessionId) {
+        return {
+          agents: [],
+          readOnly: false,
+          lastKnown: false,
+          generation,
+        };
+      }
+
+      const sessionKey = transcriptKey(connectionId, profileId, sessionId);
+      const entry = this.requireTransport(connectionId, profileId);
+      const snap = this.capabilityRegistry.getSnapshot();
+      const resolved = resolveMethodWithAlias("subagents.list", snap.methodTiers);
+      const rpcMethod = resolved.tier !== "unknown" ? resolved.method : "subagent.list";
+
+      if (
+        this.capabilityRegistry.isMethodRefused("subagents.list") ||
+        this.capabilityRegistry.isMethodRefused(rpcMethod)
+      ) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 已拒绝 Subagents 能力");
+      }
+
+      const steerAvailable =
+        snap.entries.find((e) => e.actionId === "subagents.steer")?.runtimeStatus === "available";
+      const interruptAvailable =
+        snap.entries.find((e) => e.actionId === "subagents.interrupt")?.runtimeStatus ===
+        "available";
+
+      if (this.capabilityRegistry.getMethodTier("subagents.list") === "unknown") {
+        const fallback = (this.lastKnownSubagentsBySession.get(sessionKey) ?? []).map((item) => ({
+          ...item,
+          lastKnown: true,
+        }));
+        return {
+          agents: fallback,
+          readOnly: true,
+          lastKnown: true,
+          generation,
+        };
+      }
+
+      try {
+        const res = await entry.client.call<Record<string, unknown>>(rpcMethod, {
+          profile_id: profileId,
+          session_id: sessionId,
+        });
+        const rawList = Array.isArray(res.agents ?? res.subagents)
+          ? ((res.agents ?? res.subagents) as Array<Record<string, unknown>>)
+          : [];
+        const agents: WorkspaceAgentItem[] = rawList.map((raw, idx) => {
+          const rawStatus = asString(raw.status, "running");
+          const status: WorkspaceAgentItem["status"] =
+            rawStatus === "idle" ||
+            rawStatus === "completed" ||
+            rawStatus === "failed" ||
+            rawStatus === "stopped"
+              ? rawStatus
+              : "running";
+          return {
+            agentId: asString(raw.agent_id ?? raw.agentId ?? raw.id, `subagent-${idx + 1}`),
+            name: asString(raw.name ?? raw.title, `Subagent ${idx + 1}`),
+            role: asString(raw.role, "Subagent"),
+            status,
+            ...(typeof raw.summary === "string" ? { summary: raw.summary } : {}),
+            ...(typeof (raw.updated_at ?? raw.updatedAt) === "string"
+              ? { updatedAt: String(raw.updated_at ?? raw.updatedAt) }
+              : {}),
+          };
+        });
+        this.lastKnownSubagentsBySession.set(
+          sessionKey,
+          agents.map((a) => ({ ...a })),
+        );
+        return {
+          agents,
+          readOnly: !steerAvailable && !interruptAvailable,
+          lastKnown: false,
+          generation: this.capabilityRegistry.getSnapshot().generation,
+        };
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          this.capabilityRegistry.markMethodNotFound({
+            method: rpcMethod,
+            expectedOwnerGeneration: entry.ownerGeneration,
+            expectedAuthorityEpoch: entry.authorityEpoch,
+          });
+          this.capabilityRegistry.markMethodNotFound({
+            method: "subagent.steer",
+            expectedOwnerGeneration: entry.ownerGeneration,
+            expectedAuthorityEpoch: entry.authorityEpoch,
+          });
+          this.capabilityRegistry.markMethodNotFound({
+            method: "subagent.interrupt",
+            expectedOwnerGeneration: entry.ownerGeneration,
+            expectedAuthorityEpoch: entry.authorityEpoch,
+          });
+          this.emitCapabilities();
+          const fallback = (this.lastKnownSubagentsBySession.get(sessionKey) ?? []).map((item) => ({
+            ...item,
+            lastKnown: true,
+          }));
+          return {
+            agents: fallback,
+            readOnly: true,
+            lastKnown: true,
+            generation: this.capabilityRegistry.getSnapshot().generation,
+          };
+        }
+        this.translateRpcFailure(entry, err, undefined, rpcMethod);
+      }
+    },
+
+    "subagents.tail": async (payload, scope) => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+      if (!sessionId || !agentId) {
+        throw makeBridgeError("invalid_request", "未选择要查看 Tail 的 Subagent");
+      }
+
+      const entry = this.requireTransport(connectionId, profileId);
+      const snap = this.capabilityRegistry.getSnapshot();
+      const resolved = resolveMethodWithAlias("subagents.tail", snap.methodTiers);
+      const rpcMethod = resolved.tier !== "unknown" ? resolved.method : "subagent.tail";
+
+      if (
+        this.capabilityRegistry.isMethodRefused("subagents.tail") ||
+        this.capabilityRegistry.isMethodRefused(rpcMethod) ||
+        this.capabilityRegistry.getMethodTier("subagents.tail") === "unknown"
+      ) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 Subagent Tail 能力");
+      }
+
+      try {
+        const res = await entry.client.call<Record<string, unknown>>(rpcMethod, {
+          profile_id: profileId,
+          session_id: sessionId,
+          agent_id: agentId,
+        });
+        const rawLines = Array.isArray(res.lines)
+          ? res.lines.map((l) => String(l))
+          : typeof res.output === "string"
+            ? res.output.split("\n")
+            : [];
+        const bounded = boundSubagentTailLines(rawLines);
+        const tail: SubagentTailSnapshot = {
+          agentId,
+          lines: bounded.lines,
+          truncated: Boolean(res.truncated || bounded.truncated),
+          generation: this.capabilityRegistry.getSnapshot().generation,
+          updatedAt: new Date().toISOString(),
+        };
+        return { tail };
+      } catch (err) {
+        this.translateRpcFailure(entry, err, undefined, rpcMethod);
+      }
+    },
+
+    "subagents.steer": async (payload, scope) => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+      const text = typeof payload.text === "string" ? payload.text.trim() : "";
+      if (!sessionId || !agentId || !text) {
+        throw makeBridgeError("invalid_request", "请输入针对该 Subagent 的补充指令");
+      }
+
+      const entry = this.requireTransport(connectionId, profileId);
+      const snap = this.capabilityRegistry.getSnapshot();
+      const resolved = resolveMethodWithAlias("subagents.steer", snap.methodTiers);
+      const rpcMethod = resolved.tier !== "unknown" ? resolved.method : "subagent.steer";
+
+      if (
+        this.capabilityRegistry.isMethodRefused("subagents.steer") ||
+        this.capabilityRegistry.isMethodRefused(rpcMethod) ||
+        this.capabilityRegistry.getMethodTier("subagents.steer") === "unknown"
+      ) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持 Subagent 补充指令");
+      }
+
+      try {
+        await entry.client.call<Record<string, unknown>>(rpcMethod, {
+          profile_id: profileId,
+          session_id: sessionId,
+          agent_id: agentId,
+          text,
+        });
+        return {
+          steered: true,
+          agentId,
+        };
+      } catch (err) {
+        this.translateRpcFailure(entry, err, undefined, rpcMethod);
+      }
+    },
+
+    "subagents.interrupt": async (payload, scope) => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+      if (!sessionId || !agentId) {
+        throw makeBridgeError("invalid_request", "未选择要停止的 Subagent");
+      }
+
+      const entry = this.requireTransport(connectionId, profileId);
+      const snap = this.capabilityRegistry.getSnapshot();
+      const resolved = resolveMethodWithAlias("subagents.interrupt", snap.methodTiers);
+      const rpcMethod = resolved.tier !== "unknown" ? resolved.method : "subagent.interrupt";
+
+      if (
+        this.capabilityRegistry.isMethodRefused("subagents.interrupt") ||
+        this.capabilityRegistry.isMethodRefused(rpcMethod) ||
+        this.capabilityRegistry.getMethodTier("subagents.interrupt") === "unknown"
+      ) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持停止 Subagent");
+      }
+
+      try {
+        const res = await entry.client.call<Record<string, unknown>>(rpcMethod, {
+          profile_id: profileId,
+          session_id: sessionId,
+          agent_id: agentId,
+        });
+        const confirmed =
+          res.interrupted !== false &&
+          res.stopped !== false &&
+          res.ok !== false;
+        if (!confirmed) {
+          throw makeBridgeError("conflict", "Gateway 未确认停止该 Subagent，当前运行状态保持不变");
+        }
+        const rawStatus = asString(res.status, "stopped");
+        const nextStatus: WorkspaceAgentItem["status"] =
+          rawStatus === "completed" || rawStatus === "idle" || rawStatus === "failed"
+            ? rawStatus
+            : "stopped";
+        const sessionKey = transcriptKey(connectionId, profileId, sessionId);
+        const cached = this.lastKnownSubagentsBySession.get(sessionKey);
+        if (cached) {
+          this.lastKnownSubagentsBySession.set(
+            sessionKey,
+            cached.map((a) => (a.agentId === agentId ? { ...a, status: nextStatus } : a)),
+          );
+        }
+        return {
+          interrupted: true,
+          agentId,
+          status: nextStatus,
+        };
+      } catch (err) {
+        if ((err as { code?: ErrorCode })?.code === "conflict") {
+          throw err;
+        }
+        this.translateRpcFailure(entry, err, undefined, rpcMethod);
+      }
+    },
+
+    "checkpoints.list": async (payload, scope) => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const generation = this.capabilityRegistry.getSnapshot().generation;
+      if (!sessionId) {
+        return {
+          checkpoints: [],
+          canRestore: false,
+          generation,
+        };
+      }
+
+      const entry = this.requireTransport(connectionId, profileId);
+      const snap = this.capabilityRegistry.getSnapshot();
+      const resolved = resolveMethodWithAlias("checkpoint.list", snap.methodTiers);
+      const rpcMethod = resolved.tier !== "unknown" ? resolved.method : "rollback.list";
+
+      if (
+        this.capabilityRegistry.isMethodRefused("checkpoint.list") ||
+        this.capabilityRegistry.isMethodRefused(rpcMethod) ||
+        this.capabilityRegistry.getMethodTier("checkpoint.list") === "unknown"
+      ) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 Checkpoint 列表能力");
+      }
+
+      try {
+        const res = await entry.client.call<Record<string, unknown>>(rpcMethod, {
+          profile_id: profileId,
+          session_id: sessionId,
+        });
+        const rawList = Array.isArray(res.checkpoints)
+          ? (res.checkpoints as Array<Record<string, unknown>>)
+          : [];
+        const checkpoints: WorkspaceCheckpointItem[] = rawList.map((raw, idx) => ({
+          checkpointId: asString(
+            raw.checkpoint_id ?? raw.checkpointId ?? raw.id,
+            `ckpt-${idx + 1}`,
+          ),
+          title: asString(raw.title ?? raw.label, `Checkpoint #${idx + 1}`),
+          ...(typeof raw.summary === "string" ? { summary: raw.summary } : {}),
+          createdAt: asString(
+            raw.created_at ?? raw.createdAt,
+            new Date().toISOString(),
+          ),
+          ...(typeof (raw.turn_id ?? raw.turnId) === "string"
+            ? { turnId: String(raw.turn_id ?? raw.turnId) }
+            : {}),
+        }));
+        const currentSnap = this.capabilityRegistry.getSnapshot();
+        const restoreEntry = currentSnap.entries.find((e) => e.actionId === "checkpoint.restore");
+        const canRestore = Boolean(restoreEntry && restoreEntry.runtimeStatus !== "unavailable");
+        return {
+          checkpoints,
+          canRestore,
+          generation: currentSnap.generation,
+        };
+      } catch (err) {
+        this.translateRpcFailure(entry, err, undefined, rpcMethod);
+      }
+    },
+
+    "checkpoints.diff": async (payload, scope) => {
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      const checkpointId =
+        typeof payload.checkpointId === "string" ? payload.checkpointId.trim() : "";
+      if (!sessionId || !checkpointId) {
+        throw makeBridgeError("invalid_request", "未选择要对比的 Checkpoint");
+      }
+
+      const entry = this.requireTransport(connectionId, profileId);
+      const snap = this.capabilityRegistry.getSnapshot();
+      const resolved = resolveMethodWithAlias("checkpoint.diff", snap.methodTiers);
+      const rpcMethod = resolved.tier !== "unknown" ? resolved.method : "rollback.diff";
+
+      if (
+        this.capabilityRegistry.isMethodRefused("checkpoint.diff") ||
+        this.capabilityRegistry.isMethodRefused(rpcMethod) ||
+        this.capabilityRegistry.getMethodTier("checkpoint.diff") === "unknown"
+      ) {
+        throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 Checkpoint Diff 能力");
+      }
+
+      try {
+        const res = await entry.client.call<Record<string, unknown>>(rpcMethod, {
+          profile_id: profileId,
+          session_id: sessionId,
+          checkpoint_id: checkpointId,
+        });
+        const diff: CheckpointDiffSnapshot = {
+          checkpointId,
+          summary: asString(res.summary, "Checkpoint 差异摘要"),
+          patch: asString(res.patch ?? res.diff, ""),
+          ...(typeof (res.files_changed ?? res.filesChanged) === "number"
+            ? { filesChanged: Number(res.files_changed ?? res.filesChanged) }
+            : {}),
+        };
+        return { diff };
+      } catch (err) {
+        this.translateRpcFailure(entry, err, undefined, rpcMethod);
+      }
+    },
+
+    "checkpoints.restore": async (payload, scope) => {
+      if (payload.confirmed !== true) {
+        throw makeBridgeError("invalid_request", "恢复 Checkpoint 需要显式确认");
+      }
+
+      const checkpointId =
+        typeof payload.checkpointId === "string" ? payload.checkpointId.trim() : "";
+      const boundConnectionId =
+        typeof payload.connectionId === "string"
+          ? payload.connectionId.trim()
+          : (scope?.connectionId ?? "");
+      const boundProfileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId.trim()
+          : (scope?.profileId ?? "default");
+      const boundSessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId.trim()
+          : (scope?.sessionId ?? "");
+      const boundGeneration =
+        typeof payload.generation === "number" ? payload.generation : -1;
+
+      const activeConnectionId = this.activeScope?.connectionId ?? scope?.connectionId ?? "local";
+      const activeProfileId = this.activeScope?.profileId ?? scope?.profileId ?? "default";
+      const activeSessionId =
+        this.activeSessionId ?? this.activeScope?.sessionId ?? scope?.sessionId ?? "";
+      const currentSnap = this.capabilityRegistry.getSnapshot();
+
+      const restoreEntry = currentSnap.entries.find((e) => e.actionId === "checkpoint.restore");
+      const resolved = resolveMethodWithAlias("checkpoint.restore", currentSnap.methodTiers);
+      const rpcMethod = resolved.tier !== "unknown" ? resolved.method : "rollback.restore";
+
+      if (
+        !restoreEntry ||
+        restoreEntry.runtimeStatus === "unavailable" ||
+        this.capabilityRegistry.isMethodRefused("checkpoint.restore") ||
+        this.capabilityRegistry.isMethodRefused(rpcMethod) ||
+        this.capabilityRegistry.getMethodTier("checkpoint.restore") === "unknown"
+      ) {
+        throw makeBridgeError(
+          "capability_unavailable",
+          "当前 Gateway 未提供 rollback.restore 能力，仅支持只读浏览与 Diff 对比",
+        );
+      }
+
+      const validation = validateCheckpointRestoreBinding(
+        {
+          connectionId: boundConnectionId,
+          profileId: boundProfileId,
+          sessionId: boundSessionId,
+          checkpointId,
+          generation: boundGeneration,
+        },
+        {
+          connectionId: activeConnectionId,
+          profileId: activeProfileId,
+          sessionId: activeSessionId,
+        },
+        currentSnap.generation,
+      );
+      if (!validation.valid) {
+        throw makeBridgeError(validation.code, validation.message);
+      }
+
+      const entry = this.requireTransport(activeConnectionId, activeProfileId);
+      try {
+        const res = await entry.client.call<Record<string, unknown>>(rpcMethod, {
+          profile_id: activeProfileId,
+          session_id: activeSessionId,
+          checkpoint_id: checkpointId,
+        });
+        if (res.restored === false || res.ok === false) {
+          throw makeBridgeError("conflict", "Gateway 未能恢复到所选 Checkpoint");
+        }
+        return {
+          restored: true,
+          checkpointId,
+          sessionId: activeSessionId,
+        };
+      } catch (err) {
+        if ((err as { code?: ErrorCode })?.code === "conflict") {
+          throw err;
+        }
+        this.translateRpcFailure(entry, err, undefined, rpcMethod);
+      }
+    },
 
     "chatState.exportMissingSession": async (_payload, scope) => {
       this.assertNotShuttingDown();

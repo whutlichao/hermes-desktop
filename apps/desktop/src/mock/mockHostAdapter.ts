@@ -37,8 +37,12 @@ import {
   type SessionTranscriptSnapshot,
   type SshHostKeyConfirmResult,
   type ArtifactAnnotation,
+  type CheckpointDiffSnapshot,
+  type ErrorCode,
+  type SubagentTailSnapshot,
   type WorkspaceAgentItem,
   type WorkspaceArtifactItem,
+  type WorkspaceCheckpointItem,
   type WorkspaceFileEntry,
   type WorkspaceGitDiffItem,
   SUPPORTED_GATEWAY_CONFIG_KEYS,
@@ -47,6 +51,7 @@ import {
   CAPABILITY_DOMAIN_CATALOG,
   CapabilityRegistry,
   SETTINGS_FIELD_CATALOG,
+  boundSubagentTailLines,
   createBridgeDispatcher,
   createEmptyRegistryDocument,
   diffRegistries,
@@ -62,6 +67,7 @@ import {
   projectRegistrySnapshot,
   redactSensitiveData,
   sanitizeDiagnosticsPayload,
+  validateCheckpointRestoreBinding,
   validateClientAddConnection,
   validateClientRemoveConnection,
   validateClientUpdateConnection,
@@ -130,6 +136,26 @@ interface MockE2EFixture {
     supportedKeys?: string[];
     values?: Record<string, GatewayConfigValue>;
   };
+  subagentTails?: Record<string, string[]>;
+  subagentNotFoundMethods?: string[];
+  subagentErrorByAction?: Partial<
+    Record<
+      "subagents.list" | "subagents.steer" | "subagents.interrupt" | "subagents.tail",
+      { code: ErrorCode; message: string }
+    >
+  >;
+  checkpoints?: Record<string, WorkspaceCheckpointItem[]>;
+  checkpointDiffs?: Record<string, CheckpointDiffSnapshot>;
+  checkpointNotFoundMethods?: string[];
+  checkpointErrorByAction?: Partial<
+    Record<
+      "checkpoints.list" | "checkpoints.diff" | "checkpoints.restore",
+      { code: ErrorCode; message: string }
+    >
+  >;
+  servedMethods?: string[];
+  refusedMethods?: string[];
+  bumpGenerationCount?: number;
 }
 
 function readE2EFixture(): MockE2EFixture | undefined {
@@ -250,48 +276,6 @@ export function createMockHostBridge(): HermesHost {
   };
   if (fixture) {
     (globalThis as { __HERMES_E2E_COUNTS__?: typeof e2eCounts }).__HERMES_E2E_COUNTS__ = e2eCounts;
-    const readyConn = currentFleet.connections.find((c) => c.actual === "ready");
-    if (readyConn || fixture.capabilities) {
-      const served = fixture.capabilities?.servedMethods ?? [
-        "prompt.submit",
-        "prompt.cancel",
-        "session.steer",
-        "session.list",
-        "session.create",
-        "session.resume",
-        "profiles.list",
-        "config.get",
-        "config.update",
-      ];
-      capabilityRegistry.applyConnectHandshake({
-        connectionId: currentFleet.activeScope?.connectionId ?? readyConn?.connectionId ?? "local",
-        profileId: currentFleet.activeScope?.profileId ?? "default",
-        ownerGeneration: 1,
-        authorityEpoch: 1,
-        gatewayVersionOrSha: "mock-e2e-v1",
-        serverRequestsSupported: true,
-        describeResult: {
-          served_methods: served,
-          older_methods: fixture.capabilities?.olderMethods ?? [],
-          refused_methods: fixture.capabilities?.refusedMethods ?? [],
-          session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
-        },
-      });
-      if (fixture.capabilities?.probedDomains) {
-        for (const [dom, outcome] of Object.entries(fixture.capabilities.probedDomains)) {
-          const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === dom);
-          if (meta?.probeMethod) {
-            capabilityRegistry.applyProbeOutcome({
-              domain: dom as CapabilityDomainId,
-              method: meta.probeMethod,
-              outcome,
-              expectedOwnerGeneration: 1,
-              expectedAuthorityEpoch: 1,
-            });
-          }
-        }
-      }
-    }
   }
 
   const defaultConfigValues: Record<string, GatewayConfigValue> = {};
@@ -349,6 +333,95 @@ export function createMockHostBridge(): HermesHost {
   let fleetSeq = 0;
   let sessionsSeq = 0;
   let chatStateSeq = 0;
+  let mockOwnerGen = 1;
+  let lastSeenBumpCount = fixture?.bumpGenerationCount ?? 0;
+  const lastKnownMockSubagents = new Map<string, WorkspaceAgentItem[]>();
+
+  const DEFAULT_MOCK_SERVED_METHODS = [
+    "prompt.submit",
+    "prompt.cancel",
+    "session.steer",
+    "approval.list",
+    "session.create",
+    "session.list",
+    "session.resume",
+    "shell.exec",
+    "profiles.list",
+    "config.get",
+    "config.update",
+    "skills.list",
+    "tools.show",
+    "mcp.list",
+    "session.context_breakdown",
+    "cron.status",
+    "messaging.status",
+    "plugins.list",
+    "rollback.list",
+    "rollback.diff",
+    "rollback.restore",
+    "files.list",
+    "subagent.list",
+    "subagent.steer",
+    "subagent.interrupt",
+    "subagent.tail",
+  ];
+
+  function applyMockCapabilityHandshake(liveFix?: MockE2EFixture) {
+    const activeConn =
+      currentFleet.connections.find((c) => c.actual === "ready") ??
+      mockConnections.find((c) => c.actual === "ready");
+    if (!activeConn && !liveFix?.capabilities) return;
+    const cid = currentFleet.activeScope?.connectionId ?? activeConn?.connectionId ?? "local";
+    const pid = currentFleet.activeScope?.profileId ?? "default";
+    const served =
+      liveFix?.capabilities?.servedMethods ??
+      liveFix?.servedMethods ??
+      DEFAULT_MOCK_SERVED_METHODS;
+    const older = liveFix?.capabilities?.olderMethods ?? [];
+    const refused = liveFix?.capabilities?.refusedMethods ?? liveFix?.refusedMethods ?? [];
+    capabilityRegistry.applyConnectHandshake({
+      connectionId: cid,
+      profileId: pid,
+      ownerGeneration: mockOwnerGen,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: `mock-sha-${mockOwnerGen}`,
+      serverRequestsSupported: true,
+      describeResult: {
+        served_methods: served,
+        older_methods: older,
+        refused_methods: refused,
+        session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
+      },
+    });
+    if (liveFix?.capabilities?.probedDomains) {
+      for (const [dom, outcome] of Object.entries(liveFix.capabilities.probedDomains)) {
+        const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === dom);
+        if (meta?.probeMethod) {
+          capabilityRegistry.applyProbeOutcome({
+            domain: dom as CapabilityDomainId,
+            method: meta.probeMethod,
+            outcome,
+            expectedOwnerGeneration: mockOwnerGen,
+            expectedAuthorityEpoch: 1,
+          });
+        }
+      }
+    }
+  }
+
+  if (fixture) {
+    applyMockCapabilityHandshake(fixture);
+  }
+
+  function syncFixtureGenerationIfNeeded(liveFix?: MockE2EFixture) {
+    const nextBump = liveFix?.bumpGenerationCount ?? 0;
+    if (nextBump > lastSeenBumpCount) {
+      lastSeenBumpCount = nextBump;
+      mockOwnerGen += 1;
+      applyMockCapabilityHandshake(liveFix);
+      emitCapabilitiesPatch();
+    }
+  }
 
   function emitFleetSnapshot() {
     fleetSeq += 1;
@@ -1891,6 +1964,408 @@ export function createMockHostBridge(): HermesHost {
       const found = list.find((item) => item.relativePath === relativePath) ?? null;
       return { file: found ? { ...found } : null };
     },
+    "subagents.list": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const fullKey = `${connectionId}::${profileId}::${sessionId}`;
+      const agentsMap = liveFixture?.agents ?? {};
+      const configuredAgents =
+        agentsMap[fullKey] ?? (sessionId ? agentsMap[sessionId] : undefined) ?? [];
+      if (configuredAgents.length > 0 && !lastKnownMockSubagents.has(fullKey)) {
+        lastKnownMockSubagents.set(
+          fullKey,
+          configuredAgents.map((a) => ({ ...a })),
+        );
+      }
+
+      const notFoundList = liveFixture?.subagentNotFoundMethods ?? [];
+      if (notFoundList.includes("subagent.list") || notFoundList.includes("subagents.list")) {
+        capabilityRegistry.markMethodNotFound({
+          method: "subagent.list",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        capabilityRegistry.markMethodNotFound({
+          method: "subagent.steer",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        capabilityRegistry.markMethodNotFound({
+          method: "subagent.interrupt",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        emitCapabilitiesPatch();
+        const fallback = (
+          lastKnownMockSubagents.get(fullKey) ??
+          configuredAgents
+        ).map((a) => ({ ...a, lastKnown: true }));
+        return {
+          agents: fallback,
+          readOnly: true,
+          lastKnown: true,
+          generation: capabilityRegistry.getSnapshot().generation,
+        };
+      }
+
+      const customErr = liveFixture?.subagentErrorByAction?.["subagents.list"];
+      if (customErr) {
+        const err = new Error(customErr.message);
+        (err as { code?: ErrorCode }).code = customErr.code;
+        throw err;
+      }
+
+      const list = configuredAgents.map((a) => ({ ...a }));
+      lastKnownMockSubagents.set(fullKey, list);
+      const snap = capabilityRegistry.getSnapshot();
+      const steerEntry = snap.entries.find((e) => e.actionId === "subagents.steer");
+      const interruptEntry = snap.entries.find((e) => e.actionId === "subagents.interrupt");
+      const readOnly =
+        (!steerEntry || steerEntry.runtimeStatus === "unavailable") &&
+        (!interruptEntry || interruptEntry.runtimeStatus === "unavailable");
+      return {
+        agents: list,
+        readOnly,
+        lastKnown: false,
+        generation: snap.generation,
+      };
+    },
+    "subagents.tail": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+      if (!sessionId || !agentId) {
+        const err = new Error("未选择要查看 Tail 的 Subagent");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const notFoundList = liveFixture?.subagentNotFoundMethods ?? [];
+      if (notFoundList.includes("subagent.tail") || notFoundList.includes("subagents.tail")) {
+        capabilityRegistry.markMethodNotFound({
+          method: "subagent.tail",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        emitCapabilitiesPatch();
+        const err = new Error("当前 Gateway 未提供 Subagent Tail 能力");
+        (err as { code?: ErrorCode }).code = "capability_unavailable";
+        throw err;
+      }
+      const customErr = liveFixture?.subagentErrorByAction?.["subagents.tail"];
+      if (customErr) {
+        const err = new Error(customErr.message);
+        (err as { code?: ErrorCode }).code = customErr.code;
+        throw err;
+      }
+      const fullKey = `${connectionId}::${profileId}::${sessionId}::${agentId}`;
+      const sessionAgentKey = `${sessionId}::${agentId}`;
+      const tailMap = liveFixture?.subagentTails ?? {};
+      const rawLines = tailMap[fullKey] ?? tailMap[sessionAgentKey] ?? tailMap[agentId] ?? [];
+      const bounded = boundSubagentTailLines(rawLines);
+      const tail: SubagentTailSnapshot = {
+        agentId,
+        lines: bounded.lines,
+        truncated: bounded.truncated,
+        generation: capabilityRegistry.getSnapshot().generation,
+        updatedAt: new Date().toISOString(),
+      };
+      return { tail };
+    },
+    "subagents.steer": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+      const text = typeof payload.text === "string" ? payload.text.trim() : "";
+      if (!sessionId || !agentId || !text) {
+        const err = new Error("请输入针对该 Subagent 的补充指令");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const notFoundList = liveFixture?.subagentNotFoundMethods ?? [];
+      if (notFoundList.includes("subagent.steer") || notFoundList.includes("subagents.steer")) {
+        capabilityRegistry.markMethodNotFound({
+          method: "subagent.steer",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        emitCapabilitiesPatch();
+        const err = new Error("当前 Gateway 不支持 Subagent 补充指令");
+        (err as { code?: ErrorCode }).code = "capability_unavailable";
+        throw err;
+      }
+      const customErr = liveFixture?.subagentErrorByAction?.["subagents.steer"];
+      if (customErr) {
+        const err = new Error(customErr.message);
+        (err as { code?: ErrorCode }).code = customErr.code;
+        throw err;
+      }
+      return {
+        steered: true,
+        agentId,
+      };
+    },
+    "subagents.interrupt": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
+      if (!sessionId || !agentId) {
+        const err = new Error("未选择要停止的 Subagent");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const notFoundList = liveFixture?.subagentNotFoundMethods ?? [];
+      if (
+        notFoundList.includes("subagent.interrupt") ||
+        notFoundList.includes("subagents.interrupt")
+      ) {
+        capabilityRegistry.markMethodNotFound({
+          method: "subagent.interrupt",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        emitCapabilitiesPatch();
+        const err = new Error("当前 Gateway 不支持停止 Subagent");
+        (err as { code?: ErrorCode }).code = "capability_unavailable";
+        throw err;
+      }
+      const customErr = liveFixture?.subagentErrorByAction?.["subagents.interrupt"];
+      if (customErr) {
+        const err = new Error(customErr.message);
+        (err as { code?: ErrorCode }).code = customErr.code;
+        throw err;
+      }
+      const fullKey = `${connectionId}::${profileId}::${sessionId}`;
+      const agentsMap = liveFixture?.agents ?? {};
+      const list = agentsMap[fullKey] ?? (sessionId ? agentsMap[sessionId] : undefined);
+      if (list) {
+        for (const a of list) {
+          if (a.agentId === agentId) {
+            a.status = "stopped";
+          }
+        }
+      }
+      const cached = lastKnownMockSubagents.get(fullKey);
+      if (cached) {
+        lastKnownMockSubagents.set(
+          fullKey,
+          cached.map((a) => (a.agentId === agentId ? { ...a, status: "stopped" } : a)),
+        );
+      }
+      return {
+        interrupted: true,
+        agentId,
+        status: "stopped" as const,
+      };
+    },
+    "checkpoints.list": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
+      const connectionId = scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+      const profileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId
+          : scope?.profileId ?? currentFleet.activeScope?.profileId ?? "default";
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const fullKey = `${connectionId}::${profileId}::${sessionId}`;
+      const ckptMap = liveFixture?.checkpoints ?? {};
+      const checkpoints = (
+        ckptMap[fullKey] ??
+        (sessionId ? ckptMap[sessionId] : undefined) ??
+        []
+      ).map((c) => ({ ...c }));
+      const notFoundList = liveFixture?.checkpointNotFoundMethods ?? [];
+      if (
+        notFoundList.includes("rollback.restore") ||
+        notFoundList.includes("checkpoint.restore")
+      ) {
+        capabilityRegistry.markMethodNotFound({
+          method: "rollback.restore",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        emitCapabilitiesPatch();
+      }
+      const customErr = liveFixture?.checkpointErrorByAction?.["checkpoints.list"];
+      if (customErr) {
+        const err = new Error(customErr.message);
+        (err as { code?: ErrorCode }).code = customErr.code;
+        throw err;
+      }
+      const snap = capabilityRegistry.getSnapshot();
+      const restoreEntry = snap.entries.find((e) => e.actionId === "checkpoint.restore");
+      const canRestore = Boolean(restoreEntry && restoreEntry.runtimeStatus !== "unavailable");
+      return {
+        checkpoints,
+        canRestore,
+        generation: snap.generation,
+      };
+    },
+    "checkpoints.diff": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
+      const sessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : scope?.sessionId ?? currentFleet.activeSessionId ?? "";
+      const checkpointId =
+        typeof payload.checkpointId === "string" ? payload.checkpointId.trim() : "";
+      if (!sessionId || !checkpointId) {
+        const err = new Error("未选择要对比的 Checkpoint");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const customErr = liveFixture?.checkpointErrorByAction?.["checkpoints.diff"];
+      if (customErr) {
+        const err = new Error(customErr.message);
+        (err as { code?: ErrorCode }).code = customErr.code;
+        throw err;
+      }
+      const diffMap = (liveFixture?.checkpointDiffs ?? {}) as Record<
+        string,
+        CheckpointDiffSnapshot | string
+      >;
+      const rawDiff = diffMap[`${sessionId}::${checkpointId}`] ?? diffMap[checkpointId];
+      const diff: CheckpointDiffSnapshot =
+        typeof rawDiff === "string"
+          ? {
+              checkpointId,
+              summary: "Checkpoint 差异摘要",
+              patch: rawDiff,
+              filesChanged: 1,
+            }
+          : (rawDiff ?? {
+              checkpointId,
+              summary: "Checkpoint 差异摘要",
+              patch: "",
+              filesChanged: 0,
+            });
+      return { diff: { ...diff } };
+    },
+    "checkpoints.restore": async (payload, scope) => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
+      if (payload.confirmed !== true) {
+        const err = new Error("恢复 Checkpoint 需要显式确认");
+        (err as { code?: ErrorCode }).code = "invalid_request";
+        throw err;
+      }
+      const snap = capabilityRegistry.getSnapshot();
+      const restoreEntry = snap.entries.find((e) => e.actionId === "checkpoint.restore");
+      const notFoundList = liveFixture?.checkpointNotFoundMethods ?? [];
+      if (
+        !restoreEntry ||
+        restoreEntry.runtimeStatus === "unavailable" ||
+        notFoundList.includes("rollback.restore") ||
+        notFoundList.includes("checkpoint.restore")
+      ) {
+        capabilityRegistry.markMethodNotFound({
+          method: "rollback.restore",
+          expectedOwnerGeneration: mockOwnerGen,
+          expectedAuthorityEpoch: 1,
+        });
+        emitCapabilitiesPatch();
+        const err = new Error(
+          "当前 Gateway 未提供 rollback.restore 能力，仅支持只读浏览与 Diff 对比",
+        );
+        (err as { code?: ErrorCode }).code = "capability_unavailable";
+        throw err;
+      }
+
+      const checkpointId =
+        typeof payload.checkpointId === "string" ? payload.checkpointId.trim() : "";
+      const boundConnectionId =
+        typeof payload.connectionId === "string"
+          ? payload.connectionId.trim()
+          : (scope?.connectionId ?? "");
+      const boundProfileId =
+        typeof payload.profileId === "string"
+          ? payload.profileId.trim()
+          : (scope?.profileId ?? "default");
+      const boundSessionId =
+        typeof payload.sessionId === "string"
+          ? payload.sessionId.trim()
+          : (scope?.sessionId ?? "");
+      const boundGeneration =
+        typeof payload.generation === "number" ? payload.generation : -1;
+
+      const activeConnectionId =
+        currentFleet.activeScope?.connectionId ?? scope?.connectionId ?? "local";
+      const activeProfileId =
+        currentFleet.activeScope?.profileId ?? scope?.profileId ?? "default";
+      const activeSessionId =
+        currentFleet.activeSessionId ??
+        currentFleet.activeScope?.sessionId ??
+        scope?.sessionId ??
+        "";
+
+      const check = validateCheckpointRestoreBinding(
+        {
+          connectionId: boundConnectionId,
+          profileId: boundProfileId,
+          sessionId: boundSessionId,
+          checkpointId,
+          generation: boundGeneration,
+        },
+        {
+          connectionId: activeConnectionId,
+          profileId: activeProfileId,
+          sessionId: activeSessionId,
+        },
+        snap.generation,
+      );
+      if (!check.valid) {
+        const err = new Error(check.message);
+        (err as { code?: ErrorCode }).code = check.code;
+        throw err;
+      }
+
+      const customErr = liveFixture?.checkpointErrorByAction?.["checkpoints.restore"];
+      if (customErr) {
+        const err = new Error(customErr.message);
+        (err as { code?: ErrorCode }).code = customErr.code;
+        throw err;
+      }
+
+      return {
+        restored: true,
+        checkpointId,
+        sessionId: activeSessionId,
+      };
+    },
     "chatState.exportMissingSession": async (): Promise<MissingSessionExport | null> => {
       if (!currentChatState.missingSession) return null;
       const m = currentChatState.missingSession;
@@ -2019,13 +2494,15 @@ export function createMockHostBridge(): HermesHost {
     }),
     "local.diagnose": async (): Promise<SanitizedDiagnosticsPayload> => buildMockDiagnostics(),
     "capabilities.describe": async (payload): Promise<CapabilitySnapshot> => {
+      const liveFixture = readE2EFixture() ?? fixture;
+      syncFixtureGenerationIfNeeded(liveFixture);
       const domain =
         typeof payload.domain === "string" ? (payload.domain as CapabilityDomainId) : undefined;
       const snap = capabilityRegistry.getSnapshot();
       if (domain && snap.capabilitiesReady) {
         const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === domain);
         if (meta?.probeMethod) {
-          const overrideOutcome = fixture?.capabilities?.probedDomains?.[domain];
+          const overrideOutcome = liveFixture?.capabilities?.probedDomains?.[domain];
           const tier = capabilityRegistry.getMethodTier(meta.probeMethod);
           const outcome =
             overrideOutcome ??
@@ -2219,12 +2696,13 @@ export function createMockHostBridge(): HermesHost {
         const typed = listener as (event: BridgeEvent<CapabilitySnapshot>) => void;
         capabilitiesListeners.add(typed);
         queueMicrotask(() => {
+          if (!capabilitiesListeners.has(typed)) return;
           listener({
             topic: "capabilities",
             scope: null,
             kind: "snapshot",
             seq: 0,
-            revision: 1,
+            revision: capabilityRegistry.getSnapshot().generation,
             payload: capabilityRegistry.getSnapshot(),
           });
         });

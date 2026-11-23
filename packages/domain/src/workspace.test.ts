@@ -21,16 +21,28 @@ import {
   reconcileWorkspaceFiles,
   selectWorkspaceAgent,
   selectWorkspaceArtifact,
+  selectWorkspaceCheckpoint,
   selectWorkspaceFile,
   selectWorkspaceFileLines,
   selectWorkspaceGitDiff,
   setWorkspaceActiveTab,
+  setWorkspaceAgentError,
   setWorkspaceAgentSteerText,
+  setWorkspaceAgentTail,
   setWorkspaceArtifactScroll,
   setWorkspaceArtifactZoom,
+  setWorkspaceCheckpointDiff,
+  setWorkspaceCheckpointError,
+  setWorkspaceCheckpointRestorePending,
   setWorkspaceTerminalScrollback,
   switchWorkspaceContext,
   toggleWorkspaceDirectory,
+  boundSubagentTailLines,
+  invalidateWorkspaceGeneration,
+  reconcileWorkspaceAgents,
+  reconcileWorkspaceCheckpoints,
+  validateCheckpointRestoreBinding,
+  MAX_SUBAGENT_TAIL_LINES,
 } from "./workspace";
 
 const ARTIFACT_V1: WorkspaceArtifactItem = {
@@ -361,5 +373,166 @@ describe("WorkspaceFrame & WorkspaceSessionState domain model (Ticket #35)", () 
         outdatedVersion: true,
       },
     ]);
+  });
+
+  it("models Subagents bounded tail, generation invalidation, read-only last-known roster, and Checkpoint restore confirmation/binding/error preservation (Ticket #41)", () => {
+    expect(getWorkspaceTabBinding("checkpoints")).toBe("active_chat");
+
+    // 1. Bounded Subagent tail (MAX_SUBAGENT_TAIL_LINES = 200)
+    const manyLines = Array.from({ length: 250 }, (_, idx) => `log-line-${idx + 1}`);
+    const bounded = boundSubagentTailLines(manyLines);
+    expect(bounded.truncated).toBe(true);
+    expect(bounded.lines).toHaveLength(MAX_SUBAGENT_TAIL_LINES);
+    expect(bounded.lines[0]).toBe("log-line-51");
+    expect(bounded.lines[MAX_SUBAGENT_TAIL_LINES - 1]).toBe("log-line-250");
+
+    const scopeA = { connectionId: "local", profileId: "default", sessionId: "sess-1" };
+    let state = createInitialWorkspaceSessionState(scopeA);
+    state = reconcileWorkspaceAgents(
+      state,
+      scopeA,
+      [
+        {
+          agentId: "sub-1",
+          name: "Verifier",
+          role: "Test Runner",
+          status: "running",
+          summary: "Running vitest",
+        },
+      ],
+      { readOnly: true, lastKnown: true },
+    );
+    expect(getActiveChatWorkspaceView(state).agentsReadOnly).toBe(true);
+    expect(getActiveChatWorkspaceView(state).agents[0].lastKnown).toBe(true);
+
+    // Store tail at generation 2
+    state = setWorkspaceAgentTail(
+      state,
+      {
+        agentId: "sub-1",
+        lines: ["step 1", "step 2"],
+        truncated: false,
+        generation: 2,
+        updatedAt: "2026-11-23T09:00:00.000Z",
+      },
+      scopeA,
+    );
+    expect(getActiveChatWorkspaceView(state).agentTailById["sub-1"]?.lines).toEqual(["step 1", "step 2"]);
+    expect(getActiveChatWorkspaceView(state).tailInvalidatedById["sub-1"]).toBeFalsy();
+
+    // Generation bumps to 3 -> old tail is invalidated and cleared
+    state = invalidateWorkspaceGeneration(state, 3);
+    expect(getActiveChatWorkspaceView(state).agentTailById["sub-1"]).toBeUndefined();
+    expect(getActiveChatWorkspaceView(state).tailInvalidatedById["sub-1"]).toBe(true);
+
+    // Subagent error stores safe typed ErrorCode
+    state = setWorkspaceAgentError(state, {
+      code: "conflict",
+      message: "Subagent 停止请求未被确认",
+      retryable: true,
+      actionId: "subagents.interrupt",
+      detail: "Gateway denied interrupt while tool call is locked",
+    });
+    expect(getActiveChatWorkspaceView(state).agentError?.code).toBe("conflict");
+
+    // 2. Checkpoints: list, select, diff, explicit restore confirmation, scope/generation binding, and failure preserving selection
+    state = reconcileWorkspaceCheckpoints(
+      state,
+      scopeA,
+      [
+        {
+          checkpointId: "ckpt-1",
+          title: "Before schema migration",
+          summary: "3 files tracked",
+          createdAt: "2026-11-23T08:30:00.000Z",
+        },
+        {
+          checkpointId: "ckpt-2",
+          title: "After test pass",
+          summary: "5 files tracked",
+          createdAt: "2026-11-23T08:45:00.000Z",
+        },
+      ],
+      { canRestore: false },
+    );
+    expect(getActiveChatWorkspaceView(state).checkpointsCanRestore).toBe(false);
+    expect(getActiveChatWorkspaceView(state).selectedCheckpointId).toBe("ckpt-1");
+
+    state = selectWorkspaceCheckpoint(state, "ckpt-2");
+    state = setWorkspaceCheckpointDiff(
+      state,
+      {
+        checkpointId: "ckpt-2",
+        summary: "2 files changed (+14 -3)",
+        patch: "@@ -1,3 +1,14 @@\n+export const ready = true;",
+        filesChanged: 2,
+      },
+      scopeA,
+    );
+    expect(getActiveChatWorkspaceView(state).checkpointDiffById["ckpt-2"]?.filesChanged).toBe(2);
+
+    // Explicit restore confirmation pending state
+    state = setWorkspaceCheckpointRestorePending(state, "ckpt-2");
+    expect(getActiveChatWorkspaceView(state).checkpointRestorePendingId).toBe("ckpt-2");
+
+    // Validate restore binding against current scope & generation
+    const validCheck = validateCheckpointRestoreBinding(
+      {
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "sess-1",
+        checkpointId: "ckpt-2",
+        generation: 3,
+      },
+      scopeA,
+      3,
+    );
+    expect(validCheck).toEqual({ valid: true });
+
+    // Cross-scope restore is rejected with scope_mismatch
+    const crossScopeCheck = validateCheckpointRestoreBinding(
+      {
+        connectionId: "local",
+        profileId: "work",
+        sessionId: "sess-1",
+        checkpointId: "ckpt-2",
+        generation: 3,
+      },
+      scopeA,
+      3,
+    );
+    expect(crossScopeCheck).toEqual({
+      valid: false,
+      code: "scope_mismatch",
+      message: "Checkpoint 恢复绑定与当前活动 Scope 不匹配，已拒绝跨 Scope 回滚。",
+    });
+
+    // Stale generation restore is rejected with conflict
+    const staleGenCheck = validateCheckpointRestoreBinding(
+      {
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "sess-1",
+        checkpointId: "ckpt-2",
+        generation: 2,
+      },
+      scopeA,
+      3,
+    );
+    expect(staleGenCheck).toEqual({
+      valid: false,
+      code: "conflict",
+      message: "连接代际（Generation）已变更，请重新确认后再恢复 Checkpoint。",
+    });
+
+    // Failure on restore preserves selectedCheckpointId ("ckpt-2") and records safe error
+    state = setWorkspaceCheckpointError(state, {
+      code: "conflict",
+      message: "恢复 Checkpoint 失败，当前 Session 状态未变更",
+      retryable: true,
+      actionId: "checkpoint.restore",
+    });
+    expect(getActiveChatWorkspaceView(state).selectedCheckpointId).toBe("ckpt-2");
+    expect(getActiveChatWorkspaceView(state).checkpointError?.code).toBe("conflict");
   });
 });

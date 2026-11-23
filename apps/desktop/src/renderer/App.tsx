@@ -14,6 +14,7 @@ import {
   type CapabilityEntry,
   type CapabilitySnapshot,
   type ChatSessionProjection,
+  type CheckpointDiffSnapshot,
   type FleetSnapshot,
   type GatewayConfigSnapshot,
   type GatewayConfigUpdateResult,
@@ -27,8 +28,10 @@ import {
   type SanitizedDiagnosticsPayload,
   type SessionSummary,
   type SessionTranscriptSnapshot,
+  type SubagentTailSnapshot,
   type WorkspaceAgentItem,
   type WorkspaceArtifactItem,
+  type WorkspaceCheckpointItem,
   type WorkspaceFileEntry,
   type WorkspaceGitDiffItem,
   type WorkspaceTab,
@@ -51,26 +54,35 @@ import {
   getCopy,
   getTopmostSurface,
   hideWorkspace,
+  invalidateWorkspaceGeneration,
   markWorkspaceArtifactsExternalStale,
+  markWorkspaceCheckpointRestored,
   markWorkspaceFilesExternalStale,
   openWorkspace,
   projectSettingsSectionFields,
   reconcileWorkspaceAgents,
   reconcileWorkspaceArtifacts,
+  reconcileWorkspaceCheckpoints,
   reconcileWorkspaceFiles,
   reconcileWorkspaceGitDiffs,
   resolveProfileManagementAvailability,
   resolveWorkspaceChatKey,
   selectWorkspaceAgent,
   selectWorkspaceArtifact,
+  selectWorkspaceCheckpoint,
   selectWorkspaceFile,
   selectWorkspaceFileLines,
   selectWorkspaceGitDiff,
   setWorkspaceActiveTab,
+  setWorkspaceAgentError,
   setWorkspaceAgentSteerText,
+  setWorkspaceAgentTail,
   setWorkspaceAnnotations,
   setWorkspaceArtifactScroll,
   setWorkspaceArtifactZoom,
+  setWorkspaceCheckpointDiff,
+  setWorkspaceCheckpointError,
+  setWorkspaceCheckpointRestorePending,
   shellReducer,
   switchWorkspaceContext,
   toggleWorkspaceDirectory,
@@ -93,6 +105,8 @@ export default function App() {
   const [workspaceState, setWorkspaceState] = useState(() =>
     createInitialWorkspaceSessionState(null),
   );
+  const workspaceStateRef = useRef(workspaceState);
+  workspaceStateRef.current = workspaceState;
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
@@ -101,6 +115,7 @@ export default function App() {
   const [fleetResyncNonce, setFleetResyncNonce] = useState(0);
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
   const [configSnapshot, setConfigSnapshot] = useState<GatewayConfigSnapshot | null>(null);
+  const [agentInterrupting, setAgentInterrupting] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const paletteTriggerRef = useRef<HTMLButtonElement>(null);
@@ -291,7 +306,37 @@ export default function App() {
           )
         : Promise.resolve(null);
 
-      const [filesRes, artifactsRes] = await Promise.all([filesPromise, artifactsPromise]);
+      const [filesRes, artifactsRes, subagentsRes, checkpointsRes] = await Promise.all([
+        filesPromise,
+        artifactsPromise,
+        targetChatScope.sessionId
+          ? host.request<{
+              agents?: WorkspaceAgentItem[];
+              readOnly?: boolean;
+              lastKnown?: boolean;
+            }>(
+              "subagents.list",
+              {
+                sessionId: targetChatScope.sessionId,
+                profileId: targetChatScope.profileId ?? "default",
+              },
+              targetChatScope,
+            )
+          : Promise.resolve(null),
+        targetChatScope.sessionId
+          ? host.request<{
+              checkpoints?: WorkspaceCheckpointItem[];
+              canRestore?: boolean;
+            }>(
+              "checkpoints.list",
+              {
+                sessionId: targetChatScope.sessionId,
+                profileId: targetChatScope.profileId ?? "default",
+              },
+              targetChatScope,
+            )
+          : Promise.resolve(null),
+      ]);
 
       setWorkspaceState((prev) => {
         let next = switchWorkspaceContext(prev, targetChatScope);
@@ -310,18 +355,46 @@ export default function App() {
             targetChatScope,
             artifactsRes.value.artifacts ?? [],
           );
-          if (artifactsRes.value.agents) {
+          if (artifactsRes.value.agents && (!subagentsRes || !subagentsRes.ok)) {
             next = reconcileWorkspaceAgents(next, targetChatScope, artifactsRes.value.agents);
           }
           if (artifactsRes.value.stale) {
             next = markWorkspaceArtifactsExternalStale(next, targetChatScope);
           }
         }
+        if (subagentsRes && subagentsRes.ok) {
+          next = reconcileWorkspaceAgents(
+            next,
+            targetChatScope,
+            subagentsRes.value.agents ?? [],
+            {
+              readOnly: Boolean(subagentsRes.value.readOnly),
+              lastKnown: Boolean(subagentsRes.value.lastKnown),
+            },
+          );
+        }
+        if (checkpointsRes && checkpointsRes.ok) {
+          next = reconcileWorkspaceCheckpoints(
+            next,
+            targetChatScope,
+            checkpointsRes.value.checkpoints ?? [],
+            {
+              canRestore: checkpointsRes.value.canRestore ?? true,
+            },
+          );
+        }
         return next;
       });
     },
     [],
   );
+
+  // Invalidate old Subagent tails and pending Checkpoint restore confirmation when capability generation changes
+  useEffect(() => {
+    setWorkspaceState((prev) =>
+      invalidateWorkspaceGeneration(prev, state.capabilities.generation),
+    );
+  }, [state.capabilities.generation]);
 
   useEffect(() => {
     setWorkspaceState((prev) => switchWorkspaceContext(prev, activeChatScope));
@@ -437,6 +510,326 @@ export default function App() {
     },
     [activeChatScope, composerDraft],
   );
+
+  const handleRefreshAgentTail = useCallback(
+    async (agentIdOverride?: string) => {
+      if (!activeChatScope?.sessionId) return;
+      const chatView = getActiveChatWorkspaceView(workspaceStateRef.current);
+      const agentId =
+        agentIdOverride ?? chatView.selectedAgentId ?? chatView.agents[0]?.agentId ?? null;
+      if (!agentId) return;
+
+      if (chatView.agentError) {
+        setWorkspaceState((prev) => setWorkspaceAgentError(prev, null, activeChatScope));
+      }
+      const res = await host.request<{ tail?: SubagentTailSnapshot }>(
+        "subagents.tail",
+        {
+          agentId,
+          sessionId: activeChatScope.sessionId,
+          profileId: activeChatScope.profileId ?? "default",
+        },
+        activeChatScope,
+      );
+      if (res.ok && res.value.tail) {
+        const tail = res.value.tail;
+        setWorkspaceState((prev) => setWorkspaceAgentTail(prev, tail, activeChatScope));
+      } else if (!res.ok) {
+        setWorkspaceState((prev) =>
+          setWorkspaceAgentError(
+            prev,
+            {
+              code: res.error.code,
+              message: res.error.message,
+              retryable: res.error.retryable,
+              actionId: "subagents.tail",
+              detail: `code=${res.error.code} requestId=${res.error.requestId}`,
+            },
+            activeChatScope,
+          ),
+        );
+      }
+    },
+    [activeChatScope],
+  );
+
+  const handleSteerAgent = useCallback(async () => {
+    if (!activeChatScope?.sessionId) return;
+    const chatView = getActiveChatWorkspaceView(workspaceStateRef.current);
+    const agentId = chatView.selectedAgentId ?? chatView.agents[0]?.agentId ?? null;
+    const text = chatView.steerText.trim();
+    if (!agentId || !text) return;
+
+    if (chatView.agentError) {
+      setWorkspaceState((prev) => setWorkspaceAgentError(prev, null, activeChatScope));
+    }
+    const res = await host.request<{ steered?: boolean }>(
+      "subagents.steer",
+      {
+        agentId,
+        text,
+        sessionId: activeChatScope.sessionId,
+        profileId: activeChatScope.profileId ?? "default",
+      },
+      activeChatScope,
+    );
+    if (res.ok) {
+      setWorkspaceState((prev) => setWorkspaceAgentSteerText(prev, ""));
+    } else {
+      setWorkspaceState((prev) =>
+        setWorkspaceAgentError(
+          prev,
+          {
+            code: res.error.code,
+            message: res.error.message,
+            retryable: res.error.retryable,
+            actionId: "subagents.steer",
+            detail: `code=${res.error.code} requestId=${res.error.requestId}`,
+          },
+          activeChatScope,
+        ),
+      );
+    }
+  }, [activeChatScope]);
+
+  const handleInterruptAgent = useCallback(async () => {
+    if (!activeChatScope?.sessionId || agentInterrupting) return;
+    const chatView = getActiveChatWorkspaceView(workspaceStateRef.current);
+    const agentId = chatView.selectedAgentId ?? chatView.agents[0]?.agentId ?? null;
+    if (!agentId) return;
+
+    setAgentInterrupting(true);
+    if (chatView.agentError) {
+      setWorkspaceState((prev) => setWorkspaceAgentError(prev, null, activeChatScope));
+    }
+    try {
+      const res = await host.request<{
+        interrupted?: boolean;
+        agentId?: string;
+        status?: WorkspaceAgentItem["status"];
+      }>(
+        "subagents.interrupt",
+        {
+          agentId,
+          sessionId: activeChatScope.sessionId,
+          profileId: activeChatScope.profileId ?? "default",
+        },
+        activeChatScope,
+      );
+      if (res.ok && res.value.interrupted) {
+        const nextStatus = res.value.status ?? "stopped";
+        setWorkspaceState((prev) => {
+          const current = getActiveChatWorkspaceView(prev);
+          return reconcileWorkspaceAgents(
+            prev,
+            activeChatScope,
+            current.agents.map((a) =>
+              a.agentId === agentId ? { ...a, status: nextStatus } : a,
+            ),
+          );
+        });
+      } else if (!res.ok) {
+        // NEVER pretend stop succeeded when interrupt fails!
+        setWorkspaceState((prev) =>
+          setWorkspaceAgentError(
+            prev,
+            {
+              code: res.error.code,
+              message: res.error.message,
+              retryable: res.error.retryable,
+              actionId: "subagents.interrupt",
+              detail: `code=${res.error.code} requestId=${res.error.requestId}`,
+            },
+            activeChatScope,
+          ),
+        );
+      }
+    } finally {
+      setAgentInterrupting(false);
+    }
+  }, [activeChatScope, agentInterrupting]);
+
+  const handleRetryAgentAction = useCallback(() => {
+    const chatView = getActiveChatWorkspaceView(workspaceStateRef.current);
+    const lastAction = chatView.agentError?.actionId;
+    if (lastAction === "subagents.interrupt") {
+      void handleInterruptAgent();
+    } else if (lastAction === "subagents.steer") {
+      void handleSteerAgent();
+    } else if (lastAction === "subagents.tail") {
+      void handleRefreshAgentTail();
+    } else if (activeChatScope) {
+      void refreshWorkspaceData(activeChatScope);
+    }
+  }, [
+    activeChatScope,
+    handleInterruptAgent,
+    handleRefreshAgentTail,
+    handleSteerAgent,
+    refreshWorkspaceData,
+  ]);
+
+  const handleDiffCheckpoint = useCallback(
+    async (checkpointId?: string) => {
+      if (!activeChatScope?.sessionId) return;
+      const chatView = getActiveChatWorkspaceView(workspaceStateRef.current);
+      const targetId =
+        checkpointId ??
+        chatView.selectedCheckpointId ??
+        chatView.checkpoints[0]?.checkpointId ??
+        null;
+      if (!targetId) return;
+
+      if (chatView.checkpointError) {
+        setWorkspaceState((prev) => setWorkspaceCheckpointError(prev, null, activeChatScope));
+      }
+      const res = await host.request<{ diff?: CheckpointDiffSnapshot }>(
+        "checkpoints.diff",
+        {
+          checkpointId: targetId,
+          sessionId: activeChatScope.sessionId,
+          profileId: activeChatScope.profileId ?? "default",
+        },
+        activeChatScope,
+      );
+      if (res.ok && res.value.diff) {
+        const diff = res.value.diff;
+        setWorkspaceState((prev) => setWorkspaceCheckpointDiff(prev, diff, activeChatScope));
+      } else if (!res.ok) {
+        setWorkspaceState((prev) =>
+          setWorkspaceCheckpointError(
+            prev,
+            {
+              code: res.error.code,
+              message: res.error.message,
+              retryable: res.error.retryable,
+              actionId: "checkpoint.diff",
+              detail: `code=${res.error.code} requestId=${res.error.requestId}`,
+            },
+            activeChatScope,
+          ),
+        );
+      }
+    },
+    [activeChatScope],
+  );
+
+  const handleConfirmRestoreCheckpoint = useCallback(async () => {
+    if (!activeChatScope?.sessionId) return;
+    const chatView = getActiveChatWorkspaceView(workspaceStateRef.current);
+    const checkpointId =
+      chatView.checkpointRestorePendingId ?? chatView.selectedCheckpointId ?? null;
+    if (!checkpointId) return;
+
+    if (chatView.checkpointError) {
+      setWorkspaceState((prev) => setWorkspaceCheckpointError(prev, null, activeChatScope));
+    }
+    const res = await host.request<{ restored?: boolean; checkpointId?: string }>(
+      "checkpoints.restore",
+      {
+        checkpointId,
+        confirmed: true,
+        connectionId: activeChatScope.connectionId,
+        profileId: activeChatScope.profileId ?? "default",
+        sessionId: activeChatScope.sessionId,
+        generation: state.capabilities.generation,
+      },
+      activeChatScope,
+    );
+    if (res.ok && res.value.restored) {
+      setWorkspaceState((prev) =>
+        markWorkspaceCheckpointRestored(prev, checkpointId, activeChatScope),
+      );
+      dispatch({
+        type: "ANNOUNCE",
+        message: getCopy("workspace.checkpoints.restoredNotice"),
+      });
+    } else if (!res.ok) {
+      // Failure preserves selectedCheckpointId and shows safe recovery action
+      setWorkspaceState((prev) =>
+        setWorkspaceCheckpointError(
+          prev,
+          {
+            code: res.error.code,
+            message: res.error.message,
+            retryable: res.error.retryable,
+            actionId: "checkpoint.restore",
+            detail: `code=${res.error.code} requestId=${res.error.requestId}`,
+          },
+          activeChatScope,
+        ),
+      );
+    }
+  }, [activeChatScope, state.capabilities.generation]);
+
+  const handleRetryCheckpointAction = useCallback(() => {
+    const chatView = getActiveChatWorkspaceView(workspaceStateRef.current);
+    if (chatView.checkpointError?.actionId === "checkpoint.restore") {
+      void handleConfirmRestoreCheckpoint();
+    } else {
+      void handleDiffCheckpoint();
+    }
+  }, [handleConfirmRestoreCheckpoint, handleDiffCheckpoint]);
+
+  const activeChatViewForEffects = getActiveChatWorkspaceView(workspaceState);
+  const selectedAgentIdForTail =
+    activeChatViewForEffects.selectedAgentId ??
+    activeChatViewForEffects.agents[0]?.agentId ??
+    null;
+  const hasSelectedAgentTail = Boolean(
+    selectedAgentIdForTail &&
+      (activeChatViewForEffects.agentTailById[selectedAgentIdForTail] ||
+        activeChatViewForEffects.tailInvalidatedById[selectedAgentIdForTail]),
+  );
+  const hasAgentError = Boolean(activeChatViewForEffects.agentError);
+
+  useEffect(() => {
+    if (
+      workspaceState.frame.mode === "open" &&
+      workspaceState.frame.activeTab === "agents" &&
+      selectedAgentIdForTail &&
+      !hasSelectedAgentTail &&
+      !hasAgentError
+    ) {
+      void handleRefreshAgentTail(selectedAgentIdForTail);
+    }
+  }, [
+    handleRefreshAgentTail,
+    hasAgentError,
+    hasSelectedAgentTail,
+    selectedAgentIdForTail,
+    workspaceState.frame.activeTab,
+    workspaceState.frame.mode,
+  ]);
+
+  const selectedCheckpointIdForDiff =
+    activeChatViewForEffects.selectedCheckpointId ??
+    activeChatViewForEffects.checkpoints[0]?.checkpointId ??
+    null;
+  const hasSelectedCheckpointDiff = Boolean(
+    selectedCheckpointIdForDiff &&
+      activeChatViewForEffects.checkpointDiffById[selectedCheckpointIdForDiff],
+  );
+  const hasCheckpointError = Boolean(activeChatViewForEffects.checkpointError);
+
+  useEffect(() => {
+    if (
+      workspaceState.frame.mode === "open" &&
+      workspaceState.frame.activeTab === "checkpoints" &&
+      selectedCheckpointIdForDiff &&
+      !hasSelectedCheckpointDiff &&
+      !hasCheckpointError
+    ) {
+      void handleDiffCheckpoint(selectedCheckpointIdForDiff);
+    }
+  }, [
+    handleDiffCheckpoint,
+    hasCheckpointError,
+    hasSelectedCheckpointDiff,
+    selectedCheckpointIdForDiff,
+    workspaceState.frame.activeTab,
+    workspaceState.frame.mode,
+  ]);
 
   const handleCreateSession = useCallback(async () => {
     if (!hasReadyConnection || !effectiveScope || !canCreateSession) {
@@ -1076,9 +1469,11 @@ export default function App() {
           });
         },
         openWorkspaceTab: (tab) => {
+          dispatch({ type: "CLOSE_SURFACE", surface: "capabilities" });
           handleOpenWorkspace(tab);
         },
         toggleWorkspace: () => {
+          dispatch({ type: "CLOSE_SURFACE", surface: "capabilities" });
           handleToggleWorkspace();
         },
         openSettings: () => {
@@ -1528,6 +1923,9 @@ export default function App() {
 
           <WorkspaceDrawer
             workspaceState={workspaceState}
+            capabilities={state.capabilities}
+            activeChatScope={activeChatScope}
+            agentInterrupting={agentInterrupting}
             onSelectTab={handleSelectWorkspaceTab}
             onHide={handleHideWorkspace}
             onClose={handleCloseWorkspace}
@@ -1562,6 +1960,26 @@ export default function App() {
             onChangeSteerText={(text) =>
               setWorkspaceState((prev) => setWorkspaceAgentSteerText(prev, text))
             }
+            onSteerAgent={() => void handleSteerAgent()}
+            onInterruptAgent={() => void handleInterruptAgent()}
+            onRefreshAgentTail={() => void handleRefreshAgentTail()}
+            onRetryAgentAction={handleRetryAgentAction}
+            onSelectCheckpoint={(checkpointId) =>
+              setWorkspaceState((prev) => selectWorkspaceCheckpoint(prev, checkpointId))
+            }
+            onDiffCheckpoint={(checkpointId) => void handleDiffCheckpoint(checkpointId)}
+            onRequestRestoreCheckpoint={(checkpointId) =>
+              setWorkspaceState((prev) =>
+                setWorkspaceCheckpointRestorePending(prev, checkpointId, activeChatScope),
+              )
+            }
+            onConfirmRestoreCheckpoint={() => void handleConfirmRestoreCheckpoint()}
+            onCancelRestoreCheckpoint={() =>
+              setWorkspaceState((prev) =>
+                setWorkspaceCheckpointRestorePending(prev, null, activeChatScope),
+              )
+            }
+            onRetryCheckpointAction={handleRetryCheckpointAction}
           />
         </div>
 

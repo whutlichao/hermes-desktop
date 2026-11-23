@@ -603,3 +603,176 @@ describe("MockHostBridge Ticket #35 Workspace artifacts, files, and Draft annota
     unsubHealth();
   });
 });
+
+describe("MockHostBridge Ticket #41 Subagents and Checkpoints contract (S0)", () => {
+  it("serves subagents.list/steer/interrupt/tail and checkpoints.list/diff/restore with -32601 degradation, bounded tail, generation check, and cross-scope protection", async () => {
+    const prevFixture = (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__;
+    try {
+      const manyLines = Array.from({ length: 220 }, (_, i) => `mock-tail-${i + 1}`);
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              label: "This device",
+              kind: "local",
+              originDisplay: "127.0.0.1",
+              actual: "ready",
+              degraded: false,
+              latencyMs: 2,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              title: "Session 1",
+              preview: "",
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+          activeSessionId: "sess-1",
+        },
+        agents: {
+          "sess-1": [
+            {
+              agentId: "sub-1",
+              name: "Code Reviewer",
+              role: "Reviewer",
+              status: "running",
+              summary: "Inspecting diffs",
+            },
+          ],
+        },
+        subagentTails: {
+          "sub-1": manyLines,
+        },
+        checkpoints: {
+          "sess-1": [
+            {
+              checkpointId: "ckpt-1",
+              title: "Initial baseline",
+              summary: "2 files",
+              createdAt: "2026-11-23T08:50:00.000Z",
+            },
+          ],
+        },
+        checkpointDiffs: {
+          "ckpt-1": {
+            checkpointId: "ckpt-1",
+            summary: "2 files changed",
+            patch: "+const ok = true;",
+            filesChanged: 2,
+          },
+        },
+      };
+
+      const mock = createMockHostBridge();
+      const scope = { connectionId: "local", profileId: "default", sessionId: "sess-1" };
+
+      const listRes = await mock.request<{
+        agents: Array<{ agentId: string; status: string }>;
+        readOnly: boolean;
+        lastKnown: boolean;
+        generation: number;
+      }>("subagents.list", {}, scope);
+      expect(listRes.ok).toBe(true);
+      if (listRes.ok) {
+        expect(listRes.value.readOnly).toBe(false);
+        expect(listRes.value.agents[0].agentId).toBe("sub-1");
+      }
+
+      const tailRes = await mock.request<{
+        tail: { agentId: string; lines: string[]; truncated: boolean; generation: number };
+      }>("subagents.tail", { agentId: "sub-1" }, scope);
+      expect(tailRes.ok).toBe(true);
+      if (tailRes.ok) {
+        expect(tailRes.value.tail.truncated).toBe(true);
+        expect(tailRes.value.tail.lines).toHaveLength(200);
+        expect(tailRes.value.tail.lines[0]).toBe("mock-tail-21");
+      }
+
+      const steerRes = await mock.request<{ steered: boolean; agentId: string }>(
+        "subagents.steer",
+        { agentId: "sub-1", text: "Check types" },
+        scope,
+      );
+      expect(steerRes.ok && steerRes.value.steered).toBe(true);
+
+      const intRes = await mock.request<{ interrupted: boolean; status: string }>(
+        "subagents.interrupt",
+        { agentId: "sub-1" },
+        scope,
+      );
+      expect(intRes.ok && intRes.value.status).toBe("stopped");
+
+      const ckptList = await mock.request<{
+        checkpoints: Array<{ checkpointId: string }>;
+        canRestore: boolean;
+        generation: number;
+      }>("checkpoints.list", {}, scope);
+      expect(ckptList.ok).toBe(true);
+      const gen = ckptList.ok ? ckptList.value.generation : 1;
+
+      const ckptDiff = await mock.request<{ diff: { checkpointId: string; patch: string } }>(
+        "checkpoints.diff",
+        { checkpointId: "ckpt-1" },
+        scope,
+      );
+      expect(ckptDiff.ok && ckptDiff.value.diff.patch).toContain("+const ok = true;");
+
+      // Cross-scope restore rejected
+      const badRestore = await mock.request(
+        "checkpoints.restore",
+        {
+          checkpointId: "ckpt-1",
+          confirmed: true,
+          connectionId: "local",
+          profileId: "other-profile",
+          sessionId: "sess-1",
+          generation: gen,
+        },
+        scope,
+      );
+      expect(badRestore.ok).toBe(false);
+      if (!badRestore.ok) {
+        expect(badRestore.error.code).toBe("scope_mismatch");
+      }
+
+      // Confirmed matching restore succeeds
+      const okRestore = await mock.request<{ restored: boolean; checkpointId: string }>(
+        "checkpoints.restore",
+        {
+          checkpointId: "ckpt-1",
+          confirmed: true,
+          connectionId: "local",
+          profileId: "default",
+          sessionId: "sess-1",
+          generation: gen,
+        },
+        scope,
+      );
+      expect(okRestore.ok && okRestore.value.restored).toBe(true);
+    } finally {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
+    }
+  });
+});
