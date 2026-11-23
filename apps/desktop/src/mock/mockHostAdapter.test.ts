@@ -572,4 +572,34 @@ describe("MockHostBridge Ticket #35 Workspace artifacts, files, and Draft annota
       (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
     }
   });
+
+  it("supports Ticket #34 connection.health topic snapshot/patch parity, connections.retry recovery, and focus_scope command", async () => {
+    const mock = createMockHostBridge();
+    const healthEvents: BridgeEvent[] = [];
+    const unsubHealth = mock.subscribe("connection.health", null, (ev) => healthEvents.push(ev));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(healthEvents).toHaveLength(1);
+    expect(healthEvents[0].topic).toBe("connection.health");
+    expect(healthEvents[0].kind).toBe("snapshot");
+
+    // Adding a trusted SSH connection emits a connection.health update with latency and health summary
+    const addSsh = await mock.request<ConnectionMutationResponse>("connections.add", {
+      kind: "ssh",
+      label: "Fleet Node",
+      host: "lab.local",
+      user: "ubuntu",
+    });
+    expect(addSsh.ok && addSsh.value.committed).toBe(true);
+    expect(healthEvents.length).toBeGreaterThanOrEqual(2);
+    const latestHealth = healthEvents[healthEvents.length - 1].payload as Array<{
+      connectionId: string;
+      actual: string;
+      latencyMs: number | null;
+      nextRetryAt: number | null;
+    }>;
+    expect(latestHealth.some((c) => c.connectionId === "fleet-node" && c.actual === "ready")).toBe(true);
+
+    unsubHealth();
+  });
 });

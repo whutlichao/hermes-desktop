@@ -1,6 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, Menu, screen, session, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  Notification,
+  powerMonitor,
+  screen,
+  session,
+  shell,
+} from "electron";
 import {
   type AppCommand,
   type AppInfo,
@@ -210,6 +221,28 @@ connectionSupervisor = new ConnectionSupervisor(localBackendManager, {
   authManager: remoteAuthManager,
   chatSessionStateStore,
   sshTransport: sshTransportManager,
+  isAppForeground: () => {
+    const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
+    return Boolean(win && !win.isDestroyed() && win.isFocused());
+  },
+  onBackgroundNotification: (notif) => {
+    if (!Notification.isSupported()) return;
+    const osNotif = new Notification({
+      title: notif.title,
+      body: notif.body,
+      silent: false,
+    });
+    osNotif.on("click", () => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        mainWindow = createMainWindow();
+      } else {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+      }
+      dispatchAppCommand(notif.focusCommand);
+    });
+    osNotif.show();
+  },
 });
 const registryBridge = createRegistryBridgeHandlers(registryStore, {
   authManager: remoteAuthManager,
@@ -226,14 +259,15 @@ const registryBridge = createRegistryBridgeHandlers(registryStore, {
 });
 
 registryBridge.subscribeRegistry((event) => {
-  if (
-    event.kind === "patch" &&
-    event.payload.diff &&
-    (event.payload.diff.dialMaterialChanged ||
+  if (event.kind === "patch" && event.payload.diff) {
+    void connectionSupervisor.handleRegistrySnapshot(event.payload.snapshot, event.payload.diff);
+    if (
+      event.payload.diff.dialMaterialChanged ||
       event.payload.diff.credentialsChanged ||
-      event.payload.diff.changes.some((c) => c.dialMaterialChanged))
-  ) {
-    connectionSupervisor.invalidateCapabilities("registry_changed");
+      event.payload.diff.changes.some((c) => c.dialMaterialChanged)
+    ) {
+      connectionSupervisor.invalidateCapabilities("registry_changed");
+    }
   }
 });
 
@@ -589,6 +623,13 @@ app.whenReady().then(async () => {
     void connectionSupervisor.connectLocal(startupProfile);
   }
 
+  powerMonitor.on("suspend", () => {
+    void connectionSupervisor.suspend();
+  });
+  powerMonitor.on("resume", () => {
+    void connectionSupervisor.resume();
+  });
+
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0 && !isQuitting) {
       mainWindow = createMainWindow();
@@ -603,8 +644,7 @@ app.on("before-quit", () => {
     unsub();
   }
   activeSubscriptions.clear();
-  void connectionSupervisor.dispose();
-  void registryStore.flush(2000).finally(() => {
+  void connectionSupervisor.shutdown({ timeoutMs: 2000 }).finally(() => {
     registryStore.close();
   });
 });

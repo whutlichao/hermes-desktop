@@ -80,6 +80,7 @@ export interface GatewayClientConnectOptions {
 
 export type GatewayNotificationListener = (method: string, params: Record<string, unknown>) => void;
 export type GatewayCloseListener = (reason: string) => void;
+export type GatewayInboundFrameListener = (opcode: number, payload: Buffer) => void;
 
 export class GatewayClient {
   private socket: net.Socket;
@@ -98,6 +99,7 @@ export class GatewayClient {
   >();
   private readonly notificationListeners = new Set<GatewayNotificationListener>();
   private readonly closeListeners = new Set<GatewayCloseListener>();
+  private readonly inboundFrameListeners = new Set<GatewayInboundFrameListener>();
 
   private constructor(socket: net.Socket) {
     this.socket = socket;
@@ -283,6 +285,10 @@ export class GatewayClient {
       }
       this.rxBuffer = this.rxBuffer.subarray(offset + maskLen + len);
 
+      for (const listener of this.inboundFrameListeners) {
+        listener(opcode, payload);
+      }
+
       if (opcode === 0x8) {
         this.close();
         return;
@@ -427,6 +433,18 @@ export class GatewayClient {
     return () => {
       this.closeListeners.delete(listener);
     };
+  }
+
+  onInboundFrame(listener: GatewayInboundFrameListener): () => void {
+    this.inboundFrameListeners.add(listener);
+    return () => {
+      this.inboundFrameListeners.delete(listener);
+    };
+  }
+
+  sendPing(payload: Buffer = Buffer.alloc(0)): void {
+    if (this.closed || this.socket.destroyed) return;
+    this.socket.write(encodeClientFrame(0x9, payload));
   }
 
   close(): void {

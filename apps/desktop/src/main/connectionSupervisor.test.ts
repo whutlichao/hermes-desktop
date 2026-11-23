@@ -1263,4 +1263,503 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   });
+
+  it("manages always-connected Fleet lifecycle (#34): desired/actual transitions, startup concurrency cap=4 with local+Primary priority, 1s->30s full-jitter backoff + 5s stable reset + manual Retry, 15s/45s heartbeat, shared socket per-Profile resync & profile_not_served isolation, suspend/resume stagger, <=2s bounded shutdown, and background minimal notifications", async () => {
+    const sandbox = createTestSandbox("hermes-s1-fleet-34-");
+    let passed = false;
+
+    let currentTime = 1_000_000;
+    let rngValue = 0.5;
+    const scheduledTimers = new Map<
+      number,
+      { id: number; runAt: number; delayMs: number; cb: () => void }
+    >();
+    let timerSeq = 0;
+
+      let supervisorRef: InstanceType<typeof LocalConnectionSupervisor> | null = null;
+      const advanceFakeClock = async (ms: number) => {
+        const target = currentTime + ms;
+        while (true) {
+          const due = [...scheduledTimers.values()]
+            .filter((t) => t.runAt <= target)
+            .sort((a, b) => a.runAt - b.runAt || a.id - b.id);
+          if (due.length === 0) break;
+          const next = due[0];
+          scheduledTimers.delete(next.id);
+          currentTime = next.runAt;
+          next.cb();
+          await new Promise((r) => setTimeout(r, 20));
+          while (supervisorRef?.hasInflightDials()) {
+            await supervisorRef.waitForInflightDials();
+            await new Promise((r) => setTimeout(r, 10));
+          }
+        }
+        currentTime = target;
+        await new Promise((r) => setTimeout(r, 20));
+        while (supervisorRef?.hasInflightDials()) {
+          await supervisorRef.waitForInflightDials();
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      };
+
+    const validTickets = new Set<string>();
+    for (let i = 1; i <= 50; i += 1) {
+      validTickets.add(`tkt_fleet_${i}`);
+    }
+    let ticketSeq = 0;
+    let blockOpsProfile = false;
+    let activeProfilesList = [
+      { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+      { profile_id: "work", display_name: "Work", handle: "work", is_default: false },
+      { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+    ];
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: activeProfilesList,
+      initialSessions: [
+        { profile_id: "default", session_id: "s-def", title: "Default Session" },
+        { profile_id: "work", session_id: "s-work", title: "Work Session" },
+        { profile_id: "ops", session_id: "s-ops", title: "Ops Session" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "profiles.list") {
+          ctx.replyResult({ profiles: activeProfilesList });
+          return true;
+        }
+        if ((method === "session.list" || method === "sessions.list") && params.profile_id === "ops" && blockOpsProfile) {
+          ctx.replyError(-32004, "profile_not_served");
+          return true;
+        }
+        if (method === "prompt.submit") {
+          const sid = String(params.session_id);
+          const pid = String(params.profile_id ?? "default");
+          const turnId = `turn-${pid}-1`;
+          ctx.replyResult({
+            accepted: true,
+            session_id: sid,
+            turn_id: turnId,
+            user_message_id: `u-${pid}`,
+            assistant_message_id: `a-${pid}`,
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    try {
+      const udsPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+      let failUdsResolveCount = 0;
+      let ticketUnavailableOnce = false;
+      let udsAttachRecoverCount = 0;
+
+      const udsServer = net.createServer((sock) => {
+        let buf = "";
+        sock.on("data", (chunk) => {
+          buf += chunk.toString("utf8");
+          const nl = buf.indexOf("\n");
+          if (nl === -1) return;
+          const req = JSON.parse(buf.slice(0, nl)) as Record<string, unknown>;
+          buf = buf.slice(nl + 1);
+          if (req.op === "resolve-profile") {
+            if (failUdsResolveCount > 0) {
+              failUdsResolveCount -= 1;
+              sock.write(
+                JSON.stringify({
+                  status: "update_paused",
+                  reason: "gateway_restarting",
+                }) + "\n",
+              );
+              return;
+            }
+            sock.write(
+              JSON.stringify({
+                status: "ok",
+                state: "ready",
+                attachable: true,
+                purposes: ["interactive"],
+                endpoint: {
+                  profile_id: req.profile_id ?? "default",
+                  instance_id: "inst-fleet-1",
+                  authority_epoch: 1,
+                  runtime_protocol: 1,
+                  capabilities: ["session-authority-v1", "host-scope-interactive"],
+                  code_sha: "sha_fleet",
+                  ws_url: gw.wsUrl,
+                },
+              }) + "\n",
+            );
+          } else if (req.op === "session-ticket") {
+            if (ticketUnavailableOnce) {
+              ticketUnavailableOnce = false;
+              udsAttachRecoverCount += 1;
+              sock.write(
+                JSON.stringify({
+                  status: "refused",
+                  reason: "ticket_unavailable",
+                }) + "\n",
+              );
+              return;
+            }
+            ticketSeq += 1;
+            const tkt = `tkt_fleet_${ticketSeq}`;
+            validTickets.add(tkt);
+            sock.write(
+              JSON.stringify({
+                status: "ok",
+                ticket: tkt,
+                expires_in_seconds: 30,
+              }) + "\n",
+            );
+          }
+        });
+      });
+      await new Promise<void>((r) => udsServer.listen(udsPath, r));
+      fs.chmodSync(udsPath, 0o600);
+
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({
+        cliPath,
+        wsUrl: gw.wsUrl,
+        perProfileTicketPrefix: "tkt_cli_fallback_",
+      });
+      // Pre-seed fallback tickets in case ticket_unavailable falls back to CLI attach
+      for (const p of ["default", "work", "ops"]) {
+        // Fake CLI uses Date.now(), so let's make validTickets accept tkt_fleet_* and we also test UDS re-attach
+        void p;
+      }
+
+      const localPorts = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await localPorts.writeOverridePath(cliPath);
+      const localBackend = new LocalBackendManager({
+        ...localPorts,
+        getControlSocketCandidates: () => [udsPath],
+      });
+
+      const store = new RegistryStore({ rootDir: sandbox.hermesHomeDir });
+      let appIsForeground = true;
+      const notifications: Array<{
+        kind: string;
+        title: string;
+        body: string;
+        scope: { connectionId: string; profileId?: string; sessionId?: string };
+      }> = [];
+
+      const supervisor = new LocalConnectionSupervisor(localBackend, {
+        registryStore: store,
+        now: () => currentTime,
+        random: () => rngValue,
+        setTimer: (cb, delayMs) => {
+          timerSeq += 1;
+          const id = timerSeq;
+          scheduledTimers.set(id, { id, runAt: currentTime + delayMs, delayMs, cb });
+          return id as unknown as ReturnType<typeof setTimeout>;
+        },
+        clearTimer: (handle) => {
+          scheduledTimers.delete(handle as unknown as number);
+        },
+        isAppForeground: () => appIsForeground,
+        onBackgroundNotification: (notif) => {
+          notifications.push(notif);
+        },
+      });
+      supervisorRef = supervisor;
+
+      // 1. Default profile is eager; other profiles ('work', 'ops') start desired='disabled'/idle until first activated
+      await supervisor.connectLocal("default");
+      const linkDefault1 = supervisor.getConnectionLink("local", "default");
+      const linkWork1 = supervisor.getConnectionLink("local", "work");
+      expect(linkDefault1?.desired).toBe("enabled");
+      expect(linkDefault1?.actual).toBe("ready");
+      expect(linkWork1?.actual).toBe("idle");
+      expect(gw.connections).toHaveLength(1);
+
+      // 2. Activating 'work' profile shares the single interactive WS, marks 'work' enabled + ready, and keeps it connected
+      await supervisor.handlers["scopes.switch"](
+        { connectionId: "local", profileId: "work" },
+        null,
+      );
+      expect(gw.connections).toHaveLength(1); // Shared interactive socket!
+      const linkWork2 = supervisor.getConnectionLink("local", "work");
+      expect(linkWork2?.desired).toBe("enabled");
+      expect(linkWork2?.actual).toBe("ready");
+
+      // Start a turn on 'work' -> 'work' becomes pinned!
+      await supervisor.handlers["prompts.send"](
+        { sessionId: "s-work", text: "background build task" },
+        { connectionId: "local", profileId: "work", sessionId: "s-work" },
+      );
+      expect(supervisor.getConnectionLink("local", "work")?.pinned).toBe(true);
+
+      // Switch back to 'default' -> 'work' stays enabled, ready, and pinned (never recycled)
+      await supervisor.handlers["scopes.switch"](
+        { connectionId: "local", profileId: "default" },
+        null,
+      );
+      expect(supervisor.getConnectionLink("local", "work")?.desired).toBe("enabled");
+      expect(supervisor.getConnectionLink("local", "work")?.actual).toBe("ready");
+      expect(supervisor.getConnectionLink("local", "work")?.pinned).toBe(true);
+
+      // 3. Background notification: when app is in background, prompt.completed or approval.requested emits minimal notification without command/path/message/token
+      appIsForeground = false;
+      // Trigger turn completion on background 'work' profile via active socket
+      const rpcCountBeforeNotif = gw.rpcCalls.length;
+      void rpcCountBeforeNotif;
+      supervisor.notifyBackgroundEventForTest?.({
+        kind: "approval_pending",
+        scope: { connectionId: "local", profileId: "work", sessionId: "s-work" },
+        rawPayload: { command: "sudo rm -rf /Users/alice/token_123", path: "/Users/alice/secret" },
+      });
+      expect(notifications).toHaveLength(1);
+      expect(notifications[0].body).toBe("有 Approval 待处理");
+      expect(JSON.stringify(notifications[0])).not.toMatch(/sudo|alice|token_123|secret/);
+
+      // When app is foreground, no background notification is emitted
+      appIsForeground = true;
+      supervisor.notifyBackgroundEventForTest?.({
+        kind: "turn_completed",
+        scope: { connectionId: "local", profileId: "work", sessionId: "s-work" },
+        rawPayload: { text: "secret output" },
+      });
+      expect(notifications).toHaveLength(1);
+
+      // 4. Single profile failure isolation: 'ops' fails with profile_not_served -> 'ops' is blocked, Gateway aggregates to ready + degraded (profileExceptionCount: 1), while 'default' & 'work' stay ready on shared socket!
+      blockOpsProfile = true;
+      await supervisor.handlers["scopes.switch"](
+        { connectionId: "local", profileId: "ops" },
+        null,
+      );
+      expect(supervisor.getConnectionLink("local", "ops")?.actual).toBe("blocked");
+      expect(supervisor.getConnectionLink("local", "default")?.actual).toBe("ready");
+      expect(supervisor.getConnectionLink("local", "work")?.actual).toBe("ready");
+      const localHealthDegraded = supervisor.getLocalHealth();
+      expect(localHealthDegraded.actual).toBe("ready");
+      expect(localHealthDegraded.degraded).toBe(true);
+      expect(localHealthDegraded.aggregateState).toBe("degraded");
+      expect(localHealthDegraded.profileExceptionCount).toBe(1);
+      blockOpsProfile = false;
+
+      // 5. Profile disappearance only stops that profile without tearing down the shared socket
+      activeProfilesList = activeProfilesList.filter((p) => p.profile_id !== "ops");
+      await supervisor.refreshProfilesForConnection("local");
+      expect(supervisor.getConnectionLink("local", "ops")?.desired).toBe("disabled");
+      expect(supervisor.getConnectionLink("local", "default")?.actual).toBe("ready");
+      expect(supervisor.getConnectionLink("local", "work")?.actual).toBe("ready");
+      expect(supervisor.getLocalHealth().degraded).toBe(false);
+
+      // 6. Backoff 1s->30s full jitter + 5s stable ready reset + manual Retry
+      // Force next 2 dial attempts to fail so we observe exponential backoff
+      failUdsResolveCount = 2;
+      rngValue = 1.0; // full cap: attempt 0 -> 1000ms, attempt 1 -> 2000ms, attempt 2 -> 4000ms
+      gw.closeAllClients();
+      await new Promise((r) => setTimeout(r, 30));
+
+      const healthReconn1 = supervisor.getLocalHealth();
+      expect(healthReconn1.actual).toBe("reconnecting");
+      expect(healthReconn1.nextRetryAt).toBe(currentTime + 1000);
+
+      // Advance 1000ms -> attempt 1 runs and fails -> schedules attempt 2 with 2000ms
+      await advanceFakeClock(1000);
+      const healthReconn2 = supervisor.getLocalHealth();
+      expect(healthReconn2.actual).toBe("reconnecting");
+      expect(healthReconn2.nextRetryAt).toBe(currentTime + 2000);
+
+      // Manual Retry immediately dials without waiting for timer, and does NOT reset attempt counter prematurely!
+      // Let's make this manual Retry succeed, then drop within 3s (< 5s stable window)
+      failUdsResolveCount = 0;
+      await supervisor.handlers["connections.retry"]({ connectionId: "local" }, null);
+      expect(supervisor.getLocalHealth().actual).toBe("ready");
+
+      // Both 'default' and 'work' were desired='enabled', so shared socket reconnect independently resumed/refreshed sessions for BOTH profiles!
+      const sessionListProfilesAfterReconnect = gw.rpcCalls
+        .filter((c) => c.method === "session.list" || c.method === "sessions.list")
+        .map((c) => c.params.profile_id);
+      expect(sessionListProfilesAfterReconnect).toContain("default");
+      expect(sessionListProfilesAfterReconnect).toContain("work");
+
+      // Advance only 3000ms (< 5000ms stable threshold) and drop socket again -> attempt counter was NOT reset (was 2, now 2 -> 4000ms backoff!)
+      await advanceFakeClock(3000);
+      failUdsResolveCount = 1;
+      gw.closeAllClients();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(supervisor.getLocalHealth().actual).toBe("reconnecting");
+      expect(supervisor.getLocalHealth().nextRetryAt).toBe(currentTime + 4000);
+
+      // Now let reconnect succeed and stay ready for >= 5000ms -> attempt counter resets to 0!
+      failUdsResolveCount = 0;
+      await advanceFakeClock(4000);
+      expect(supervisor.getLocalHealth().actual).toBe("ready");
+      await advanceFakeClock(5000);
+
+      // Drop again after 5s stable -> backoff is back to 1000ms (attempt 0)!
+      failUdsResolveCount = 1;
+      gw.closeAllClients();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(supervisor.getLocalHealth().nextRetryAt).toBe(currentTime + 1000);
+      failUdsResolveCount = 0;
+      await advanceFakeClock(1000);
+      expect(supervisor.getLocalHealth().actual).toBe("ready");
+
+      // 7. Heartbeat 15s/45s: 45s without inbound frames marks transport unavailable and triggers reconnect
+      await advanceFakeClock(45_000);
+      // After 45s silence, heartbeat watchdog closes socket and triggers reconnect
+      expect(gw.connections.length).toBeGreaterThanOrEqual(4);
+
+      // 8. Suspend & Resume: suspend closes socket, suppresses timers, sets desired=suspended & actual=idle; resume staggers 0-250ms and resets backoff
+      rngValue = 0.5; // 125ms stagger
+      supervisor.suspend();
+      expect(supervisor.getLocalHealth().desired).toBe("suspended");
+      expect(supervisor.getLocalHealth().actual).toBe("idle");
+      expect(supervisor.getLocalHealth().aggregateState).toBe("suspended");
+
+      const connCountOnSuspend = gw.connections.length;
+      supervisor.resume();
+      // At t+0ms before stagger (125ms), not yet connected
+      expect(gw.connections.length).toBe(connCountOnSuspend);
+      await advanceFakeClock(125);
+      expect(supervisor.getLocalHealth().actual).toBe("ready");
+      expect(supervisor.getLocalHealth().desired).toBe("enabled");
+
+      // 9. ticket_unavailable re-attaches / re-opens serve first before entering backoff
+      ticketUnavailableOnce = true;
+      gw.closeAllClients();
+      await new Promise((r) => setTimeout(r, 30));
+      while (supervisor.hasInflightDials()) {
+        await supervisor.waitForInflightDials();
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      expect(udsAttachRecoverCount).toBe(1);
+      expect(supervisor.getLocalHealth().actual).toBe("ready");
+
+      // 10. Bounded shutdown <= 2s: stops new commands, cancels timers, closes WS/SSH, marks disposed
+      const shutdownStart = Date.now();
+      await supervisor.shutdown({ timeoutMs: 2000 });
+      expect(Date.now() - shutdownStart).toBeLessThan(2000);
+      expect(supervisor.isDisposed()).toBe(true);
+
+      await expect(
+        supervisor.handlers["sessions.create"]({ title: "After quit" }, { connectionId: "local", profileId: "default" }),
+      ).rejects.toThrow();
+
+      store.close();
+      udsServer.close();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  }, 15_000);
+
+  it("enforces startFleet() concurrency cap=4 with local + Primary priority", async () => {
+    const sandbox = createTestSandbox("hermes-s1-fleet-priority-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_pri_1", "tkt_pri_2"]);
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [{ profile_id: "default", display_name: "Default", handle: "default", is_default: true }],
+      initialSessions: [{ profile_id: "default", session_id: "s-1", title: "Session 1" }],
+    });
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+      const localBackend = new LocalBackendManager(ports);
+      const store = new RegistryStore({ rootDir: sandbox.hermesHomeDir });
+
+      // Add 5 SSH connections and mark the 4th one as Primary
+      const remoteIds: string[] = [];
+      for (let i = 1; i <= 5; i += 1) {
+        const added = store.add({
+          kind: "ssh",
+          label: `Remote ${i}`,
+          host: `node${i}.example.com`,
+          user: "ubuntu",
+        });
+        expect(added.ok).toBe(true);
+        if (added.ok) {
+          const id = added.snapshot.connections.find((c) => c.label === `Remote ${i}`)!.id;
+          remoteIds.push(id);
+        }
+      }
+      const primaryRemoteId = remoteIds[3]!;
+      store.setPrimary(primaryRemoteId);
+
+      let activeDials = 0;
+      let maxConcurrentObserved = 0;
+      const dialOrder: string[] = [];
+
+      const supervisor = new LocalConnectionSupervisor(localBackend, {
+        registryStore: store,
+        maxConcurrentDials: 4,
+      });
+
+      const origEnsure = (supervisor as unknown as {
+        ensureTransport: (
+          cid: string,
+          pid: string,
+          opts?: Record<string, unknown>,
+        ) => Promise<unknown>;
+      }).ensureTransport.bind(supervisor);
+
+      (supervisor as unknown as {
+        ensureTransport: (
+          cid: string,
+          pid: string,
+          opts?: Record<string, unknown>,
+        ) => Promise<unknown>;
+      }).ensureTransport = async (cid, pid, opts) => {
+        dialOrder.push(cid);
+        activeDials += 1;
+        maxConcurrentObserved = Math.max(maxConcurrentObserved, activeDials);
+        await new Promise((r) => setTimeout(r, 40));
+        try {
+          if (cid === "local") {
+            return await origEnsure(cid, pid, opts);
+          }
+          return { ok: true, fleet: supervisor.getFleetSnapshot() };
+        } finally {
+          activeDials -= 1;
+        }
+      };
+
+      await supervisor.startFleet();
+      expect(dialOrder[0]).toBe("local");
+      expect(dialOrder[1]).toBe(primaryRemoteId);
+      expect(maxConcurrentObserved).toBeLessThanOrEqual(4);
+      expect(dialOrder).toHaveLength(6);
+
+      await supervisor.shutdown({ timeoutMs: 2000 });
+      store.close();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

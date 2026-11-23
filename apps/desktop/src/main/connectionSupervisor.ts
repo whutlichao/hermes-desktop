@@ -1,23 +1,29 @@
 import type {
   ActivityEventPayload,
   ActiveChatRef,
+  BackgroundNotificationKind,
   BridgeEvent,
   BridgeScope,
   CapabilityDomainId,
   CapabilitySnapshot,
   ChatSessionProjection,
+  ConnectionActualState,
+  ConnectionDesiredState,
   ConnectionHealthSummary,
+  ConnectionLinkSummary,
   ErrorCode,
   FleetSnapshot,
   GatewayConfigSnapshot,
   GatewayConfigUpdateResult,
   GatewayConfigValue,
+  LocalFailureCode,
   LocalInspectResult,
   LocalTypedFailure,
   ProfileSummary,
   PromptEventPayload,
   RegistryDiff,
   RegistrySnapshotView,
+  SafeBackgroundNotification,
   SessionSummary,
   SessionTranscriptSnapshot,
   SshFailureCode,
@@ -27,7 +33,11 @@ import type {
   TranscriptPatchPayload,
 } from "@hermes/contracts";
 import {
+  aggregateConnectionHealth,
+  buildSafeBackgroundNotification,
   CAPABILITY_DOMAIN_CATALOG,
+  computeFullJitterBackoffMs,
+  computeResumeStaggerMs,
   CORE_CAPABILITY_DOMAINS,
   CapabilityRegistry,
   classifyRuntimeCapabilities,
@@ -35,6 +45,7 @@ import {
   getLocalFailureCopy,
   isAllowedGatewayConfigKey,
   isJsonRpcMethodNotFound,
+  isProfileLinkException,
   reduceTranscriptEvent,
   resolveExplicitMethodAlias,
   toSupportedChatActions,
@@ -50,7 +61,7 @@ import {
   GatewayTransportError,
 } from "./gatewayClient";
 import type { LocalBackendManager, LocalDialMaterial } from "./localBackendManager";
-import type { RegistryStore, RegistryStoreEvent } from "./registryStore";
+import type { RegistryStore } from "./registryStore";
 import {
   mintRemoteWsTicketIfSupported,
   resolveRemoteCredentials,
@@ -72,9 +83,34 @@ export interface ConnectionSupervisorOptions {
   authManager?: RemoteAuthManager;
   remoteTls?: GatewayClientTlsOptions;
   sshTransport?: SshTransportManager;
+  now?: () => number;
+  random?: () => number;
+  setTimer?: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (handle: ReturnType<typeof setTimeout>) => void;
+  isAppForeground?: () => boolean;
+  onBackgroundNotification?: (notification: SafeBackgroundNotification) => void;
+  maxConcurrentDials?: number;
 }
 
 type DialMaterial = LocalDialMaterial | SshDialMaterial;
+
+interface ConnectionLinkState {
+  connectionId: string;
+  profileId: string;
+  desired: ConnectionDesiredState;
+  actual: ConnectionActualState;
+  degraded: boolean;
+  pinned: boolean;
+  latencyMs: number | null;
+  nextRetryAt: number | null;
+  attempt: number;
+  errorCode?: ErrorCode;
+  unavailableCode?: LocalFailureCode;
+  message?: string;
+  wasDesiredBeforeSuspend: boolean;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  stableTimer: ReturnType<typeof setTimeout> | null;
+}
 
 interface GatewayTransportEntry {
   key: string;
@@ -94,8 +130,12 @@ interface GatewayTransportEntry {
   capabilitiesHandshakeSent: boolean;
   subscribedToGateway: boolean;
   disposed: boolean;
+  lastInboundAt: number;
+  lastPingSentAt: number | null;
+  heartbeatTimer: ReturnType<typeof setTimeout> | null;
   unsubNotification: () => void;
   unsubClose: () => void;
+  unsubInbound: () => void;
 }
 
 interface SubscriberRecord {
@@ -251,6 +291,13 @@ function isRpcAuthError(err: unknown): boolean {
   return err.rpcCode === 401 || err.rpcCode === 403 || err.rpcCode === -32001;
 }
 
+function isProfileUnavailableRpcError(err: unknown): boolean {
+  if (!(err instanceof GatewayRpcError)) return false;
+  if (err.rpcCode === -32004) return true;
+  const msg = err.message.toLowerCase();
+  return msg.includes("profile_not_served") || msg.includes("profile_mismatch") || msg.includes("profile_unavailable");
+}
+
 export class ConnectionSupervisor {
   private readonly localBackend: LocalBackendManager;
   private readonly getLocalLabel: () => string;
@@ -262,22 +309,33 @@ export class ConnectionSupervisor {
   private readonly remoteTls?: GatewayClientTlsOptions;
   private readonly sshTransport?: SshTransportManager;
   private readonly unsubRegistry?: () => void;
+  private readonly now: () => number;
+  private readonly random: () => number;
+  private readonly setTimer: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void;
+  private readonly isAppForeground: () => boolean;
+  private readonly onBackgroundNotification?: (notification: SafeBackgroundNotification) => void;
+  private readonly maxConcurrentDials: number;
 
   private revision = 1;
   private subscriberSeq = 0;
   private ownerGenerationSeq = 0;
   private inflightCoreProbes: Promise<void> | null = null;
   private disposed = false;
+  private shuttingDown = false;
+  private suspended = false;
 
   private localHealth: ConnectionHealthSummary;
   private readonly remoteHealth = new Map<string, ConnectionHealthSummary>();
   private readonly sshHealthById = new Map<string, ConnectionHealthSummary>();
+  private readonly linksByKey = new Map<string, ConnectionLinkState>();
   private readonly profilesByConnection = new Map<string, ProfileSummary[]>();
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
   private readonly transcripts = new Map<string, SessionTranscriptSnapshot>();
   private readonly transports = new Map<string, GatewayTransportEntry>();
   private readonly connectingByKey = new Map<string, Promise<SupervisorConnectResult>>();
   private readonly subscribers = new Map<number, SubscriberRecord>();
+  private readonly staggerTimers = new Set<ReturnType<typeof setTimeout>>();
 
   private activeScope: BridgeScope | null = null;
   private activeSessionId: string | null = null;
@@ -291,16 +349,27 @@ export class ConnectionSupervisor {
     this.authManager = options?.authManager;
     this.remoteTls = options?.remoteTls;
     this.sshTransport = options?.sshTransport;
+    this.now = options?.now ?? (() => Date.now());
+    this.random = options?.random ?? (() => Math.random());
+    this.setTimer = options?.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
+    this.clearTimer = options?.clearTimer ?? ((handle) => clearTimeout(handle));
+    this.isAppForeground = options?.isAppForeground ?? (() => true);
+    this.onBackgroundNotification = options?.onBackgroundNotification;
+    this.maxConcurrentDials = Math.max(1, options?.maxConcurrentDials ?? 4);
     this.localHealth = {
       connectionId: "local",
       label: this.getLocalLabel(),
       kind: "local",
       originDisplay: "127.0.0.1",
+      desired: "enabled",
       actual: "idle",
+      aggregateState: "idle",
       degraded: false,
       latencyMs: null,
       nextRetryAt: null,
+      profileExceptionCount: 0,
     };
+    this.ensureLinkState("local", "default", "enabled");
 
     const saved = this.chatSessionStateStore?.load();
     if (saved?.lastActiveChat) {
@@ -317,9 +386,212 @@ export class ConnectionSupervisor {
       this.syncRegistryEntries(initialSnap);
       this.syncHealthPlaceholdersFromRegistry(initialSnap);
       this.unsubRegistry = this.registryStore.subscribe((ev) => {
-        this.handleRegistryEvent(ev);
+        this.syncRegistryEntries(ev.snapshot);
+        this.syncHealthPlaceholdersFromRegistry(ev.snapshot);
       });
     }
+  }
+
+  isDisposed(): boolean {
+    return this.disposed;
+  }
+
+  hasInflightDials(): boolean {
+    return this.connectingByKey.size > 0;
+  }
+
+  async waitForInflightDials(): Promise<void> {
+    if (this.connectingByKey.size === 0) return;
+    await Promise.allSettled([...this.connectingByKey.values()]);
+  }
+
+  private ensureLinkState(
+    connectionId: string,
+    profileId: string,
+    defaultDesired: ConnectionDesiredState = "disabled",
+  ): ConnectionLinkState {
+    const key = scopeKey(connectionId, profileId);
+    const existing = this.linksByKey.get(key);
+    if (existing) {
+      return existing;
+    }
+    const created: ConnectionLinkState = {
+      connectionId,
+      profileId,
+      desired: this.suspended ? "suspended" : defaultDesired,
+      actual: "idle",
+      degraded: false,
+      pinned: false,
+      latencyMs: null,
+      nextRetryAt: null,
+      attempt: 0,
+      wasDesiredBeforeSuspend: defaultDesired === "enabled",
+      retryTimer: null,
+      stableTimer: null,
+    };
+    this.linksByKey.set(key, created);
+    return created;
+  }
+
+  private clearLinkTimers(link: ConnectionLinkState): void {
+    if (link.retryTimer !== null) {
+      this.clearTimer(link.retryTimer);
+      link.retryTimer = null;
+    }
+    if (link.stableTimer !== null) {
+      this.clearTimer(link.stableTimer);
+      link.stableTimer = null;
+    }
+  }
+
+  private getLinksForConnection(connectionId: string): ConnectionLinkState[] {
+    const out: ConnectionLinkState[] = [];
+    for (const link of this.linksByKey.values()) {
+      if (link.connectionId === connectionId) {
+        out.push(link);
+      }
+    }
+    return out;
+  }
+
+  private computeProfilePinned(connectionId: string, profileId: string): boolean {
+    const sk = scopeKey(connectionId, profileId);
+    const sessions = this.sessionsByScope.get(sk) ?? [];
+    for (const s of sessions) {
+      if (s.activeTurnId || s.status === "running" || s.needsInput) {
+        return true;
+      }
+    }
+    const prefix = `${connectionId}::${profileId}::`;
+    for (const [tk, tx] of this.transcripts.entries()) {
+      if (!tk.startsWith(prefix)) continue;
+      if (tx.activeTurnId || tx.turnStopping || tx.messages.some((m) => m.streaming || m.status === "streaming")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private syncProfileAndConnectionProjections(connectionId: string): void {
+    const links: ConnectionLinkSummary[] = [];
+    for (const link of this.linksByKey.values()) {
+      if (link.connectionId !== connectionId) continue;
+      link.pinned = this.computeProfilePinned(connectionId, link.profileId);
+      links.push({
+        connectionId: link.connectionId,
+        profileId: link.profileId,
+        desired: link.desired,
+        actual: link.actual,
+        degraded: link.degraded,
+        pinned: link.pinned,
+        latencyMs: link.latencyMs,
+        nextRetryAt: link.nextRetryAt,
+        attempt: link.attempt,
+        ...(link.errorCode ? { errorCode: link.errorCode } : {}),
+        ...(link.unavailableCode ? { unavailableCode: link.unavailableCode } : {}),
+        ...(link.message ? { message: link.message } : {}),
+      });
+    }
+
+    const base =
+      connectionId === "local"
+        ? { ...this.localHealth, label: this.getLocalLabel() }
+        : this.remoteHealth.get(connectionId) ?? this.sshHealthById.get(connectionId) ?? null;
+    const aggregated = base ? aggregateConnectionHealth({ base, links }) : null;
+    const gatewayAggregate = aggregated?.aggregateState ?? "idle";
+
+    const profiles = this.profilesByConnection.get(connectionId);
+    if (profiles && profiles.length > 0) {
+      const nextProfiles = profiles.map((p) => {
+        const link = this.linksByKey.get(scopeKey(connectionId, p.profileId));
+        if (!link) return p;
+        const summary: ConnectionLinkSummary = {
+          connectionId,
+          profileId: p.profileId,
+          desired: link.desired,
+          actual: link.actual,
+          degraded: link.degraded,
+          pinned: link.pinned,
+          latencyMs: link.latencyMs,
+          nextRetryAt: link.nextRetryAt,
+          attempt: link.attempt,
+          ...(link.errorCode ? { errorCode: link.errorCode } : {}),
+          ...(link.unavailableCode ? { unavailableCode: link.unavailableCode } : {}),
+          ...(link.message ? { message: link.message } : {}),
+        };
+        return {
+          ...p,
+          desired: link.desired,
+          actual: link.actual,
+          degraded: link.degraded,
+          pinned: link.pinned,
+          isException: isProfileLinkException(summary, gatewayAggregate),
+          ...(link.unavailableCode ? { unavailableCode: link.unavailableCode } : { unavailableCode: undefined }),
+          ...(link.errorCode ? { errorCode: link.errorCode } : { errorCode: undefined }),
+          ...(link.message ? { message: link.message } : { message: undefined }),
+        };
+      });
+      this.profilesByConnection.set(connectionId, nextProfiles);
+    }
+
+    if (!aggregated) return;
+
+    if (connectionId === "local") {
+      this.localHealth = aggregated;
+    } else if (this.remoteHealth.has(connectionId)) {
+      this.remoteHealth.set(connectionId, aggregated);
+    } else if (this.sshHealthById.has(connectionId)) {
+      this.sshHealthById.set(connectionId, aggregated);
+    }
+  }
+
+  getConnectionLink(connectionId: string, profileId: string): ConnectionLinkSummary | null {
+    this.syncProfileAndConnectionProjections(connectionId);
+    const link = this.linksByKey.get(scopeKey(connectionId, profileId));
+    if (!link) return null;
+    return {
+      connectionId: link.connectionId,
+      profileId: link.profileId,
+      desired: link.desired,
+      actual: link.actual,
+      degraded: link.degraded,
+      pinned: link.pinned,
+      latencyMs: link.latencyMs,
+      nextRetryAt: link.nextRetryAt,
+      attempt: link.attempt,
+      ...(link.errorCode ? { errorCode: link.errorCode } : {}),
+      ...(link.unavailableCode ? { unavailableCode: link.unavailableCode } : {}),
+      ...(link.message ? { message: link.message } : {}),
+    };
+  }
+
+  async refreshProfilesForConnection(connectionId: string): Promise<ProfileSummary[]> {
+    const defaultProfile =
+      connectionId === "local"
+        ? "default"
+        : this.getSshTargetForConnection(connectionId)?.defaultProfile ?? "default";
+    const entry = this.getTransport(connectionId, defaultProfile);
+    if (!entry) {
+      return [...(this.profilesByConnection.get(connectionId) ?? [])];
+    }
+    return this.refreshProfiles(entry, defaultProfile);
+  }
+
+  notifyBackgroundEventForTest(params: {
+    kind: BackgroundNotificationKind;
+    scope: BridgeScope;
+    rawPayload?: Record<string, unknown>;
+  }): SafeBackgroundNotification | null {
+    const notif = buildSafeBackgroundNotification({
+      kind: params.kind,
+      isAppForeground: this.isAppForeground(),
+      scope: params.scope,
+      rawSecretOrCommand: params.rawPayload,
+    });
+    if (notif) {
+      this.onBackgroundNotification?.(notif);
+    }
+    return notif;
   }
 
   getCapabilitySnapshot(): CapabilitySnapshot {
@@ -333,10 +605,15 @@ export class ConnectionSupervisor {
   }
 
   getLocalHealth(): ConnectionHealthSummary {
+    this.syncProfileAndConnectionProjections("local");
     return { ...this.localHealth, label: this.getLocalLabel() };
   }
 
   private getAllProfiles(): ProfileSummary[] {
+    const connectionIds = new Set<string>(["local", ...this.remoteHealth.keys(), ...this.sshHealthById.keys()]);
+    for (const cid of connectionIds) {
+      this.syncProfileAndConnectionProjections(cid);
+    }
     const out: ProfileSummary[] = [];
     for (const list of this.profilesByConnection.values()) {
       out.push(...list);
@@ -347,8 +624,34 @@ export class ConnectionSupervisor {
   private syncRegistryEntries(snapshot: ReturnType<RegistryStore["snapshot"]>): void {
     const dialableRemoteIds = new Set<string>();
     for (const entry of snapshot.connections) {
-      if (entry.kind !== "remote" || !entry.dialable) continue;
+      if (entry.kind !== "remote") continue;
+      if (!entry.dialable) {
+        const defaultPid = entry.remoteProfile?.trim() || "default";
+        const link = this.ensureLinkState(entry.id, defaultPid, "enabled");
+        link.actual = "blocked";
+        link.degraded = true;
+        link.errorCode = "invalid_request";
+        link.message = "远端 Gateway 配置无效";
+        this.remoteHealth.set(entry.id, {
+          connectionId: entry.id,
+          label: entry.label,
+          kind: "remote",
+          originDisplay: entry.originDisplay ?? "",
+          desired: link.desired,
+          actual: "blocked",
+          aggregateState: "blocked",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: "invalid_request",
+          message: link.message,
+        });
+        dialableRemoteIds.add(entry.id);
+        continue;
+      }
       dialableRemoteIds.add(entry.id);
+      const defaultPid = entry.remoteProfile?.trim() || "default";
+      this.ensureLinkState(entry.id, defaultPid, "enabled");
       const prev = this.remoteHealth.get(entry.id);
       if (prev) {
         this.remoteHealth.set(entry.id, {
@@ -362,12 +665,15 @@ export class ConnectionSupervisor {
           label: entry.label,
           kind: "remote",
           originDisplay: entry.originDisplay ?? "",
+          desired: this.suspended ? "suspended" : "enabled",
           actual: "idle",
+          aggregateState: this.suspended ? "suspended" : "idle",
           degraded: false,
           latencyMs: null,
           nextRetryAt: null,
         });
       }
+      this.syncProfileAndConnectionProjections(entry.id);
     }
 
     for (const existingId of [...this.remoteHealth.keys()]) {
@@ -382,6 +688,14 @@ export class ConnectionSupervisor {
     const transport = this.transports.get(key);
     if (transport) {
       this.disposeTransportEntry(key, transport);
+    }
+    for (const [lk, link] of [...this.linksByKey.entries()]) {
+      if (link.connectionId === connectionId) {
+        this.clearLinkTimers(link);
+        link.desired = "disabled";
+        link.actual = "idle";
+        this.linksByKey.delete(lk);
+      }
     }
     this.remoteHealth.delete(connectionId);
     this.profilesByConnection.delete(connectionId);
@@ -419,33 +733,16 @@ export class ConnectionSupervisor {
     }
   }
 
-  private handleRegistryEvent(ev: RegistryStoreEvent): void {
-    if (this.disposed) return;
-    for (const change of ev.diff.changes) {
-      if (change.kind === "connection_removed") {
-        this.teardownRemoteConnection(change.connectionId);
-      } else if (change.kind === "connection_updated" && change.dialMaterialChanged) {
-        const key = `remote:${change.connectionId}`;
-        const existing = this.transports.get(key);
-        if (existing) {
-          this.disposeTransportEntry(key, existing);
-        }
-      }
-    }
-
-    this.syncRegistryEntries(ev.snapshot);
-    this.syncHealthPlaceholdersFromRegistry(ev.snapshot);
-    this.emitFleet();
-  }
-
   getFleetSnapshot(): FleetSnapshot {
     const allSessions: SessionSummary[] = [];
     for (const list of this.sessionsByScope.values()) {
       allSessions.push(...list);
     }
+    const profiles = this.getAllProfiles();
     const localProfiles = this.profilesByConnection.get("local") ?? [];
     const includeLocal =
       this.localHealth.actual !== "idle" ||
+      this.localHealth.desired === "suspended" ||
       localProfiles.length > 0 ||
       allSessions.some((s) => s.connectionId === "local") ||
       Boolean(this.localHealth.errorCode);
@@ -454,16 +751,20 @@ export class ConnectionSupervisor {
     if (includeLocal) {
       connections.push(this.getLocalHealth());
     }
-    for (const remote of this.remoteHealth.values()) {
-      connections.push({ ...remote });
+    for (const remoteId of this.remoteHealth.keys()) {
+      this.syncProfileAndConnectionProjections(remoteId);
+      const remote = this.remoteHealth.get(remoteId);
+      if (remote) connections.push({ ...remote });
     }
-    for (const sshHealth of this.sshHealthById.values()) {
-      connections.push({ ...sshHealth });
+    for (const sshId of this.sshHealthById.keys()) {
+      this.syncProfileAndConnectionProjections(sshId);
+      const sshHealth = this.sshHealthById.get(sshId);
+      if (sshHealth) connections.push({ ...sshHealth });
     }
 
     return {
       connections,
-      profiles: this.getAllProfiles(),
+      profiles,
       sessions: allSessions,
       activeScope: this.activeScope ? { ...this.activeScope } : null,
       activeSessionId: this.activeSessionId,
@@ -730,8 +1031,33 @@ export class ConnectionSupervisor {
   private syncHealthPlaceholdersFromRegistry(snapshot: RegistrySnapshotView): void {
     const validSshIds = new Set<string>();
     for (const conn of snapshot.connections) {
-      if (conn.kind !== "ssh" || !conn.dialable) continue;
+      if (conn.kind !== "ssh") continue;
+      const defaultProfile = conn.remoteProfile?.trim() || "default";
+      if (!conn.dialable) {
+        validSshIds.add(conn.id);
+        const link = this.ensureLinkState(conn.id, defaultProfile, "enabled");
+        link.actual = "blocked";
+        link.degraded = true;
+        link.errorCode = "invalid_request";
+        link.message = "SSH Gateway 配置无效";
+        this.sshHealthById.set(conn.id, {
+          connectionId: conn.id,
+          label: conn.label,
+          kind: "ssh",
+          originDisplay: conn.sshTargetDisplay ?? conn.sshHost ?? conn.id,
+          desired: link.desired,
+          actual: "blocked",
+          aggregateState: "blocked",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: "invalid_request",
+          message: link.message,
+        });
+        continue;
+      }
       validSshIds.add(conn.id);
+      this.ensureLinkState(conn.id, defaultProfile, "enabled");
       const existing = this.sshHealthById.get(conn.id);
       if (existing) {
         this.sshHealthById.set(conn.id, {
@@ -745,12 +1071,15 @@ export class ConnectionSupervisor {
           label: conn.label,
           kind: "ssh",
           originDisplay: conn.sshTargetDisplay ?? conn.sshHost ?? conn.id,
+          desired: this.suspended ? "suspended" : "enabled",
           actual: "idle",
+          aggregateState: this.suspended ? "suspended" : "idle",
           degraded: false,
           latencyMs: null,
           nextRetryAt: null,
         });
       }
+      this.syncProfileAndConnectionProjections(conn.id);
     }
     for (const id of [...this.sshHealthById.keys()]) {
       if (!validSshIds.has(id)) {
@@ -760,6 +1089,7 @@ export class ConnectionSupervisor {
   }
 
   async handleRegistrySnapshot(snapshot: RegistrySnapshotView, diff?: RegistryDiff): Promise<void> {
+    this.syncRegistryEntries(snapshot);
     this.syncHealthPlaceholdersFromRegistry(snapshot);
     if (diff) {
       for (const change of diff.changes) {
@@ -773,16 +1103,24 @@ export class ConnectionSupervisor {
           if (updated?.kind === "ssh") {
             if (!change.dialMaterialChanged) {
               this.emitFleet(change.connectionId);
-            } else {
+            } else if (updated.dialable && !this.suspended && !this.disposed) {
               await this.connectSsh(change.connectionId, { forceReconnect: true });
+            }
+          } else if (updated?.kind === "remote") {
+            if (!change.dialMaterialChanged) {
+              this.emitFleet(change.connectionId);
+            } else if (updated.dialable && !this.suspended && !this.disposed) {
+              await this.connectRemote(change.connectionId, { forceReconnect: true, activate: false });
             }
           }
           continue;
         }
         if (change.kind === "connection_added") {
           const added = snapshot.connections.find((c) => c.id === change.connectionId);
-          if (added?.kind === "ssh" && added.dialable) {
+          if (added?.kind === "ssh" && added.dialable && !this.suspended && !this.disposed) {
             await this.connectSsh(change.connectionId, { activateScope: false });
+          } else if (added?.kind === "remote" && added.dialable && !this.suspended && !this.disposed) {
+            await this.connectRemote(change.connectionId, { activate: false });
           }
         }
       }
@@ -792,6 +1130,15 @@ export class ConnectionSupervisor {
 
   async removeConnection(connectionId: string): Promise<void> {
     if (connectionId === "local") return;
+    for (const [lk, link] of [...this.linksByKey.entries()]) {
+      if (link.connectionId === connectionId) {
+        this.clearLinkTimers(link);
+        link.desired = "disabled";
+        link.actual = "idle";
+        link.nextRetryAt = null;
+        this.linksByKey.delete(lk);
+      }
+    }
     for (const [key, entry] of [...this.transports.entries()]) {
       if (entry.connectionId === connectionId) {
         this.disposeTransportEntry(key, entry);
@@ -839,16 +1186,289 @@ export class ConnectionSupervisor {
     this.emitFleet();
   }
 
+  private markLinkReady(
+    connectionId: string,
+    profileId: string,
+    latencyMs: number | null,
+  ): void {
+    const link = this.ensureLinkState(connectionId, profileId, "enabled");
+    link.desired = "enabled";
+    link.wasDesiredBeforeSuspend = true;
+    link.actual = "ready";
+    link.degraded = false;
+    link.latencyMs = latencyMs;
+    link.nextRetryAt = null;
+    link.errorCode = undefined;
+    link.unavailableCode = undefined;
+    link.message = undefined;
+    if (link.retryTimer !== null) {
+      this.clearTimer(link.retryTimer);
+      link.retryTimer = null;
+    }
+    if (link.stableTimer !== null) {
+      this.clearTimer(link.stableTimer);
+      link.stableTimer = null;
+    }
+    link.stableTimer = this.setTimer(() => {
+      link.stableTimer = null;
+      if (!this.disposed && !this.suspended && link.actual === "ready") {
+        link.attempt = 0;
+      }
+    }, 5_000);
+    this.syncProfileAndConnectionProjections(connectionId);
+  }
+
+  private scheduleLinkBackoff(
+    connectionId: string,
+    profileId: string,
+    errorCode: ErrorCode,
+    message?: string,
+    unavailableCode?: LocalFailureCode,
+  ): void {
+    if (this.disposed || this.shuttingDown || this.suspended) return;
+    const primaryLink = this.ensureLinkState(connectionId, profileId, "enabled");
+    if (primaryLink.desired !== "enabled") return;
+
+    const existingTransport = this.transports.get(`${connectionId}::shared`);
+    const isSharedMode =
+      !existingTransport || existingTransport.transportMode === "shared-host-scope";
+
+    const targetLinks = isSharedMode
+      ? this.getLinksForConnection(connectionId).filter(
+          (l) => l.desired === "enabled" && l.unavailableCode !== "profile_unavailable",
+        )
+      : [primaryLink];
+    if (!targetLinks.includes(primaryLink)) {
+      targetLinks.push(primaryLink);
+    }
+
+    const baseAttempt = primaryLink.attempt;
+    const delayMs = computeFullJitterBackoffMs(baseAttempt, this.random());
+    const nextRetryAt = this.now() + delayMs;
+
+    for (const link of targetLinks) {
+      if (link.stableTimer !== null) {
+        this.clearTimer(link.stableTimer);
+        link.stableTimer = null;
+      }
+      if (link.retryTimer !== null) {
+        this.clearTimer(link.retryTimer);
+        link.retryTimer = null;
+      }
+      link.attempt = baseAttempt + 1;
+      link.actual = "reconnecting";
+      link.degraded = true;
+      link.latencyMs = null;
+      link.nextRetryAt = nextRetryAt;
+      link.errorCode = errorCode;
+      link.unavailableCode = unavailableCode;
+      link.message = message;
+    }
+
+    this.syncProfileAndConnectionProjections(connectionId);
+    this.emitFleet(connectionId);
+
+    primaryLink.retryTimer = this.setTimer(() => {
+      primaryLink.retryTimer = null;
+      if (this.disposed || this.shuttingDown || this.suspended || primaryLink.desired !== "enabled") {
+        return;
+      }
+      if (connectionId === "local") {
+        void this.connectLocal(profileId, { forceReconnect: true });
+      } else if (this.isSshConnection(connectionId)) {
+        void this.connectSsh(connectionId, { profileId, forceReconnect: true });
+      } else {
+        void this.connectRemote(connectionId, { profileId, forceReconnect: true });
+      }
+    }, delayMs);
+  }
+
+  private scheduleTransportHeartbeat(entry: GatewayTransportEntry): void {
+    if (entry.heartbeatTimer !== null) {
+      this.clearTimer(entry.heartbeatTimer);
+      entry.heartbeatTimer = null;
+    }
+    if (this.disposed || this.shuttingDown || this.suspended || entry.disposed) {
+      return;
+    }
+    entry.heartbeatTimer = this.setTimer(() => {
+      entry.heartbeatTimer = null;
+      if (this.disposed || this.shuttingDown || this.suspended || entry.disposed || !entry.client.isOpen()) {
+        return;
+      }
+      const elapsed = this.now() - entry.lastInboundAt;
+      if (elapsed >= 45_000) {
+        this.handleTransportHeartbeatTimeout(entry);
+        return;
+      }
+      const servedMethods = Array.isArray(entry.describeResult?.served_methods)
+        ? (entry.describeResult?.served_methods as unknown[])
+        : [];
+      if (servedMethods.includes("gateway.ping")) {
+        const sentAt = this.now();
+        entry.lastPingSentAt = sentAt;
+        void entry.client
+          .call("gateway.ping", {}, { timeoutMs: 10_000 })
+          .then(() => {
+            if (this.disposed || entry.disposed) return;
+            const rtt = Math.max(1, this.now() - sentAt);
+            entry.lastInboundAt = this.now();
+            this.updateReadyLinksLatency(entry.connectionId, rtt);
+          })
+          .catch(() => {
+            // Tracked by 45s inbound deadline
+          });
+      }
+      this.scheduleTransportHeartbeat(entry);
+    }, 15_000);
+  }
+
+  private updateReadyLinksLatency(connectionId: string, latencyMs: number): void {
+    for (const link of this.linksByKey.values()) {
+      if (link.connectionId === connectionId && link.actual === "ready") {
+        link.latencyMs = latencyMs;
+      }
+    }
+    this.syncProfileAndConnectionProjections(connectionId);
+    this.emitFleet(connectionId);
+  }
+
+  private handleTransportHeartbeatTimeout(entry: GatewayTransportEntry): void {
+    if (this.disposed || entry.disposed) return;
+    this.disposeTransportEntry(entry.key, entry);
+    this.handleUnexpectedTransportClose(entry);
+  }
+
+  private handleUnexpectedTransportClose(entry: GatewayTransportEntry): void {
+    if (this.disposed || this.shuttingDown || this.suspended) return;
+    const connectionId = entry.connectionId;
+    const hasRemaining = [...this.transports.values()].some(
+      (t) => t.connectionId === connectionId && !t.disposed && t.client.isOpen(),
+    );
+    if (!hasRemaining) {
+      if (connectionId === "local" || this.activeScope?.connectionId === connectionId) {
+        this.capabilityRegistry.invalidate({ reason: "transport_closed" });
+        this.emitCapabilities();
+      }
+    }
+
+    if (entry.kind === "local" && entry.dial) {
+      void this.reconnectLocalAfterDrop(entry.dial as LocalDialMaterial);
+      return;
+    }
+    if (entry.kind === "ssh" && this.sshTransport && entry.dial) {
+      void this.reconnectSshAfterDrop(connectionId, entry.dial.profileId, entry.dial.instanceId);
+      return;
+    }
+    this.scheduleLinkBackoff(connectionId, entry.defaultProfileId, "unreachable");
+  }
+
+  private async reconnectLocalAfterDrop(previousDial: LocalDialMaterial): Promise<void> {
+    if (this.disposed || this.shuttingDown || this.suspended) return;
+    const link = this.ensureLinkState("local", previousDial.profileId, "enabled");
+    if (link.desired !== "enabled") return;
+
+    const inflightKey = `local-drop::${previousDial.profileId}`;
+    if (this.connectingByKey.has(inflightKey)) return;
+
+    const runner = (async (): Promise<SupervisorConnectResult> => {
+      const startedAt = this.now();
+      const minted = await this.localBackend.mintReconnectTicket(previousDial);
+      if (minted.ok) {
+        const ticket = minted.consumeTicket();
+        if (ticket) {
+          const transportKey =
+            previousDial.transportMode === "shared-host-scope"
+              ? "local::shared"
+              : `local::profile:${previousDial.profileId}`;
+          return this.finishGatewayHandshake({
+            connectionId: "local",
+            kind: "local",
+            label: this.getLocalLabel(),
+            originDisplay: "127.0.0.1",
+            transportKey,
+            dial: previousDial,
+            ticket,
+            startedAt,
+          });
+        }
+      }
+
+      // If ticket_unavailable, re-attach / re-open serve once before entering exponential backoff
+      if (!minted.ok && minted.failure.code === "ticket_unavailable") {
+        const reattached = await this.localBackend.prepareDial({ profileId: previousDial.profileId });
+        if (reattached.ok) {
+          let ticket = reattached.dial.consumeTicket();
+          if (!ticket) {
+            const reminted = await this.localBackend.mintReconnectTicket(reattached.dial);
+            if (reminted.ok) {
+              ticket = reminted.consumeTicket();
+            }
+          }
+          if (ticket) {
+            const transportKey =
+              reattached.dial.transportMode === "shared-host-scope"
+                ? "local::shared"
+                : `local::profile:${reattached.dial.profileId}`;
+            return this.finishGatewayHandshake({
+              connectionId: "local",
+              kind: "local",
+              label: this.getLocalLabel(),
+              originDisplay: "127.0.0.1",
+              transportKey,
+              dial: reattached.dial,
+              ticket,
+              startedAt,
+            });
+          }
+        }
+      }
+
+      const failure = !minted.ok ? minted.failure : undefined;
+      this.scheduleLinkBackoff(
+        "local",
+        previousDial.profileId,
+        mapLocalFailureToErrorCode(failure),
+        failure ? getLocalFailureCopy(failure.code).whatHappened : undefined,
+        failure?.code,
+      );
+      return { ok: false, failure, fleet: this.getFleetSnapshot() };
+    })().finally(() => {
+      this.connectingByKey.delete(inflightKey);
+    });
+
+    this.connectingByKey.set(inflightKey, runner);
+    await runner;
+  }
+
   private async ensureScopeTransport(
     connectionId: string,
     profileId: string,
     options?: { forceReconnect?: boolean; activate?: boolean; activateScope?: boolean },
   ): Promise<SupervisorConnectResult> {
+    if (this.disposed || this.shuttingDown) {
+      return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+    const link = this.ensureLinkState(connectionId, profileId, "enabled");
+    if (!this.suspended) {
+      link.desired = "enabled";
+      link.wasDesiredBeforeSuspend = true;
+    }
+    if (options?.forceReconnect) {
+      for (const link of this.getLinksForConnection(connectionId)) {
+        if (link.retryTimer !== null) {
+          this.clearTimer(link.retryTimer);
+          link.retryTimer = null;
+          link.nextRetryAt = null;
+        }
+      }
+    }
+
     if (!options?.forceReconnect) {
       const existing = this.getTransport(connectionId, profileId);
       if (existing) {
-        await this.refreshSessionsForProfile(existing, profileId);
-        return { ok: true, fleet: this.getFleetSnapshot() };
+        const ok = await this.activateOrRefreshProfileOnSharedTransport(existing, profileId);
+        return { ok, fleet: this.getFleetSnapshot() };
       }
     }
 
@@ -900,16 +1520,35 @@ export class ConnectionSupervisor {
     connectionId: string,
     options?: { profileId?: string; forceReconnect?: boolean; activate?: boolean },
   ): Promise<SupervisorConnectResult> {
-    if (!this.registryStore) {
+    if (this.disposed || this.shuttingDown || !this.registryStore) {
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
+    const snap = this.registryStore.snapshot();
+    const conn = snap.connections.find((c) => c.id === connectionId);
+    const defaultPid = options?.profileId ?? conn?.remoteProfile ?? "default";
+    const link = this.ensureLinkState(connectionId, defaultPid, "enabled");
+    if (!this.suspended) {
+      link.desired = "enabled";
+      link.wasDesiredBeforeSuspend = true;
+    }
+    if (options?.forceReconnect) {
+      for (const link of this.getLinksForConnection(connectionId)) {
+        if (link.retryTimer !== null) {
+          this.clearTimer(link.retryTimer);
+          link.retryTimer = null;
+          link.nextRetryAt = null;
+        }
+      }
+    }
+
     if (!options?.forceReconnect) {
-      const existing = this.getTransport(connectionId, options?.profileId ?? "default");
+      const existing = this.getTransport(connectionId, defaultPid);
       if (existing) {
         const pid = options?.profileId ?? existing.defaultProfileId;
-        const sessions = await this.refreshSessionsForProfile(existing, pid);
-        if (options?.activate) {
+        const ok = await this.activateOrRefreshProfileOnSharedTransport(existing, pid);
+        const sessions = this.sessionsByScope.get(scopeKey(connectionId, pid)) ?? [];
+        if (options?.activate && ok) {
           const sid = sessions[0]?.sessionId ?? null;
           this.activeScope = {
             connectionId,
@@ -930,7 +1569,7 @@ export class ConnectionSupervisor {
           }
           this.emitFleet(connectionId);
         }
-        return { ok: true, fleet: this.getFleetSnapshot() };
+        return { ok, fleet: this.getFleetSnapshot() };
       }
     }
 
@@ -953,7 +1592,7 @@ export class ConnectionSupervisor {
     connectionId: string,
     options?: { profileId?: string; forceReconnect?: boolean; activate?: boolean },
   ): Promise<SupervisorConnectResult> {
-    if (this.disposed || !this.registryStore) {
+    if (this.disposed || this.shuttingDown || !this.registryStore) {
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
@@ -962,9 +1601,17 @@ export class ConnectionSupervisor {
     if (!conn || conn.kind !== "remote" || !conn.dialable || !conn.originDisplay) {
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
+    const targetProfileId = options?.profileId ?? conn.remoteProfile ?? "default";
+    const link = this.ensureLinkState(connectionId, targetProfileId, "enabled");
 
     const endpointCheck = validateRemoteEndpointUrl(conn.originDisplay);
     if (!endpointCheck.valid) {
+      link.actual = "blocked";
+      link.degraded = true;
+      link.latencyMs = null;
+      link.nextRetryAt = null;
+      link.errorCode = "invalid_request";
+      link.message = getCopy(endpointCheck.messageKey);
       this.remoteHealth.set(connectionId, {
         connectionId,
         label: conn.label,
@@ -977,6 +1624,7 @@ export class ConnectionSupervisor {
         errorCode: "invalid_request",
         message: getCopy(endpointCheck.messageKey),
       });
+      this.syncProfileAndConnectionProjections(connectionId);
       this.emitFleet(connectionId);
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
@@ -987,6 +1635,12 @@ export class ConnectionSupervisor {
       if (stale) this.disposeTransportEntry(transportKey, stale);
     }
 
+    link.actual = "connecting";
+    link.degraded = false;
+    link.latencyMs = null;
+    link.nextRetryAt = null;
+    link.errorCode = undefined;
+    link.message = undefined;
     this.remoteHealth.set(connectionId, {
       connectionId,
       label: conn.label,
@@ -997,9 +1651,10 @@ export class ConnectionSupervisor {
       latencyMs: null,
       nextRetryAt: null,
     });
+    this.syncProfileAndConnectionProjections(connectionId);
     this.emitFleet(connectionId);
 
-    const startedAt = Date.now();
+    const startedAt = this.now();
     const creds = resolveRemoteCredentials({
       origin: endpointCheck.normalizedUrl,
       connectionId,
@@ -1015,6 +1670,12 @@ export class ConnectionSupervisor {
     });
 
     if (ticketRes.kind === "auth_required") {
+      link.actual = "auth_required";
+      link.degraded = true;
+      link.latencyMs = null;
+      link.nextRetryAt = null;
+      link.errorCode = "auth_required";
+      link.message = getCopy("remote.authRequiredBody");
       this.remoteHealth.set(connectionId, {
         connectionId,
         label: conn.label,
@@ -1027,6 +1688,7 @@ export class ConnectionSupervisor {
         errorCode: "auth_required",
         message: getCopy("remote.authRequiredBody"),
       });
+      this.syncProfileAndConnectionProjections(connectionId);
       this.emitFleet(connectionId);
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
@@ -1046,19 +1708,60 @@ export class ConnectionSupervisor {
       const errCode: ErrorCode = isAuth
         ? "auth_required"
         : transportErr?.code ?? "unreachable";
-      this.remoteHealth.set(connectionId, {
-        connectionId,
-        label: conn.label,
-        kind: "remote",
-        originDisplay: endpointCheck.originDisplay,
-        actual: isAuth ? "auth_required" : errCode === "timeout" ? "reconnecting" : "blocked",
-        degraded: true,
-        latencyMs: null,
-        nextRetryAt: null,
-        errorCode: errCode,
-        ...(isAuth ? { message: getCopy("remote.authRequiredBody") } : {}),
-      });
-      this.emitFleet(connectionId);
+      if (isAuth) {
+        link.actual = "auth_required";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.nextRetryAt = null;
+        link.errorCode = "auth_required";
+        link.message = getCopy("remote.authRequiredBody");
+        this.remoteHealth.set(connectionId, {
+          connectionId,
+          label: conn.label,
+          kind: "remote",
+          originDisplay: endpointCheck.originDisplay,
+          actual: "auth_required",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: errCode,
+          message: getCopy("remote.authRequiredBody"),
+        });
+        this.syncProfileAndConnectionProjections(connectionId);
+        this.emitFleet(connectionId);
+      } else if (errCode === "timeout" || errCode === "unreachable") {
+        this.remoteHealth.set(connectionId, {
+          connectionId,
+          label: conn.label,
+          kind: "remote",
+          originDisplay: endpointCheck.originDisplay,
+          actual: "reconnecting",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: errCode,
+        });
+        this.scheduleLinkBackoff(connectionId, targetProfileId, errCode);
+      } else {
+        link.actual = "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.nextRetryAt = null;
+        link.errorCode = errCode;
+        this.remoteHealth.set(connectionId, {
+          connectionId,
+          label: conn.label,
+          kind: "remote",
+          originDisplay: endpointCheck.originDisplay,
+          actual: "blocked",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: errCode,
+        });
+        this.syncProfileAndConnectionProjections(connectionId);
+        this.emitFleet(connectionId);
+      }
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
@@ -1069,6 +1772,11 @@ export class ConnectionSupervisor {
       if (!isJsonRpcMethodNotFound(err)) {
         client.close();
         const isAuth = isRpcAuthError(err);
+        link.actual = isAuth ? "auth_required" : "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.nextRetryAt = null;
+        link.errorCode = isAuth ? "auth_required" : "protocol_unsupported";
         this.remoteHealth.set(connectionId, {
           connectionId,
           label: conn.label,
@@ -1080,6 +1788,7 @@ export class ConnectionSupervisor {
           nextRetryAt: null,
           errorCode: isAuth ? "auth_required" : "protocol_unsupported",
         });
+        this.syncProfileAndConnectionProjections(connectionId);
         this.emitFleet(connectionId);
         return { ok: false, fleet: this.getFleetSnapshot() };
       }
@@ -1123,7 +1832,6 @@ export class ConnectionSupervisor {
       // Non-fatal
     }
 
-    const targetProfileId = options?.profileId ?? conn.remoteProfile ?? "default";
     const entry: GatewayTransportEntry = {
       key: transportKey,
       connectionId,
@@ -1141,10 +1849,22 @@ export class ConnectionSupervisor {
       capabilitiesHandshakeSent,
       subscribedToGateway,
       disposed: false,
+      lastInboundAt: this.now(),
+      lastPingSentAt: null,
+      heartbeatTimer: null,
       unsubNotification: () => {},
       unsubClose: () => {},
+      unsubInbound: () => {},
     };
 
+    entry.unsubInbound = client.onInboundFrame((opcode) => {
+      entry.lastInboundAt = this.now();
+      if (opcode === 0xA && entry.lastPingSentAt !== null) {
+        const rtt = Math.max(1, this.now() - entry.lastPingSentAt);
+        entry.lastPingSentAt = null;
+        this.updateReadyLinksLatency(connectionId, rtt);
+      }
+    });
     entry.unsubNotification = client.onNotification((method, params) => {
       this.handleGatewayNotification(entry, method, params);
     });
@@ -1153,14 +1873,7 @@ export class ConnectionSupervisor {
       this.disposeTransportEntry(transportKey, entry);
       const current = this.remoteHealth.get(connectionId);
       if (current && current.actual !== "auth_required") {
-        this.remoteHealth.set(connectionId, {
-          ...current,
-          actual: "reconnecting",
-          degraded: true,
-          latencyMs: null,
-          errorCode: "unreachable",
-        });
-        this.emitFleet(connectionId);
+        this.handleUnexpectedTransportClose(entry);
       }
     });
 
@@ -1169,8 +1882,9 @@ export class ConnectionSupervisor {
       this.disposeTransportEntry(transportKey, previous);
     }
     this.transports.set(transportKey, entry);
+    this.scheduleTransportHeartbeat(entry);
 
-    const latencyMs = Math.max(1, Date.now() - startedAt);
+    const latencyMs = Math.max(1, this.now() - startedAt);
     this.remoteHealth.set(connectionId, {
       connectionId,
       label: conn.label,
@@ -1183,6 +1897,7 @@ export class ConnectionSupervisor {
       message: undefined,
       nextRetryAt: null,
     });
+    this.markLinkReady(connectionId, targetProfileId, latencyMs);
 
     const profiles = await this.refreshProfiles(entry, targetProfileId);
     const activeProfileId =
@@ -1190,6 +1905,9 @@ export class ConnectionSupervisor {
       profiles[0]?.profileId ??
       targetProfileId;
     entry.defaultProfileId = activeProfileId;
+    if (activeProfileId !== targetProfileId) {
+      this.markLinkReady(connectionId, activeProfileId, latencyMs);
+    }
     const sessions = await this.refreshSessionsForProfile(entry, activeProfileId);
 
     if (
@@ -1239,8 +1957,14 @@ export class ConnectionSupervisor {
     profileId: string,
     options?: { forceReconnect?: boolean; activate?: boolean; activateScope?: boolean },
   ): Promise<SupervisorConnectResult> {
-    if (this.disposed) {
+    if (this.disposed || this.shuttingDown) {
       return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    const link = this.ensureLinkState("local", profileId, "enabled");
+    if (!this.suspended) {
+      link.desired = "enabled";
+      link.wasDesiredBeforeSuspend = true;
     }
 
     if (options?.forceReconnect) {
@@ -1257,6 +1981,12 @@ export class ConnectionSupervisor {
       }
     }
 
+    link.actual = "connecting";
+    link.degraded = false;
+    link.errorCode = undefined;
+    link.unavailableCode = undefined;
+    link.message = undefined;
+    link.nextRetryAt = null;
     this.localHealth = {
       ...this.localHealth,
       label: this.getLocalLabel(),
@@ -1266,23 +1996,39 @@ export class ConnectionSupervisor {
       message: undefined,
       nextRetryAt: null,
     };
+    this.syncProfileAndConnectionProjections("local");
     this.syncChatStateWithSnapshot();
     this.emitFleet("local");
 
-    const startedAt = Date.now();
+    const startedAt = this.now();
     const dialResult = await this.localBackend.prepareDial({ profileId });
     if (!dialResult.ok) {
+      const errCode = mapLocalFailureToErrorCode(dialResult.failure);
+      const msg = getLocalFailureCopy(dialResult.failure.code).whatHappened;
+      const isRetryable =
+        dialResult.failure.autoRetry || dialResult.inspection.actual === "reconnecting";
       this.localHealth = {
         ...this.localHealth,
         label: this.getLocalLabel(),
-        actual: dialResult.inspection.actual === "reconnecting" ? "reconnecting" : "blocked",
+        actual: isRetryable ? "reconnecting" : "blocked",
         degraded: true,
         latencyMs: null,
-        errorCode: mapLocalFailureToErrorCode(dialResult.failure),
-        message: getLocalFailureCopy(dialResult.failure.code).whatHappened,
+        errorCode: errCode,
+        message: msg,
       };
-      this.syncChatStateWithSnapshot();
-      this.emitFleet("local");
+      if (isRetryable) {
+        this.scheduleLinkBackoff("local", profileId, errCode, msg, dialResult.failure.code);
+      } else {
+        link.actual = "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.errorCode = errCode;
+        link.unavailableCode = dialResult.failure.code;
+        link.message = msg;
+        this.syncProfileAndConnectionProjections("local");
+        this.syncChatStateWithSnapshot();
+        this.emitFleet("local");
+      }
       return {
         ok: false,
         failure: dialResult.failure,
@@ -1300,15 +2046,51 @@ export class ConnectionSupervisor {
     if (!ticket) {
       const minted = await this.localBackend.mintReconnectTicket(dial);
       if (!minted.ok) {
+        if (minted.failure.code === "ticket_unavailable") {
+          const reattached = await this.localBackend.prepareDial({ profileId });
+          if (reattached.ok) {
+            const retriedTicket = reattached.dial.consumeTicket();
+            if (retriedTicket) {
+              return this.finishGatewayHandshake({
+                connectionId: "local",
+                kind: "local",
+                label: this.getLocalLabel(),
+                originDisplay: "127.0.0.1",
+                transportKey,
+                dial: reattached.dial,
+                ticket: retriedTicket,
+                startedAt,
+                activateScope: options?.activateScope ?? options?.activate,
+              });
+            }
+          }
+          const errCode = mapLocalFailureToErrorCode(minted.failure);
+          const msg = getLocalFailureCopy(minted.failure.code).whatHappened;
+          this.scheduleLinkBackoff("local", profileId, errCode, msg);
+          return {
+            ok: false,
+            failure: minted.failure,
+            fleet: this.getFleetSnapshot(),
+          };
+        }
+        const errCode = mapLocalFailureToErrorCode(minted.failure);
+        const msg = getLocalFailureCopy(minted.failure.code).whatHappened;
+        link.actual = "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.errorCode = errCode;
+        link.unavailableCode = minted.failure.code;
+        link.message = msg;
         this.localHealth = {
           ...this.localHealth,
           label: this.getLocalLabel(),
           actual: "blocked",
           degraded: true,
           latencyMs: null,
-          errorCode: mapLocalFailureToErrorCode(minted.failure),
-          message: getLocalFailureCopy(minted.failure.code).whatHappened,
+          errorCode: errCode,
+          message: msg,
         };
+        this.syncProfileAndConnectionProjections("local");
         this.emitFleet("local");
         return {
           ok: false,
@@ -1320,6 +2102,9 @@ export class ConnectionSupervisor {
     }
 
     if (!ticket) {
+      link.actual = "blocked";
+      link.degraded = true;
+      link.errorCode = "auth_failed";
       this.localHealth = {
         ...this.localHealth,
         label: this.getLocalLabel(),
@@ -1327,6 +2112,7 @@ export class ConnectionSupervisor {
         degraded: true,
         errorCode: "auth_failed",
       };
+      this.syncProfileAndConnectionProjections("local");
       this.emitFleet("local");
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
@@ -1349,13 +2135,19 @@ export class ConnectionSupervisor {
     profileId: string,
     options?: { forceReconnect?: boolean; activateScope?: boolean },
   ): Promise<SupervisorConnectResult> {
-    if (this.disposed || !this.sshTransport) {
+    if (this.disposed || this.shuttingDown || !this.sshTransport) {
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
     const info = this.getSshTargetForConnection(connectionId);
     if (!info) {
       return { ok: false, fleet: this.getFleetSnapshot() };
+    }
+
+    const link = this.ensureLinkState(connectionId, profileId, "enabled");
+    if (!this.suspended) {
+      link.desired = "enabled";
+      link.wasDesiredBeforeSuspend = true;
     }
 
     if (options?.forceReconnect) {
@@ -1367,6 +2159,12 @@ export class ConnectionSupervisor {
       await this.sshTransport.disposeConnection(connectionId);
     }
 
+    link.actual = "connecting";
+    link.degraded = false;
+    link.errorCode = undefined;
+    link.unavailableCode = undefined;
+    link.message = undefined;
+    link.nextRetryAt = null;
     this.setHealth(connectionId, {
       connectionId,
       label: info.label,
@@ -1377,24 +2175,38 @@ export class ConnectionSupervisor {
       latencyMs: null,
       nextRetryAt: null,
     });
+    this.syncProfileAndConnectionProjections(connectionId);
     this.emitFleet(connectionId);
 
-    const startedAt = Date.now();
+    const startedAt = this.now();
     const dialResult = await this.sshTransport.prepareDial(info.target, profileId);
     if (!dialResult.ok) {
+      const errCode = mapSshFailureToErrorCode(dialResult.failureCode);
+      const isRetryable = dialResult.status !== "blocked";
       this.setHealth(connectionId, {
         connectionId,
         label: info.label,
         kind: "ssh",
         originDisplay: info.sshTargetDisplay,
-        actual: dialResult.status === "blocked" ? "blocked" : "reconnecting",
+        actual: isRetryable ? "reconnecting" : "blocked",
         degraded: true,
         latencyMs: null,
         nextRetryAt: null,
-        errorCode: mapSshFailureToErrorCode(dialResult.failureCode),
+        errorCode: errCode,
         message: dialResult.message,
       });
-      this.emitFleet(connectionId);
+      if (isRetryable) {
+        this.scheduleLinkBackoff(connectionId, profileId, errCode, dialResult.message);
+      } else {
+        link.actual = "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.nextRetryAt = null;
+        link.errorCode = errCode;
+        link.message = dialResult.message;
+        this.syncProfileAndConnectionProjections(connectionId);
+        this.emitFleet(connectionId);
+      }
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
 
@@ -1413,6 +2225,33 @@ export class ConnectionSupervisor {
         dial.instanceId,
       );
       if (!minted.ok) {
+        const errCode = mapSshFailureToErrorCode(minted.failureCode);
+        if (minted.failureCode === "ticket_unavailable") {
+          const redial = await this.sshTransport.prepareDial(info.target, profileId);
+          if (redial.ok) {
+            const retriedTicket = redial.dial.consumeTicket();
+            if (retriedTicket) {
+              return this.finishGatewayHandshake({
+                connectionId,
+                kind: "ssh",
+                label: info.label,
+                originDisplay: info.sshTargetDisplay,
+                transportKey,
+                dial: redial.dial,
+                ticket: retriedTicket,
+                startedAt,
+                activateScope: options?.activateScope,
+              });
+            }
+          }
+          this.scheduleLinkBackoff(connectionId, profileId, errCode, minted.message);
+          return { ok: false, fleet: this.getFleetSnapshot() };
+        }
+        link.actual = "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.errorCode = errCode;
+        link.message = minted.message;
         this.setHealth(connectionId, {
           connectionId,
           label: info.label,
@@ -1422,9 +2261,10 @@ export class ConnectionSupervisor {
           degraded: true,
           latencyMs: null,
           nextRetryAt: null,
-          errorCode: mapSshFailureToErrorCode(minted.failureCode),
+          errorCode: errCode,
           message: minted.message,
         });
+        this.syncProfileAndConnectionProjections(connectionId);
         this.emitFleet(connectionId);
         return { ok: false, fleet: this.getFleetSnapshot() };
       }
@@ -1433,6 +2273,9 @@ export class ConnectionSupervisor {
     }
 
     if (!ticket) {
+      link.actual = "blocked";
+      link.degraded = true;
+      link.errorCode = "auth_failed";
       this.setHealth(connectionId, {
         connectionId,
         label: info.label,
@@ -1444,6 +2287,7 @@ export class ConnectionSupervisor {
         nextRetryAt: null,
         errorCode: "auth_failed",
       });
+      this.syncProfileAndConnectionProjections(connectionId);
       this.emitFleet(connectionId);
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
@@ -1473,6 +2317,7 @@ export class ConnectionSupervisor {
     activateScope?: boolean;
   }): Promise<SupervisorConnectResult> {
     const { connectionId, kind, label, originDisplay, transportKey, dial, startedAt } = params;
+    const link = this.ensureLinkState(connectionId, dial.profileId, "enabled");
     let ticket: string | null = params.ticket;
 
     let client: GatewayClient;
@@ -1485,18 +2330,29 @@ export class ConnectionSupervisor {
       });
     } catch (err) {
       const errCode: ErrorCode = err instanceof GatewayTransportError ? err.code : "unreachable";
+      const isRetryable = errCode === "timeout" || errCode === "unreachable";
       this.setHealth(connectionId, {
         connectionId,
         label: connectionId === "local" ? this.getLocalLabel() : label,
         kind,
         originDisplay,
-        actual: errCode === "timeout" ? "reconnecting" : "blocked",
+        actual: isRetryable ? "reconnecting" : "blocked",
         degraded: true,
         latencyMs: null,
         nextRetryAt: null,
         errorCode: errCode,
       });
-      this.emitFleet(connectionId);
+      if (isRetryable) {
+        this.scheduleLinkBackoff(connectionId, dial.profileId, errCode);
+      } else {
+        link.actual = "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.nextRetryAt = null;
+        link.errorCode = errCode;
+        this.syncProfileAndConnectionProjections(connectionId);
+        this.emitFleet(connectionId);
+      }
       return { ok: false, fleet: this.getFleetSnapshot() };
     } finally {
       ticket = null;
@@ -1508,6 +2364,11 @@ export class ConnectionSupervisor {
     } catch (err) {
       if (!isJsonRpcMethodNotFound(err)) {
         client.close();
+        link.actual = "blocked";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.nextRetryAt = null;
+        link.errorCode = "protocol_unsupported";
         this.setHealth(connectionId, {
           connectionId,
           label: connectionId === "local" ? this.getLocalLabel() : label,
@@ -1519,6 +2380,7 @@ export class ConnectionSupervisor {
           nextRetryAt: null,
           errorCode: "protocol_unsupported",
         });
+        this.syncProfileAndConnectionProjections(connectionId);
         this.emitFleet(connectionId);
         return { ok: false, fleet: this.getFleetSnapshot() };
       }
@@ -1580,9 +2442,22 @@ export class ConnectionSupervisor {
       capabilitiesHandshakeSent,
       subscribedToGateway,
       disposed: false,
+      lastInboundAt: this.now(),
+      lastPingSentAt: null,
+      heartbeatTimer: null,
       unsubNotification: () => {},
       unsubClose: () => {},
+      unsubInbound: () => {},
     };
+
+    entry.unsubInbound = client.onInboundFrame((opcode) => {
+      entry.lastInboundAt = this.now();
+      if (opcode === 0xA && entry.lastPingSentAt !== null) {
+        const rtt = Math.max(1, this.now() - entry.lastPingSentAt);
+        entry.lastPingSentAt = null;
+        this.updateReadyLinksLatency(connectionId, rtt);
+      }
+    });
 
     entry.unsubNotification = client.onNotification((method, notifParams) => {
       this.handleGatewayNotification(entry, method, notifParams);
@@ -1591,31 +2466,7 @@ export class ConnectionSupervisor {
     entry.unsubClose = client.onClose((reason) => {
       if (this.disposed || entry.disposed || reason === "client_closed") return;
       this.disposeTransportEntry(transportKey, entry);
-      const hasRemaining = [...this.transports.values()].some(
-        (t) => t.connectionId === connectionId && !t.disposed && t.client.isOpen(),
-      );
-      if (!hasRemaining) {
-        this.setHealth(connectionId, {
-          connectionId,
-          label: connectionId === "local" ? this.getLocalLabel() : label,
-          kind,
-          originDisplay,
-          actual: "reconnecting",
-          degraded: true,
-          latencyMs: null,
-          nextRetryAt: null,
-          errorCode: "unreachable",
-        });
-        if (connectionId === "local" || this.activeScope?.connectionId === connectionId) {
-          this.capabilityRegistry.invalidate({ reason: "transport_closed" });
-          this.emitCapabilities();
-        }
-        this.emitFleet(connectionId);
-      }
-
-      if (kind === "ssh" && this.sshTransport && entry.dial) {
-        void this.reconnectSshAfterDrop(connectionId, entry.dial.profileId, entry.dial.instanceId);
-      }
+      this.handleUnexpectedTransportClose(entry);
     });
 
     const previous = this.transports.get(transportKey);
@@ -1623,6 +2474,7 @@ export class ConnectionSupervisor {
       this.disposeTransportEntry(transportKey, previous);
     }
     this.transports.set(transportKey, entry);
+    this.scheduleTransportHeartbeat(entry);
 
     if (
       connectionId === "local" ||
@@ -1643,7 +2495,7 @@ export class ConnectionSupervisor {
       this.scheduleCoreProbes(entry, dial.profileId);
     }
 
-    const latencyMs = Math.max(1, Date.now() - startedAt);
+    const latencyMs = Math.max(1, this.now() - startedAt);
     this.setHealth(connectionId, {
       connectionId,
       label: connectionId === "local" ? this.getLocalLabel() : label,
@@ -1654,9 +2506,32 @@ export class ConnectionSupervisor {
       latencyMs,
       nextRetryAt: null,
     });
+    this.markLinkReady(connectionId, dial.profileId, latencyMs);
 
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
+
+    // Resync existing transcripts for dialed profile on reconnect
+    for (const tx of this.transcripts.values()) {
+      if (tx.connectionId === connectionId && tx.profileId === dial.profileId && tx.sessionId) {
+        await this.loadTranscriptSnapshot(entry, dial.profileId, tx.sessionId, {
+          replace: true,
+          resynced: true,
+        });
+      }
+    }
+
+    // If shared-host-scope transport, independently resume all other enabled profiles
+    if (entry.transportMode === "shared-host-scope") {
+      const enabledOtherProfiles = this.getLinksForConnection(connectionId).filter(
+        (l) => l.desired === "enabled" && l.profileId !== dial.profileId,
+      );
+      for (const otherLink of enabledOtherProfiles) {
+        await this.activateOrRefreshProfileOnSharedTransport(entry, otherLink.profileId, {
+          resyncTranscripts: true,
+        });
+      }
+    }
 
     if (connectionId === "local") {
       const savedState = this.chatSessionStateStore?.load();
@@ -1669,7 +2544,9 @@ export class ConnectionSupervisor {
         localProfiles.some((p) => p.profileId === savedActive.profileId) &&
         entry.transportMode === "shared-host-scope"
       ) {
-        await this.refreshSessionsForProfile(entry, savedActive.profileId);
+        await this.activateOrRefreshProfileOnSharedTransport(entry, savedActive.profileId, {
+          resyncTranscripts: true,
+        });
       }
 
       const remoteIsCurrentlyActive =
@@ -1749,6 +2626,7 @@ export class ConnectionSupervisor {
       }
     }
 
+    this.syncProfileAndConnectionProjections(connectionId);
     this.emitFleet(connectionId);
     return {
       ok: true,
@@ -1756,12 +2634,49 @@ export class ConnectionSupervisor {
     };
   }
 
+  private async activateOrRefreshProfileOnSharedTransport(
+    entry: GatewayTransportEntry,
+    profileId: string,
+    options?: { resyncTranscripts?: boolean },
+  ): Promise<boolean> {
+    const connectionId = entry.connectionId;
+    const link = this.ensureLinkState(connectionId, profileId, "enabled");
+    if (!this.suspended) {
+      link.desired = "enabled";
+      link.wasDesiredBeforeSuspend = true;
+    }
+
+    await this.refreshSessionsForProfile(entry, profileId);
+    const updatedLink = this.ensureLinkState(connectionId, profileId, "enabled");
+    if (updatedLink.actual === "blocked" && updatedLink.unavailableCode === "profile_unavailable") {
+      return false;
+    }
+
+    const baseLatency = this.getConnectionHealth(connectionId)?.latencyMs ?? 1;
+    this.markLinkReady(connectionId, profileId, baseLatency);
+
+    if (options?.resyncTranscripts) {
+      for (const tx of this.transcripts.values()) {
+        if (tx.connectionId === connectionId && tx.profileId === profileId && tx.sessionId) {
+          await this.loadTranscriptSnapshot(entry, profileId, tx.sessionId, {
+            replace: true,
+            resynced: true,
+          });
+        }
+      }
+    }
+
+    this.emitProfiles(connectionId);
+    this.emitFleet(connectionId);
+    return true;
+  }
+
   private async reconnectSshAfterDrop(
     connectionId: string,
     profileId: string,
     instanceId: string,
   ): Promise<void> {
-    if (this.disposed || !this.sshTransport) return;
+    if (this.disposed || this.shuttingDown || this.suspended || !this.sshTransport) return;
     const info = this.getSshTargetForConnection(connectionId);
     if (!info) return;
 
@@ -1769,7 +2684,7 @@ export class ConnectionSupervisor {
     if (this.connectingByKey.has(inflightKey)) return;
 
     const runner = (async (): Promise<SupervisorConnectResult> => {
-      const startedAt = Date.now();
+      const startedAt = this.now();
       const minted = await this.sshTransport!.mintReconnectTicket(
         connectionId,
         info.target,
@@ -1777,24 +2692,20 @@ export class ConnectionSupervisor {
         instanceId,
       );
       if (!minted.ok) {
-        this.setHealth(connectionId, {
-          connectionId,
-          label: info.label,
-          kind: "ssh",
-          originDisplay: info.sshTargetDisplay,
-          actual: "reconnecting",
-          degraded: true,
-          latencyMs: null,
-          nextRetryAt: null,
-          errorCode: mapSshFailureToErrorCode(minted.failureCode),
-          message: minted.message,
-        });
-        this.emitFleet(connectionId);
+        const errCode = mapSshFailureToErrorCode(minted.failureCode);
+        if (minted.failureCode === "ticket_unavailable") {
+          const redial = await this.connectSshInternal(connectionId, profileId, {
+            forceReconnect: true,
+          });
+          return redial;
+        }
+        this.scheduleLinkBackoff(connectionId, profileId, errCode, minted.message);
         return { ok: false, fleet: this.getFleetSnapshot() };
       }
 
       const ticket = minted.consumeTicket();
       if (!ticket) {
+        this.scheduleLinkBackoff(connectionId, profileId, "auth_failed");
         return { ok: false, fleet: this.getFleetSnapshot() };
       }
 
@@ -1832,6 +2743,11 @@ export class ConnectionSupervisor {
 
   private disposeTransportEntry(key: string, entry: GatewayTransportEntry): void {
     entry.disposed = true;
+    if (entry.heartbeatTimer !== null) {
+      this.clearTimer(entry.heartbeatTimer);
+      entry.heartbeatTimer = null;
+    }
+    entry.unsubInbound();
     entry.unsubNotification();
     entry.unsubClose();
     entry.client.close();
@@ -1866,6 +2782,7 @@ export class ConnectionSupervisor {
     if (rawProfiles.length === 0) {
       const hasExisting = currentProfiles.some((p) => p.profileId === activeProfileId);
       if (!hasExisting) {
+        const link = this.ensureLinkState(connectionId, activeProfileId, "enabled");
         this.profilesByConnection.set(connectionId, [
           ...currentProfiles,
           {
@@ -1874,32 +2791,101 @@ export class ConnectionSupervisor {
             displayName: activeProfileId === "default" ? "Default" : activeProfileId,
             handle: activeProfileId,
             isDefault: activeProfileId === "default",
-            actual: "ready",
+            desired: link.desired,
+            actual: link.actual,
+            degraded: link.degraded,
+            pinned: this.computeProfilePinned(connectionId, activeProfileId),
           },
         ]);
       }
     } else {
+      const seenIds = new Set<string>();
+      const nextList: ProfileSummary[] = [];
       const existingById = new Map(currentProfiles.map((p) => [p.profileId, p]));
+
       for (const raw of rawProfiles) {
         const pid = asString(raw.profile_id ?? raw.profileId ?? raw.id).trim();
         if (!pid) continue;
+        seenIds.add(pid);
         const displayName = asString(raw.display_name ?? raw.displayName, pid) || pid;
         const handle = asString(raw.handle, pid) || pid;
         const isDefault = Boolean(raw.is_default ?? raw.isDefault ?? pid === "default");
-        existingById.set(pid, {
+        const initialDesired: ConnectionDesiredState =
+          isDefault || pid === activeProfileId ? "enabled" : "disabled";
+        const link = this.ensureLinkState(connectionId, pid, initialDesired);
+        if (pid === activeProfileId && link.actual === "idle" && !this.suspended) {
+          link.desired = "enabled";
+          link.actual = "ready";
+        }
+        const prev = existingById.get(pid);
+        nextList.push({
+          ...prev,
           connectionId,
           profileId: pid,
           displayName,
           handle,
           isDefault,
-          actual: pid === activeProfileId ? "ready" : existingById.get(pid)?.actual ?? "idle",
+          desired: link.desired,
+          actual: link.actual,
+          degraded: link.degraded,
+          pinned: this.computeProfilePinned(connectionId, pid),
+          ...(link.unavailableCode ? { unavailableCode: link.unavailableCode } : {}),
+          ...(link.errorCode ? { errorCode: link.errorCode } : {}),
+          ...(link.message ? { message: link.message } : {}),
         });
       }
-      this.profilesByConnection.set(connectionId, [...existingById.values()]);
+
+      // Any profile that disappeared from profiles.list: tear down only its link!
+      for (const link of this.getLinksForConnection(connectionId)) {
+        if (!seenIds.has(link.profileId)) {
+          this.clearLinkTimers(link);
+          link.desired = "disabled";
+          link.wasDesiredBeforeSuspend = false;
+          link.actual = "idle";
+          link.degraded = false;
+          link.latencyMs = null;
+          link.nextRetryAt = null;
+          link.errorCode = undefined;
+          link.unavailableCode = undefined;
+          link.message = undefined;
+          this.sessionsByScope.delete(scopeKey(connectionId, link.profileId));
+          const perProfileKey = `${connectionId}::profile:${link.profileId}`;
+          const perProfileEntry = this.transports.get(perProfileKey);
+          if (perProfileEntry) {
+            this.disposeTransportEntry(perProfileKey, perProfileEntry);
+          }
+        }
+      }
+
+      this.profilesByConnection.set(connectionId, nextList);
     }
 
+    this.syncProfileAndConnectionProjections(connectionId);
     this.emitProfiles(connectionId);
+    this.emitFleet(connectionId);
     return [...(this.profilesByConnection.get(connectionId) ?? [])];
+  }
+
+  private markProfileUnavailable(
+    connectionId: string,
+    profileId: string,
+    err: unknown,
+  ): void {
+    const link = this.ensureLinkState(connectionId, profileId, "enabled");
+    this.clearLinkTimers(link);
+    link.actual = "blocked";
+    link.degraded = true;
+    link.latencyMs = null;
+    link.nextRetryAt = null;
+    link.unavailableCode = "profile_unavailable";
+    link.errorCode = "not_found";
+    link.message =
+      err instanceof Error && err.message
+        ? getLocalFailureCopy("profile_unavailable").whatHappened
+        : getLocalFailureCopy("profile_unavailable").whatHappened;
+    this.syncProfileAndConnectionProjections(connectionId);
+    this.emitProfiles(connectionId);
+    this.emitFleet(connectionId);
   }
 
   private async refreshSessionsForProfile(
@@ -1919,12 +2905,20 @@ export class ConnectionSupervisor {
       try {
         rawList = await callList("session.list");
       } catch (err) {
+        if (isProfileUnavailableRpcError(err)) {
+          this.markProfileUnavailable(connectionId, profileId, err);
+          return [];
+        }
         if (isRpcAuthError(err) && connectionId !== "local") {
           this.markConnectionAuthRequired(connectionId);
         } else {
           try {
             rawList = await callList("sessions.list");
           } catch (err2) {
+            if (isProfileUnavailableRpcError(err2)) {
+              this.markProfileUnavailable(connectionId, profileId, err2);
+              return [];
+            }
             if (isJsonRpcMethodNotFound(err2)) {
               entry.capabilities.sessionList = false;
             }
@@ -1938,11 +2932,23 @@ export class ConnectionSupervisor {
       .filter((item): item is SessionSummary => item !== null && item.profileId === profileId);
 
     this.sessionsByScope.set(scopeKey(connectionId, profileId), mapped);
+    this.syncProfileAndConnectionProjections(connectionId);
     this.emitSessions(connectionId, profileId);
     return mapped;
   }
 
   private markConnectionAuthRequired(connectionId: string): void {
+    for (const link of this.getLinksForConnection(connectionId)) {
+      if (link.desired === "enabled") {
+        this.clearLinkTimers(link);
+        link.actual = "auth_required";
+        link.degraded = true;
+        link.latencyMs = null;
+        link.nextRetryAt = null;
+        link.errorCode = "auth_required";
+        link.message = getCopy("remote.authRequiredBody");
+      }
+    }
     if (connectionId === "local") {
       this.localHealth = {
         ...this.localHealth,
@@ -1967,6 +2973,7 @@ export class ConnectionSupervisor {
     if (remoteEntry) {
       this.disposeTransportEntry(`remote:${connectionId}`, remoteEntry);
     }
+    this.syncProfileAndConnectionProjections(connectionId);
     this.emitFleet(connectionId);
   }
 
@@ -2293,6 +3300,12 @@ export class ConnectionSupervisor {
     method: string,
     params: Record<string, unknown>,
   ): void {
+    if (this.disposed || this.shuttingDown || entry.disposed) return;
+    const currentEntry = this.transports.get(entry.key);
+    if (currentEntry && currentEntry.ownerGeneration !== entry.ownerGeneration) {
+      return;
+    }
+
     const connectionId = entry.connectionId;
     if (method === "auth.required" || method === "auth_required") {
       this.markConnectionAuthRequired(connectionId);
@@ -2363,6 +3376,20 @@ export class ConnectionSupervisor {
       asString(params.profile_id ?? params.profileId, entry.defaultProfileId).trim() ||
       entry.defaultProfileId;
     const resolvedProfileId = this.findProfileIdForSession(connectionId, sessionId) ?? profileId;
+
+    if (method === "approval.requested" || method === "approval.pending") {
+      this.notifyBackgroundEventForTest({
+        kind: "approval_pending",
+        scope: {
+          connectionId,
+          profileId: resolvedProfileId,
+          ...(sessionId ? { sessionId } : {}),
+        },
+        rawPayload: params,
+      });
+      return;
+    }
+
     if (!sessionId) return;
 
     if (method === "prompt.delta" || method === "prompt.token") {
@@ -2474,6 +3501,17 @@ export class ConnectionSupervisor {
         kind,
         messageId,
       } satisfies PromptEventPayload);
+      if (method === "prompt.completed" || method === "prompt.done") {
+        this.notifyBackgroundEventForTest({
+          kind: "turn_completed",
+          scope: {
+            connectionId,
+            profileId: resolvedProfileId,
+            sessionId,
+          },
+          rawPayload: params,
+        });
+      }
     }
   }
 
@@ -2557,12 +3595,27 @@ export class ConnectionSupervisor {
     return entry;
   }
 
+  private assertNotShuttingDown(): void {
+    if (this.disposed || this.shuttingDown) {
+      throw makeBridgeError("cancelled", "应用正在退出");
+    }
+  }
+
   private translateRpcFailure(
     entry: GatewayTransportEntry,
     err: unknown,
     singleAction?: keyof SupportedChatActions,
     rpcMethod?: string,
+    profileId?: string,
   ): never {
+    if (isProfileUnavailableRpcError(err)) {
+      const targetPid = profileId ?? entry.defaultProfileId;
+      this.markProfileUnavailable(entry.connectionId, targetPid, err);
+      throw makeBridgeError(
+        "not_found",
+        getLocalFailureCopy("profile_unavailable").whatHappened,
+      );
+    }
     if (isJsonRpcMethodNotFound(err)) {
       if (singleAction) {
         this.downgradeSingleAction(entry, singleAction);
@@ -2737,6 +3790,7 @@ export class ConnectionSupervisor {
     HostCommandHandler
   > = {
     "capabilities.describe": async (payload, scope) => {
+      this.assertNotShuttingDown();
       if (this.inflightCoreProbes) {
         await this.inflightCoreProbes;
       }
@@ -2757,12 +3811,23 @@ export class ConnectionSupervisor {
     },
 
     "fleet.refresh": async () => {
+      this.assertNotShuttingDown();
       return { fleet: this.getFleetSnapshot() };
     },
 
     "connections.retry": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
-      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const hasExplicitProfile =
+        (typeof payload.profileId === "string" && payload.profileId.trim()) ||
+        (scope?.profileId && scope.profileId.trim());
+      const defaultProfile =
+        connectionId === "local"
+          ? "default"
+          : this.getSshTargetForConnection(connectionId)?.defaultProfile ?? "default";
+      const profileId = hasExplicitProfile
+        ? this.resolveTargetProfile(payload, scope, connectionId)
+        : defaultProfile;
       if (connectionId !== "local") {
         const res = this.isSshConnection(connectionId)
           ? await this.connectSsh(connectionId, {
@@ -2792,6 +3857,7 @@ export class ConnectionSupervisor {
     },
 
     "profiles.list": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const entry = this.getTransport(connectionId, profileId);
@@ -2807,12 +3873,14 @@ export class ConnectionSupervisor {
     },
 
     "scopes.switch": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const connectRes = await this.ensureTransport(connectionId, profileId, { activate: false });
       const entry = this.getTransport(connectionId, profileId);
+      const link = this.ensureLinkState(connectionId, profileId, "enabled");
       let transcript: SessionTranscriptSnapshot | null = null;
-      if (entry) {
+      if (entry && link.actual !== "blocked") {
         await this.refreshProfiles(entry, profileId);
         const sessions = await this.refreshSessionsForProfile(entry, profileId);
         const requestedSession =
@@ -2868,15 +3936,17 @@ export class ConnectionSupervisor {
           this.syncChatStateWithSnapshot();
         }
       }
+      this.syncProfileAndConnectionProjections(connectionId);
       this.emitFleet(connectionId);
       return {
-        ok: connectRes.ok,
+        ok: connectRes.ok && link.actual !== "blocked",
         fleet: this.getFleetSnapshot(),
         transcript,
       };
     },
 
     "sessions.list": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const entry = this.getTransport(connectionId, profileId);
@@ -2889,6 +3959,7 @@ export class ConnectionSupervisor {
     },
 
     "sessions.select": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId =
@@ -2942,6 +4013,7 @@ export class ConnectionSupervisor {
     },
 
     "sessions.create": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       await this.ensureTransport(connectionId, profileId);
@@ -2960,7 +4032,7 @@ export class ConnectionSupervisor {
           title,
         });
       } catch (err) {
-        this.translateRpcFailure(entry, err, "sessionCreate", "session.create");
+        this.translateRpcFailure(entry, err, "sessionCreate", "session.create", profileId);
       }
 
       const rawSession =
@@ -3024,6 +4096,7 @@ export class ConnectionSupervisor {
     },
 
     "sessions.resume": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
@@ -3041,6 +4114,7 @@ export class ConnectionSupervisor {
     },
 
     "prompts.send": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
@@ -3062,7 +4136,7 @@ export class ConnectionSupervisor {
           text,
         });
       } catch (err) {
-        this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit");
+        this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit", profileId);
       }
 
       const turnId = asString(res.turn_id ?? res.turnId, `turn-${Date.now()}`);
@@ -3108,6 +4182,7 @@ export class ConnectionSupervisor {
         messageId: assistantMsgId,
         status: "streaming",
       });
+      this.syncProfileAndConnectionProjections(connectionId);
 
       this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
         connectionId,
@@ -3128,6 +4203,7 @@ export class ConnectionSupervisor {
     },
 
     "prompts.stop": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
@@ -3176,7 +4252,7 @@ export class ConnectionSupervisor {
           turnId,
           kind: "stop_failed",
         } satisfies PromptEventPayload);
-        this.translateRpcFailure(entry, err, "promptCancel", "prompt.cancel");
+        this.translateRpcFailure(entry, err, "promptCancel", "prompt.cancel", profileId);
       }
 
       if (res?.stopped === false) {
@@ -3203,6 +4279,7 @@ export class ConnectionSupervisor {
         turnStopping: false,
         status: "stopped",
       });
+      this.syncProfileAndConnectionProjections(connectionId);
       this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
         connectionId,
         profileId,
@@ -3214,6 +4291,7 @@ export class ConnectionSupervisor {
     },
 
     "prompts.steer": async (payload, scope) => {
+      this.assertNotShuttingDown();
       const connectionId = this.resolveTargetConnectionId(payload, scope);
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
@@ -3234,13 +4312,17 @@ export class ConnectionSupervisor {
           text,
         });
       } catch (err) {
-        this.translateRpcFailure(entry, err, "promptSteer", "session.steer");
+        this.translateRpcFailure(entry, err, "promptSteer", "session.steer", profileId);
       }
     },
 
-    "chatState.get": async () => this.getChatStateProjection(),
+    "chatState.get": async () => {
+      this.assertNotShuttingDown();
+      return this.getChatStateProjection();
+    },
 
     "chatState.dismissRouteBanner": async () => {
+      this.assertNotShuttingDown();
       if (!this.chatSessionStateStore) return this.getChatStateProjection();
       const projection = this.chatSessionStateStore.dismissRouteBanner();
       this.emitChatState();
@@ -3248,6 +4330,7 @@ export class ConnectionSupervisor {
     },
 
     "chatState.saveDraft": async (payload, scope) => {
+      this.assertNotShuttingDown();
       if (!this.chatSessionStateStore) return this.getChatStateProjection();
       const profileId = this.resolveTargetProfile(payload, scope);
       const sessionId = this.resolveTargetSessionId(payload, scope);
@@ -3281,6 +4364,7 @@ export class ConnectionSupervisor {
     "files.read": async () => ({ file: null }),
 
     "chatState.exportMissingSession": async (_payload, scope) => {
+      this.assertNotShuttingDown();
       if (!this.chatSessionStateStore) return null;
       const ref: ActiveChatRef | undefined =
         scope?.connectionId && scope?.profileId
@@ -3294,6 +4378,7 @@ export class ConnectionSupervisor {
     },
 
     "chatState.dismissMissingSession": async () => {
+      this.assertNotShuttingDown();
       if (!this.chatSessionStateStore) return this.getChatStateProjection();
       const allSessions = this.getAllSessions();
       const projection = this.chatSessionStateStore.dismissMissingSession(allSessions);
@@ -3447,15 +4532,234 @@ export class ConnectionSupervisor {
     };
   }
 
-  async dispose(): Promise<void> {
+  async startFleet(): Promise<void> {
+    if (this.disposed || this.shuttingDown || this.suspended) return;
+
+    const snap = this.registryStore?.snapshot();
+    const primaryId = snap?.primary ?? "local";
+    const candidates: Array<{
+      connectionId: string;
+      profileId: string;
+      isLocal: boolean;
+      isPrimary: boolean;
+    }> = [
+      {
+        connectionId: "local",
+        profileId: "default",
+        isLocal: true,
+        isPrimary: primaryId === "local",
+      },
+    ];
+
+    if (snap) {
+      for (const conn of snap.connections) {
+        if (conn.id === "local" || !conn.dialable) continue;
+        const pid = conn.remoteProfile?.trim() || "default";
+        candidates.push({
+          connectionId: conn.id,
+          profileId: pid,
+          isLocal: false,
+          isPrimary: primaryId === conn.id,
+        });
+      }
+    }
+
+    const ordered = [...candidates].sort((a, b) => {
+      if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;
+      if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+      return 0;
+    });
+    const maxConcurrency = Math.max(1, this.maxConcurrentDials);
+    let cursor = 0;
+
+    const worker = async () => {
+      while (cursor < ordered.length && !this.disposed && !this.shuttingDown && !this.suspended) {
+        const index = cursor;
+        cursor += 1;
+        const target = ordered[index];
+        if (!target) break;
+        await this.ensureTransport(target.connectionId, target.profileId);
+      }
+    };
+
+    const workers = Array.from({ length: Math.min(maxConcurrency, ordered.length) }, () =>
+      worker(),
+    );
+    await Promise.allSettled(workers);
+  }
+
+  async suspend(): Promise<void> {
+    if (this.disposed || this.shuttingDown) return;
+    this.suspended = true;
+    for (const timer of this.staggerTimers) {
+      this.clearTimer(timer);
+    }
+    this.staggerTimers.clear();
+
+    // Ensure local default link exists so it transitions cleanly
+    this.ensureLinkState("local", "default", "enabled");
+
+    // Step 1: mark desired="suspended", actual="stopping", clear timers
+    for (const link of this.linksByKey.values()) {
+      link.wasDesiredBeforeSuspend = link.desired === "enabled";
+      this.clearLinkTimers(link);
+      if (link.desired !== "disabled") {
+        link.desired = "suspended";
+        link.actual = "stopping";
+      }
+      link.nextRetryAt = null;
+      link.latencyMs = null;
+    }
+
+    // Step 2: close active WS transports
+    for (const [key, entry] of [...this.transports.entries()]) {
+      this.disposeTransportEntry(key, entry);
+    }
+
+    // Step 3: transition stopping -> idle and sync projections
+    const connectionIds = new Set<string>(["local"]);
+    for (const link of this.linksByKey.values()) {
+      connectionIds.add(link.connectionId);
+      if (link.desired === "suspended") {
+        link.actual = "idle";
+      }
+    }
+
+    this.localHealth = {
+      ...this.localHealth,
+      desired: "suspended",
+      actual: "idle",
+      aggregateState: "suspended",
+      degraded: false,
+      latencyMs: null,
+      nextRetryAt: null,
+    };
+    for (const [cid, h] of this.remoteHealth.entries()) {
+      this.remoteHealth.set(cid, {
+        ...h,
+        desired: "suspended",
+        actual: "idle",
+        aggregateState: "suspended",
+        degraded: false,
+        latencyMs: null,
+        nextRetryAt: null,
+      });
+    }
+    for (const [cid, h] of this.sshHealthById.entries()) {
+      this.sshHealthById.set(cid, {
+        ...h,
+        desired: "suspended",
+        actual: "idle",
+        aggregateState: "suspended",
+        degraded: false,
+        latencyMs: null,
+        nextRetryAt: null,
+      });
+    }
+
+    for (const cid of connectionIds) {
+      this.syncProfileAndConnectionProjections(cid);
+      this.emitProfiles(cid);
+    }
+    this.emitFleet();
+  }
+
+  async resume(): Promise<void> {
+    if (this.disposed || this.shuttingDown) return;
+    this.suspended = false;
+    for (const timer of this.staggerTimers) {
+      this.clearTimer(timer);
+    }
+    this.staggerTimers.clear();
+
+    const linksToRedial: ConnectionLinkState[] = [];
+    for (const link of this.linksByKey.values()) {
+      this.clearLinkTimers(link);
+      link.attempt = 0;
+      link.nextRetryAt = null;
+      if (link.wasDesiredBeforeSuspend || (link.connectionId === "local" && link.profileId === "default")) {
+        link.desired = "enabled";
+        link.wasDesiredBeforeSuspend = true;
+        linksToRedial.push(link);
+      }
+    }
+
+    // Group by connectionId so shared-transport connections dial once and activate enabled profiles
+    const byConnection = new Map<string, ConnectionLinkState[]>();
+    for (const link of linksToRedial) {
+      const list = byConnection.get(link.connectionId) ?? [];
+      list.push(link);
+      byConnection.set(link.connectionId, list);
+    }
+
+    for (const [connectionId, links] of byConnection.entries()) {
+      this.syncProfileAndConnectionProjections(connectionId);
+      const staggerMs = computeResumeStaggerMs(this.random());
+      const defaultLink = links.find((l) => l.profileId === "default") ?? links[0];
+      if (!defaultLink) continue;
+
+      const timer = this.setTimer(() => {
+        this.staggerTimers.delete(timer);
+        if (this.disposed || this.shuttingDown || this.suspended) return;
+        void this.ensureTransport(connectionId, defaultLink.profileId, {
+          forceReconnect: true,
+        });
+      }, staggerMs);
+      this.staggerTimers.add(timer);
+    }
+    this.emitFleet();
+  }
+
+  async shutdown(options?: { timeoutMs?: number }): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
     this.disposed = true;
+    const timeoutMs = Math.min(2000, Math.max(50, options?.timeoutMs ?? 2000));
+
+    // 1. Stop new commands & unsubscribe registry
     this.unsubRegistry?.();
-    for (const [key, entry] of this.transports.entries()) {
+
+    // 2. Cancel all backoff, stability, and stagger timers
+    for (const timer of this.staggerTimers) {
+      this.clearTimer(timer);
+    }
+    this.staggerTimers.clear();
+    for (const link of this.linksByKey.values()) {
+      this.clearLinkTimers(link);
+      link.desired = "disabled";
+      link.wasDesiredBeforeSuspend = false;
+      link.actual = "stopping";
+      link.nextRetryAt = null;
+      link.latencyMs = null;
+    }
+
+    // 3. Close all WebSocket transports
+    for (const [key, entry] of [...this.transports.entries()]) {
       this.disposeTransportEntry(key, entry);
     }
     this.transports.clear();
+
+    // 4. Close SSH tunnels & flush registry within bounded timeout (<= 2s)
+    const boundedCleanup = Promise.allSettled([
+      this.sshTransport?.disposeAll() ?? Promise.resolve(),
+      this.registryStore?.flush(timeoutMs) ?? Promise.resolve(),
+    ]);
+    await Promise.race([
+      boundedCleanup,
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+
+    // 5. Mark links idle/disabled and clear subscribers
+    for (const link of this.linksByKey.values()) {
+      link.actual = "idle";
+    }
     this.subscribers.clear();
-    await this.sshTransport?.disposeAll();
+  }
+
+  async dispose(): Promise<void> {
+    await this.shutdown({ timeoutMs: 2000 });
   }
 }
 

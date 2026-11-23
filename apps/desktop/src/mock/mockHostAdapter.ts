@@ -204,6 +204,7 @@ export function createMockHostBridge(): HermesHost {
   const currentInspection = createInitialMockInspection();
 
   const fleetListeners = new Set<(event: BridgeEvent<FleetSnapshot>) => void>();
+  const healthListeners = new Set<(event: BridgeEvent<ConnectionHealthSummary[]>) => void>();
   const sessionsListeners = new Set<(event: BridgeEvent<{ sessions: SessionSummary[] }>) => void>();
   const chatStateListeners = new Set<(event: BridgeEvent<ChatSessionProjection>) => void>();
   const capabilitiesListeners = new Set<(event: BridgeEvent<CapabilitySnapshot>) => void>();
@@ -245,6 +246,7 @@ export function createMockHostBridge(): HermesHost {
     sessionsCreateCalls: 0,
     sessionsResumeCalls: 0,
     sessionsSelectCalls: 0,
+    connectionsRetryCalls: 0,
   };
   if (fixture) {
     (globalThis as { __HERMES_E2E_COUNTS__?: typeof e2eCounts }).__HERMES_E2E_COUNTS__ = e2eCounts;
@@ -323,6 +325,13 @@ export function createMockHostBridge(): HermesHost {
       });
     }
   }
+  (
+    globalThis as { __HERMES_E2E_DISPATCH_COMMAND__?: (cmd: AppCommand) => void }
+  ).__HERMES_E2E_DISPATCH_COMMAND__ = (cmd: AppCommand) => {
+    for (const listener of commandListeners) {
+      listener(cmd);
+    }
+  };
 
   const trustedMockHosts = new Set<string>(["lab.example.com", "lab.local", "remote.example.com"]);
   const mockConnections: ConnectionHealthSummary[] = [];
@@ -351,6 +360,16 @@ export function createMockHostBridge(): HermesHost {
         seq: fleetSeq,
         revision: 1,
         payload: currentFleet,
+      });
+    }
+    for (const listener of healthListeners) {
+      listener({
+        topic: "connection.health",
+        scope: null,
+        kind: "patch",
+        seq: fleetSeq,
+        revision: 1,
+        payload: currentFleet.connections.map((c) => ({ ...c })),
       });
     }
   }
@@ -482,6 +501,16 @@ export function createMockHostBridge(): HermesHost {
         seq: 0,
         revision: fleetRev,
         payload: snap,
+      });
+    }
+    for (const listener of healthListeners) {
+      listener({
+        topic: "connection.health",
+        scope: null,
+        kind: "snapshot",
+        seq: 0,
+        revision: fleetRev,
+        payload: snap.connections,
       });
     }
     for (const sub of profileListeners) {
@@ -1341,6 +1370,10 @@ export function createMockHostBridge(): HermesHost {
           typeof payload.connectionId === "string" && payload.connectionId
             ? payload.connectionId
             : scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+        const hit = cid ? currentFleet.connections.find((c) => c.connectionId === cid) : null;
+        if (!cid || !hit) {
+          return { ok: false, fleet: currentFleet, transcript: null };
+        }
         const profs = currentFleet.profiles.filter((p) => p.connectionId === cid);
         const pid =
           typeof payload.profileId === "string" && payload.profileId
@@ -1352,7 +1385,7 @@ export function createMockHostBridge(): HermesHost {
         const requestedSid =
           typeof payload.sessionId === "string" && payload.sessionId
             ? payload.sessionId
-            : null;
+            : scope?.sessionId ?? null;
         const rememberedSid = currentChatState.lastSessionByScope[`${cid}::${pid}`] ?? null;
         const validRemembered =
           rememberedSid && candidates.some((s) => s.sessionId === rememberedSid)
@@ -1443,7 +1476,48 @@ export function createMockHostBridge(): HermesHost {
       };
     },
     "connections.retry": async (payload) => {
+      e2eCounts.connectionsRetryCalls += 1;
+      const cid = typeof payload.connectionId === "string" ? payload.connectionId : "local";
       if (fixture) {
+        const hit = currentFleet.connections.find((c) => c.connectionId === cid);
+        if (hit) {
+          currentFleet = {
+            ...currentFleet,
+            connections: currentFleet.connections.map((c) =>
+              c.connectionId === cid
+                ? {
+                    ...c,
+                    actual: "ready",
+                    aggregateState: "ready",
+                    degraded: false,
+                    latencyMs: c.latencyMs ?? 12,
+                    nextRetryAt: null,
+                    profileExceptionCount: 0,
+                    message: undefined,
+                    errorCode: undefined,
+                  }
+                : c,
+            ),
+            profiles: currentFleet.profiles.map((p) =>
+              p.connectionId === cid
+                ? {
+                    ...p,
+                    actual: "ready",
+                    degraded: false,
+                    isException: false,
+                    unavailableCode: undefined,
+                    errorCode: undefined,
+                    message: undefined,
+                  }
+                : p,
+            ),
+          };
+          emitFleetSnapshot();
+          return {
+            ok: true,
+            fleet: currentFleet,
+          };
+        }
         return {
           ok: false,
           fleet: currentFleet,
@@ -1451,10 +1525,18 @@ export function createMockHostBridge(): HermesHost {
           failure: currentInspection.failure,
         };
       }
-      const cid = typeof payload.connectionId === "string" ? payload.connectionId : "local";
       if (cid !== "local") {
         const hit = mockConnections.find((c) => c.connectionId === cid);
         if (hit) {
+          hit.actual = "ready";
+          hit.aggregateState = "ready";
+          hit.degraded = false;
+          hit.latencyMs = hit.latencyMs ?? 14;
+          hit.nextRetryAt = null;
+          hit.profileExceptionCount = 0;
+          hit.message = undefined;
+          hit.errorCode = undefined;
+          emitMockFleet();
           return {
             ok: true,
             fleet: getMockFleet(),
@@ -2059,6 +2141,22 @@ export function createMockHostBridge(): HermesHost {
         });
         return () => {
           fleetListeners.delete(typed);
+        };
+      } else if (topic === "connection.health") {
+        const typed = listener as (event: BridgeEvent<ConnectionHealthSummary[]>) => void;
+        healthListeners.add(typed);
+        queueMicrotask(() => {
+          listener({
+            topic: "connection.health",
+            scope: null,
+            kind: "snapshot",
+            seq: 0,
+            revision: fixture ? 1 : fleetRev,
+            payload: (fixture ? currentFleet.connections : mockConnections).map((c) => ({ ...c })),
+          });
+        });
+        return () => {
+          healthListeners.delete(typed);
         };
       } else if (topic === "profiles") {
         const entry = {

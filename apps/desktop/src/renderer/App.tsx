@@ -756,8 +756,47 @@ export default function App() {
           break;
         case "open_about":
         case "close_window":
-        case "focus_scope":
           break;
+        case "focus_scope": {
+          const target = command.scope;
+          void host
+            .request<{
+              ok?: boolean;
+              fleet?: FleetSnapshot;
+              transcript?: SessionTranscriptSnapshot | null;
+            }>(
+              "scopes.switch",
+              {
+                connectionId: target.connectionId,
+                ...(target.profileId ? { profileId: target.profileId } : {}),
+                ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+              },
+              target,
+            )
+            .then((res) => {
+              if (!res.ok) return;
+              if (res.value.fleet) {
+                dispatch({
+                  type: "APPLY_FLEET_SNAPSHOT",
+                  connections: res.value.fleet.connections,
+                  profiles: res.value.fleet.profiles,
+                  sessions: res.value.fleet.sessions,
+                  activeScope: res.value.fleet.activeScope,
+                  activeSessionId: res.value.fleet.activeSessionId,
+                });
+              }
+              if (res.value.transcript) {
+                const applied = transcriptSyncRef.current.applySnapshot(
+                  res.value.transcript,
+                  res.value.transcript.snapshotSeq ?? 0,
+                  { replace: true, resynced: res.value.transcript.resynced },
+                );
+                dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
+              }
+              dispatch({ type: "ANNOUNCE", message: getCopy("scope.switchNotice") });
+            });
+          break;
+        }
       }
     },
     [handleCreateSession, handleToggleWorkspace],
@@ -1144,6 +1183,34 @@ export default function App() {
     dispatch({ type: "ANNOUNCE", message });
   }, []);
 
+  const handleRetryActiveConnection = useCallback(async () => {
+    const cid = activeConnection?.connectionId ?? effectiveScope?.connectionId ?? "local";
+    const retryRes = await host.request<{
+      ok?: boolean;
+      fleet?: FleetSnapshot;
+      inspection?: LocalInspectResult;
+    }>("connections.retry", {
+      connectionId: cid,
+      ...(effectiveScope?.profileId ? { profileId: effectiveScope.profileId } : {}),
+    });
+    if (retryRes.ok) {
+      if (retryRes.value.inspection) {
+        dispatch({ type: "APPLY_LOCAL_INSPECTION", inspection: retryRes.value.inspection });
+      }
+      if (retryRes.value.fleet) {
+        dispatch({
+          type: "APPLY_FLEET_SNAPSHOT",
+          connections: retryRes.value.fleet.connections,
+          profiles: retryRes.value.fleet.profiles,
+          sessions: retryRes.value.fleet.sessions,
+          activeScope: retryRes.value.fleet.activeScope,
+          activeSessionId: retryRes.value.fleet.activeSessionId,
+        });
+      }
+      dispatch({ type: "ANNOUNCE", message: getCopy("gateways.retryConnectionAction") });
+    }
+  }, [activeConnection?.connectionId, effectiveScope?.connectionId, effectiveScope?.profileId]);
+
   const isMockMode = state.appInfo?.mode === "mock";
 
   return (
@@ -1302,18 +1369,74 @@ export default function App() {
                 />
                 <span>
                   {activeConnection
-                    ? activeConnection.actual === "ready"
-                      ? getCopy("route.statusReady")
-                      : activeConnection.actual === "connecting"
-                        ? getCopy("route.statusConnecting")
-                        : activeConnection.actual === "reconnecting"
-                          ? getCopy("route.statusReconnecting")
-                          : activeConnection.actual === "auth_required"
-                            ? getCopy("route.statusAuthRequired")
-                            : getCopy("route.statusBlocked")
+                    ? activeConnection.aggregateState === "suspended" ||
+                      activeConnection.desired === "suspended"
+                      ? getCopy("status.suspended")
+                      : activeConnection.actual === "ready"
+                        ? getCopy("route.statusReady")
+                        : activeConnection.actual === "connecting"
+                          ? getCopy("route.statusConnecting")
+                          : activeConnection.actual === "reconnecting"
+                            ? getCopy("route.statusReconnecting")
+                            : activeConnection.actual === "auth_required"
+                              ? getCopy("route.statusAuthRequired")
+                              : activeConnection.actual === "idle"
+                                ? getCopy("status.idle")
+                                : activeConnection.actual === "stopping"
+                                  ? getCopy("status.stopping")
+                                  : getCopy("route.statusBlocked")
                     : getCopy("route.statusUnconnected")}
                 </span>
               </button>
+
+              {activeConnection && (
+                <>
+                  {(activeConnection.degraded ||
+                    activeConnection.aggregateState === "degraded") && (
+                    <span className="status-pill is-warn" data-testid="route-strip-degraded">
+                      {getCopy("status.degraded")}
+                    </span>
+                  )}
+                  <span className="route-health-meta" data-testid="route-strip-latency">
+                    {typeof activeConnection.latencyMs === "number"
+                      ? `${activeConnection.latencyMs}ms`
+                      : getCopy("status.latencyUnknown")}
+                  </span>
+                  {typeof activeConnection.nextRetryAt === "number" && (
+                    <span className="route-health-meta" data-testid="route-strip-next-retry">
+                      {getCopy("status.nextRetryIn")}{" "}
+                      {Math.max(1, Math.ceil((activeConnection.nextRetryAt - Date.now()) / 1000))}s
+                    </span>
+                  )}
+                  {(activeConnection.profileExceptionCount ?? 0) > 0 && (
+                    <span
+                      className="status-pill is-warn"
+                      data-testid="route-strip-profile-exceptions"
+                    >
+                      {activeConnection.profileExceptionCount} {getCopy("status.profileExceptions")}
+                    </span>
+                  )}
+                  {activeConnection.message &&
+                    (activeConnection.actual !== "ready" || activeConnection.degraded) && (
+                      <span className="route-health-meta" data-testid="route-strip-error">
+                        {activeConnection.message}
+                      </span>
+                    )}
+                  {(activeConnection.actual === "reconnecting" ||
+                    activeConnection.actual === "blocked" ||
+                    activeConnection.degraded ||
+                    typeof activeConnection.nextRetryAt === "number") && (
+                    <button
+                      type="button"
+                      className="route-chip"
+                      data-testid="route-strip-retry"
+                      onClick={() => void handleRetryActiveConnection()}
+                    >
+                      {getCopy("gateways.retryConnectionAction")}
+                    </button>
+                  )}
+                </>
+              )}
 
               <div className="route-actions">
                 <button
@@ -1787,6 +1910,16 @@ export default function App() {
                           {profile.isDefault && (
                             <span className="gateway-badge">
                               {getCopy("scope.profileDefaultBadge")}
+                            </span>
+                          )}
+                          {profile.pinned && <span className="gateway-badge">Pinned</span>}
+                          {(profile.isException ||
+                            profile.actual === "blocked" ||
+                            profile.degraded) && (
+                            <span className="gateway-badge is-warning">
+                              {profile.message ??
+                                profile.unavailableCode ??
+                                getCopy("status.degraded")}
                             </span>
                           )}
                           <span className="gateway-badge">{getCopy(healthCopyKey)}</span>

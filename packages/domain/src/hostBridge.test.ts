@@ -332,4 +332,149 @@ describe("HostBridge v1 contracts & invariants", () => {
       expect(typeof mapped.retryable).toBe("boolean");
     }
   });
+
+  it("aggregates fleet Gateway state by priority (ready/degraded/auth_required>blocked>reconnecting>connecting>idle/suspended), exposes Profile exceptions, and computes full-jitter backoff + safe background notifications", async () => {
+    const domain = (await import("@hermes/domain")) as Record<string, unknown>;
+    const aggregateConnectionHealth = domain.aggregateConnectionHealth as (input: unknown) => Record<string, unknown>;
+    const computeFullJitterBackoffMs = domain.computeFullJitterBackoffMs as (
+      attempt: number,
+      randomValue: number,
+    ) => number;
+    const computeResumeStaggerMs = domain.computeResumeStaggerMs as (randomValue: number) => number;
+    const buildSafeBackgroundNotification = domain.buildSafeBackgroundNotification as (input: unknown) => Record<
+      string,
+      unknown
+    > | null;
+
+    expect(typeof aggregateConnectionHealth).toBe("function");
+    expect(typeof computeFullJitterBackoffMs).toBe("function");
+    expect(typeof computeResumeStaggerMs).toBe("function");
+    expect(typeof buildSafeBackgroundNotification).toBe("function");
+
+    // 1. Backoff: 1s base, exponential double, 30s cap, full jitter
+    expect(computeFullJitterBackoffMs(0, 1)).toBe(1000);
+    expect(computeFullJitterBackoffMs(0, 0.5)).toBe(500);
+    expect(computeFullJitterBackoffMs(1, 1)).toBe(2000);
+    expect(computeFullJitterBackoffMs(4, 1)).toBe(16000);
+    expect(computeFullJitterBackoffMs(5, 1)).toBe(30000);
+    expect(computeFullJitterBackoffMs(9, 0.5)).toBe(15000);
+    expect(computeResumeStaggerMs(0)).toBe(0);
+    expect(computeResumeStaggerMs(1)).toBe(250);
+    expect(computeResumeStaggerMs(0.5)).toBe(125);
+
+    // 2. Gateway health aggregation rules
+    // - All active links ready and not degraded -> ready, degraded=false
+    const allReady = aggregateConnectionHealth({
+      base: {
+        connectionId: "local",
+        label: "This device",
+        kind: "local",
+        originDisplay: "127.0.0.1",
+      },
+      links: [
+        { profileId: "default", desired: "enabled", actual: "ready", degraded: false, latencyMs: 12, nextRetryAt: null },
+        { profileId: "work", desired: "enabled", actual: "ready", degraded: false, latencyMs: 18, nextRetryAt: null },
+      ],
+    });
+    expect(allReady.actual).toBe("ready");
+    expect(allReady.degraded).toBe(false);
+    expect(allReady.aggregateState).toBe("ready");
+    expect(allReady.profileExceptionCount).toBe(0);
+
+    // - At least one ready, another link blocked/reconnecting/degraded -> ready + degraded=true, profile exception exposed
+    const partialDegraded = aggregateConnectionHealth({
+      base: {
+        connectionId: "local",
+        label: "This device",
+        kind: "local",
+        originDisplay: "127.0.0.1",
+      },
+      links: [
+        { profileId: "default", desired: "enabled", actual: "ready", degraded: false, latencyMs: 10, nextRetryAt: null },
+        {
+          profileId: "ops",
+          desired: "enabled",
+          actual: "blocked",
+          degraded: true,
+          latencyMs: null,
+          nextRetryAt: null,
+          errorCode: "not_found",
+          unavailableCode: "profile_unavailable",
+        },
+      ],
+    });
+    expect(partialDegraded.actual).toBe("ready");
+    expect(partialDegraded.degraded).toBe(true);
+    expect(partialDegraded.aggregateState).toBe("degraded");
+    expect(partialDegraded.profileExceptionCount).toBe(1);
+
+    // - No ready links: auth_required > blocked > reconnecting > connecting > idle
+    const severityOrder = aggregateConnectionHealth({
+      base: {
+        connectionId: "vps",
+        label: "Prod VPS",
+        kind: "remote",
+        originDisplay: "https://vps.example.com",
+      },
+      links: [
+        { profileId: "default", desired: "enabled", actual: "reconnecting", degraded: true, latencyMs: null, nextRetryAt: 5000 },
+        { profileId: "ops", desired: "enabled", actual: "blocked", degraded: true, latencyMs: null, nextRetryAt: null, errorCode: "protocol_unsupported" },
+        { profileId: "sec", desired: "enabled", actual: "auth_required", degraded: true, latencyMs: null, nextRetryAt: null, errorCode: "auth_required" },
+      ],
+    });
+    expect(severityOrder.actual).toBe("auth_required");
+    expect(severityOrder.aggregateState).toBe("auth_required");
+
+    // - Suspended links -> actual: idle, desired: suspended, aggregateState: suspended
+    const suspendedAgg = aggregateConnectionHealth({
+      base: {
+        connectionId: "local",
+        label: "This device",
+        kind: "local",
+        originDisplay: "127.0.0.1",
+      },
+      links: [
+        { profileId: "default", desired: "suspended", actual: "idle", degraded: false, latencyMs: null, nextRetryAt: null },
+      ],
+    });
+    expect(suspendedAgg.actual).toBe("idle");
+    expect(suspendedAgg.desired).toBe("suspended");
+    expect(suspendedAgg.aggregateState).toBe("suspended");
+
+    // 3. Minimal background notifications: ONLY when app is not in foreground, zero sensitive payload
+    expect(
+      buildSafeBackgroundNotification({
+        kind: "approval_pending",
+        isAppForeground: true,
+        scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+        rawSecretOrCommand: "sudo rm -rf /Users/alice/secret token=abc",
+      }),
+    ).toBeNull();
+
+    const bgApproval = buildSafeBackgroundNotification({
+      kind: "approval_pending",
+      isAppForeground: false,
+      scope: { connectionId: "local", profileId: "work", sessionId: "s-1" },
+      rawSecretOrCommand: "sudo rm -rf /Users/alice/secret token=abc",
+    }) as { title: string; body: string; focusCommand: { type: string; scope: unknown } };
+    expect(bgApproval).not.toBeNull();
+    expect(bgApproval.body).not.toMatch(/sudo|rm|\/Users|secret|token/i);
+    expect(bgApproval.focusCommand).toEqual({
+      type: "focus_scope",
+      scope: { connectionId: "local", profileId: "work", sessionId: "s-1" },
+    });
+
+    const bgTurn = buildSafeBackgroundNotification({
+      kind: "turn_completed",
+      isAppForeground: false,
+      scope: { connectionId: "vps", profileId: "ops", sessionId: "s-2" },
+      rawSecretOrCommand: "assistant reply with secret token=xyz",
+    }) as { title: string; body: string; focusCommand: { type: string; scope: unknown } };
+    expect(bgTurn).not.toBeNull();
+    expect(bgTurn.body).not.toMatch(/assistant|secret|token|xyz/i);
+    expect(bgTurn.focusCommand).toEqual({
+      type: "focus_scope",
+      scope: { connectionId: "vps", profileId: "ops", sessionId: "s-2" },
+    });
+  });
 });

@@ -1719,4 +1719,197 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await scopeDialog.getByRole("button", { name: "复制 Profile CLI 命令" }).click();
     await expect(page.locator('[aria-live="polite"]')).toContainText("已复制只读 CLI 命令");
   });
+
+  test("E2E-FLEET-01: route strip and Gateway rows render health/degraded/latencyUnknown/nextRetryAt/profileException/safeError, Retry recovers, and focus_scope switches Scope", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      const retryTarget = Date.now() + 8000;
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local://control-socket",
+              desired: "enabled",
+              actual: "reconnecting",
+              aggregateState: "reconnecting",
+              degraded: true,
+              latencyMs: null,
+              nextRetryAt: retryTarget,
+              profileExceptionCount: 1,
+              message: "Gateway 连接已中断，正在等待退避重连。",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              desired: "enabled",
+              actual: "reconnecting",
+              degraded: false,
+              pinned: true,
+              isException: false,
+            },
+            {
+              connectionId: "local",
+              profileId: "work",
+              displayName: "Work",
+              handle: "work",
+              isDefault: false,
+              desired: "enabled",
+              actual: "blocked",
+              degraded: true,
+              pinned: false,
+              isException: true,
+              unavailableCode: "profile_unavailable",
+              message: "该 Profile 未在当前 Gateway 启用",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-default-1",
+              title: "Default Session",
+              preview: "default preview",
+              updatedAt: "2026-11-23T06:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+            {
+              connectionId: "local",
+              profileId: "work",
+              sessionId: "sess-work-1",
+              title: "Work Session",
+              preview: "work preview",
+              updatedAt: "2026-11-23T06:01:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-default-1" },
+          activeSessionId: "sess-default-1",
+        },
+        transcripts: {
+          "local::default::sess-default-1": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-default-1",
+            messages: [
+              {
+                messageId: "m-def-1",
+                sessionId: "sess-default-1",
+                role: "assistant",
+                text: "Default scope transcript",
+                createdAt: "2026-11-23T06:00:00.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+          "local::work::sess-work-1": {
+            connectionId: "local",
+            profileId: "work",
+            sessionId: "sess-work-1",
+            messages: [
+              {
+                messageId: "m-work-1",
+                sessionId: "sess-work-1",
+                role: "assistant",
+                text: "Work scope transcript after notification focus",
+                createdAt: "2026-11-23T06:01:00.000Z",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: false,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const routeStrip = page.locator(".route-strip");
+    await expect(routeStrip).toContainText("正在重连");
+    await expect(routeStrip).toContainText("降级");
+    await expect(routeStrip).toContainText("延迟未知");
+    await expect(routeStrip).toContainText("下次重试");
+    await expect(routeStrip).toContainText("1 Profile 异常");
+    await expect(routeStrip).toContainText("Gateway 连接已中断，正在等待退避重连。");
+
+    // Check Settings -> Gateways row shows health, latencyUnknown, nextRetryAt, profile exception, safe error, and Retry
+    await page.getByRole("button", { name: "打开 Settings" }).click();
+    const settings = page.getByRole("dialog", { name: "Settings" });
+    const localRow = settings.locator('[data-connection-id="local"]');
+    await expect(localRow).toContainText("正在重连");
+    await expect(localRow).toContainText("降级");
+    await expect(localRow).toContainText("延迟未知");
+    await expect(localRow).toContainText("下次重试");
+    await expect(localRow).toContainText("1 Profile 异常");
+    await expect(localRow).toContainText("Gateway 连接已中断，正在等待退避重连。");
+
+    await page.keyboard.press("Escape");
+
+    // Open Scope Popover to verify Profile exceptions & Pinned badges are visible
+    await routeStrip.getByRole("button", { name: /正在重连/ }).click();
+    const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+    await expect(scopeDialog).toContainText("Pinned");
+    await expect(scopeDialog).toContainText("该 Profile 未在当前 Gateway 启用");
+    await page.keyboard.press("Escape");
+
+    // Click Retry in route strip -> transitions to Ready + shows latency sample
+    await routeStrip.getByTestId("route-strip-retry").click();
+    await expect(routeStrip).toContainText("已连接");
+    await expect(routeStrip).toContainText("12ms");
+    await expect(routeStrip).not.toContainText("下次重试");
+
+    // Simulate clicking background OS notification -> dispatches focus_scope command -> switches Scope to local/work/sess-work-1
+    await page.evaluate(() => {
+      const dispatch = (
+        window as unknown as {
+          __HERMES_E2E_DISPATCH_COMMAND__?: (cmd: unknown) => void;
+        }
+      ).__HERMES_E2E_DISPATCH_COMMAND__;
+      dispatch?.({
+        type: "focus_scope",
+        scope: { connectionId: "local", profileId: "work", sessionId: "sess-work-1" },
+      });
+    });
+
+    await expect(routeStrip).toContainText("Work");
+    await expect(page.locator(".transcript-list")).toContainText(
+      "Work scope transcript after notification focus",
+    );
+  });
 });

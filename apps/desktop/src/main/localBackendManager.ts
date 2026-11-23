@@ -49,6 +49,7 @@ export type ControlSocketProbeResult =
   | { status: "not_found" }
   | { status: "permission_denied" }
   | { status: "service_unhealthy" }
+  | { status: "update_paused" }
   | { status: "invalid_state" }
   | {
       status: "ok";
@@ -63,6 +64,7 @@ export type ControlSocketProtocol1Response =
   | { status: "not_found" }
   | { status: "permission_denied" }
   | { status: "service_unhealthy" }
+  | { status: "update_paused" }
   | { status: "invalid_state"; reason?: string }
   | { status: "unsupported" | "refused"; reason?: string }
   | {
@@ -598,6 +600,22 @@ export class LocalBackendManager {
             notes,
           );
         }
+        if (sockRes.status === "update_paused") {
+          stages.push({ phase: "resolve_control_socket", outcome: "failed", code: "update_paused" });
+          const failure = mapLocalFailure("update_paused", "resolve_control_socket");
+          return this.recordResult(
+            {
+              connectionId: "local",
+              label: "This device",
+              actual: failure.actual,
+              cli: cliSummary,
+              failure,
+              checkedAt,
+            },
+            stages,
+            notes,
+          );
+        }
         if (sockRes.status === "invalid_state") {
           stages.push({ phase: "resolve_control_socket", outcome: "failed", code: "invalid_control_state" });
           return this.recordResult(
@@ -867,6 +885,12 @@ export class LocalBackendManager {
           failure: mapLocalFailure("service_unhealthy", "resolve_control_socket", { profileId }),
         };
       }
+      if (resolved.status === "update_paused") {
+        return {
+          kind: "failure",
+          failure: mapLocalFailure("update_paused", "resolve_control_socket", { profileId }),
+        };
+      }
       if (resolved.status === "not_found" || resolved.status === "unsupported" || resolved.status === "refused") {
         return { kind: "fallback" };
       }
@@ -931,7 +955,11 @@ export class LocalBackendManager {
   }): Promise<LocalPrepareDialResult> {
     const profileId = options?.profileId ?? "default";
     const inspection = await this.inspect();
-    if (inspection.actual === "blocked" || inspection.failure || !this.lastCliPath) {
+    if (
+      (inspection.actual === "blocked" && !inspection.failure?.retryable) ||
+      inspection.failure ||
+      !this.lastCliPath
+    ) {
       const failure = inspection.failure ?? mapLocalFailure("hermes_not_found", "locate_cli");
       return { ok: false, failure, inspection };
     }
@@ -1390,7 +1418,12 @@ export function createNodeLocalBackendPorts(options: NodeLocalPortsOptions): Loc
               finish({ status: "invalid_state" });
               return;
             }
-            if (rawStatus === "unsupported" || rawStatus === "refused") {
+            if (
+              rawStatus === "unsupported" ||
+              rawStatus === "refused" ||
+              rawStatus === "service_unhealthy" ||
+              rawStatus === "update_paused"
+            ) {
               finish({ status: rawStatus });
               return;
             }
