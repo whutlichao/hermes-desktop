@@ -5,23 +5,28 @@ import {
   Plus,
   Settings2,
 } from "lucide-react";
-import type {
-  AppCommand,
-  BridgeScope,
-  CapabilityDomainId,
-  CapabilityEntry,
-  CapabilitySnapshot,
-  ChatSessionProjection,
-  FleetSnapshot,
-  LocalInspectResult,
-  LocalSafeActionId,
-  LocalSelectCliResult,
-  MissingSessionExport,
-  RegistrySnapshotView,
-  SanitizedDiagnosticsPayload,
-  SessionSummary,
-  SessionTranscriptSnapshot,
-  WorkspaceTab,
+import {
+  SETTINGS_SECTION_IDS,
+  type AppCommand,
+  type BridgeScope,
+  type CapabilityDomainId,
+  type CapabilityEntry,
+  type CapabilitySnapshot,
+  type ChatSessionProjection,
+  type FleetSnapshot,
+  type GatewayConfigSnapshot,
+  type GatewayConfigUpdateResult,
+  type GatewayConfigValue,
+  type LocalInspectResult,
+  type LocalSafeActionId,
+  type LocalSelectCliResult,
+  type MissingSessionExport,
+  type ProfileSummary,
+  type RegistrySnapshotView,
+  type SanitizedDiagnosticsPayload,
+  type SessionSummary,
+  type SessionTranscriptSnapshot,
+  type WorkspaceTab,
 } from "@hermes/contracts";
 import {
   HERMES_INSTALL_DOCS_URL,
@@ -35,7 +40,10 @@ import {
   formatAppInfoDisplay,
   getCopy,
   getTopmostSurface,
+  projectSettingsSectionFields,
+  resolveProfileManagementAvailability,
   shellReducer,
+  type CopyKey,
 } from "@hermes/domain";
 import { host } from "@hermes/host-adapter";
 import { CapabilitiesDrawer } from "./components/CapabilitiesDrawer";
@@ -65,6 +73,7 @@ export default function App() {
   const [exportedMissing, setExportedMissing] = useState<MissingSessionExport | null>(null);
   const [fleetResyncNonce, setFleetResyncNonce] = useState(0);
   const [registrySnapshot, setRegistrySnapshot] = useState<RegistrySnapshotView | null>(null);
+  const [configSnapshot, setConfigSnapshot] = useState<GatewayConfigSnapshot | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const trackerRef = useRef(createSequenceTracker());
@@ -271,12 +280,112 @@ export default function App() {
         connectionId: effectiveScope.connectionId,
         profileId,
       };
-      await host.request("sessions.select", { profileId }, targetScope);
+      const res = await host.request<{
+        ok?: boolean;
+        fleet?: FleetSnapshot;
+        transcript?: SessionTranscriptSnapshot | null;
+      }>("scopes.switch", { connectionId: effectiveScope.connectionId, profileId }, targetScope);
+      if (res.ok && res.value.fleet) {
+        const fleet = res.value.fleet;
+        dispatch({
+          type: "APPLY_FLEET_SNAPSHOT",
+          connections: fleet.connections,
+          profiles: fleet.profiles,
+          sessions: fleet.sessions,
+          activeScope: fleet.activeScope,
+          activeSessionId: fleet.activeSessionId,
+        });
+        if (res.value.transcript) {
+          const applied = transcriptSyncRef.current.applySnapshot(
+            res.value.transcript,
+            res.value.transcript.snapshotSeq ?? 0,
+            { replace: true, resynced: res.value.transcript.resynced },
+          );
+          dispatch({
+            type: "REPLACE_TRANSCRIPT_SNAPSHOT",
+            snapshot: applied.snapshot,
+          });
+        }
+      }
       dispatch({ type: "CLOSE_SURFACE", surface: "scopePopover" });
       dispatch({ type: "ANNOUNCE", message: getCopy("scope.switchNotice") });
     },
     [effectiveScope],
   );
+
+  const handleRefreshProfiles = useCallback(async () => {
+    if (!effectiveScope) return;
+    const res = await host.request<{ profiles?: ProfileSummary[] }>(
+      "profiles.list",
+      { connectionId: effectiveScope.connectionId },
+      effectiveScope,
+    );
+    if (res.ok && Array.isArray(res.value.profiles)) {
+      const otherProfiles = state.profiles.filter(
+        (p) => p.connectionId !== effectiveScope.connectionId,
+      );
+      dispatch({
+        type: "APPLY_FLEET_SNAPSHOT",
+        connections: state.connections,
+        profiles: [...otherProfiles, ...res.value.profiles],
+        sessions: state.sessions,
+        activeScope: state.activeScope,
+        activeSessionId: state.activeSessionId,
+      });
+      dispatch({ type: "ANNOUNCE", message: getCopy("scope.profileRefreshedNotice") });
+    }
+  }, [effectiveScope, state.activeScope, state.activeSessionId, state.connections, state.profiles, state.sessions]);
+
+  const handleUpdateConfigKey = useCallback(
+    async (key: string, value: GatewayConfigValue) => {
+      const res = await host.request<GatewayConfigUpdateResult>(
+        "config.update",
+        { key, value },
+        effectiveScope,
+      );
+      if (res.ok && res.value.snapshot) {
+        setConfigSnapshot(res.value.snapshot);
+        dispatch({ type: "ANNOUNCE", message: getCopy("settings.configSavedNotice") });
+      }
+    },
+    [effectiveScope],
+  );
+
+  const isScopePopoverOpen = state.surfaceStack.includes("scopePopover");
+  const isSettingsOpen = state.surfaceStack.includes("settings");
+  const profileDomainProbed = Boolean(
+    state.capabilities.domains.find((d) => d.domain === "profile")?.probed,
+  );
+
+  useEffect(() => {
+    if (!isScopePopoverOpen || !hasReadyConnection || profileDomainProbed) return;
+    let active = true;
+    void host
+      .request<CapabilitySnapshot>("capabilities.describe", { domain: "profile" }, effectiveScope)
+      .then((res) => {
+        if (active && res.ok) {
+          dispatch({ type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: res.value });
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [effectiveScope, hasReadyConnection, isScopePopoverOpen, profileDomainProbed]);
+
+  useEffect(() => {
+    if (!isSettingsOpen) return;
+    let active = true;
+    void host
+      .request<GatewayConfigSnapshot>("config.get", {}, effectiveScope)
+      .then((res) => {
+        if (active && res.ok) {
+          setConfigSnapshot(res.value);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [effectiveScope, isSettingsOpen]);
 
   const handleSendPrompt = useCallback(async () => {
     const text = composerDraft.trim();
@@ -795,6 +904,7 @@ export default function App() {
               </div>
 
               <button
+                id="rail-new-session"
                 type="button"
                 className="sidebar-new-btn"
                 disabled={hasReadyConnection ? !canCreateSession : false}
@@ -813,11 +923,16 @@ export default function App() {
                 activeSessionId={state.activeSessionId}
                 activeScope={effectiveScope}
                 supportedActions={state.transcript?.supportedActions ?? null}
+                methodTiers={state.capabilities.methodTiers}
                 onSelectSession={(s) => void handleSelectSession(s)}
+                onCopyCliCommand={() =>
+                  dispatch({ type: "ANNOUNCE", message: getCopy("session.cli.copiedNotice") })
+                }
               />
 
               <div className="sidebar-footer">
                 <button
+                  id="rail-settings-gear"
                   type="button"
                   className="button button-secondary"
                   style={{ width: "100%", justifyContent: "space-between" }}
@@ -1083,14 +1198,110 @@ export default function App() {
         closeLabel={getCopy("settings.close")}
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "settings" })}
       >
-        <GatewaysSettings
-          snapshot={registrySnapshot}
-          fleetConnections={state.connections}
-          onSnapshotChange={setRegistrySnapshot}
-          onAnnounce={handleAnnounce}
-        />
+        <nav
+          aria-label={getCopy("settings.navLabel")}
+          className="settings-section-nav"
+          style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}
+        >
+          {SETTINGS_SECTION_IDS.map((secId) => (
+            <span
+              key={secId}
+              className="gateway-badge"
+              data-settings-nav={secId}
+            >
+              {getCopy(`settings.section.${secId}` as CopyKey)}
+            </span>
+          ))}
+        </nav>
 
-        <section className="settings-section" aria-label={getCopy("settings.aboutTitle")}>
+        <section
+          className="settings-section"
+          data-settings-section="gateways"
+          aria-label={getCopy("settings.section.gateways")}
+        >
+          <GatewaysSettings
+            snapshot={registrySnapshot}
+            fleetConnections={state.connections}
+            onSnapshotChange={setRegistrySnapshot}
+            onAnnounce={handleAnnounce}
+          />
+        </section>
+
+        {(["model", "workspace", "safety", "memory", "chat"] as const).map((secId) => {
+          const sectionTitle = getCopy(`settings.section.${secId}` as CopyKey);
+          const fields = projectSettingsSectionFields(secId, configSnapshot);
+          return (
+            <section
+              key={secId}
+              className="settings-section"
+              data-settings-section={secId}
+              aria-label={sectionTitle}
+            >
+              <h3 className="settings-section-title">{sectionTitle}</h3>
+              {fields.length === 0 ? (
+                <p className="settings-section-body">
+                  {getCopy("settings.configUnsupportedNotice")}
+                </p>
+              ) : (
+                <div className="gateway-form-grid" style={{ display: "grid", gap: 8 }}>
+                  {fields.map((field) => {
+                    const inputId = `settings-field-${field.key.replace(/\./g, "-")}`;
+                    const labelText = getCopy(field.labelKey);
+                    return (
+                      <div key={field.key} className="form-field">
+                        <label htmlFor={inputId} className="form-label">
+                          {labelText}
+                        </label>
+                        {field.kind === "select" ? (
+                          <select
+                            id={inputId}
+                            className="form-select"
+                            value={String(field.value)}
+                            disabled={field.readOnly}
+                            onChange={(event) =>
+                              void handleUpdateConfigKey(field.key, event.target.value)
+                            }
+                          >
+                            {(field.options ?? []).map((opt) => (
+                              <option key={opt} value={opt}>
+                                {opt}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            id={inputId}
+                            type="checkbox"
+                            checked={Boolean(field.value)}
+                            disabled={field.readOnly}
+                            onChange={(event) =>
+                              void handleUpdateConfigKey(field.key, event.target.checked)
+                            }
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          );
+        })}
+
+        <section
+          className="settings-section"
+          data-settings-section="updates"
+          aria-label={getCopy("settings.updatesTitle")}
+        >
+          <h3 className="settings-section-title">{getCopy("settings.updatesTitle")}</h3>
+          <p className="settings-section-body">{getCopy("settings.updatesNotice")}</p>
+        </section>
+
+        <section
+          className="settings-section"
+          data-settings-section="about"
+          aria-label={getCopy("settings.aboutTitle")}
+        >
           <h3 className="settings-section-title">{getCopy("settings.aboutTitle")}</h3>
           {state.appInfo && (() => {
             const display = formatAppInfoDisplay(state.appInfo);
@@ -1104,9 +1315,31 @@ export default function App() {
           })()}
         </section>
 
-        <section className="settings-section" aria-label={getCopy("settings.updatesTitle")}>
-          <h3 className="settings-section-title">{getCopy("settings.updatesTitle")}</h3>
-          <p className="settings-section-body">{getCopy("settings.updatesNotice")}</p>
+        <section
+          className="settings-section"
+          data-settings-section="diagnostics"
+          aria-label={getCopy("settings.section.diagnostics")}
+        >
+          <h3 className="settings-section-title">{getCopy("settings.section.diagnostics")}</h3>
+          {state.appInfo && (() => {
+            const display = formatAppInfoDisplay(state.appInfo);
+            return (
+              <div className="settings-about-card">
+                <p className="settings-about-headline">{display.headline}</p>
+                <p className="settings-about-meta">{display.buildLine}</p>
+                <p className="settings-about-meta">{display.runtimeLine}</p>
+              </div>
+            );
+          })()}
+          <div style={{ marginTop: 8 }}>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={() => void handleLocalAction("open_diagnostics")}
+            >
+              {getCopy("settings.diagnosticsOpenModalAction")}
+            </button>
+          </div>
         </section>
       </FocusDialog>
 
@@ -1159,6 +1392,7 @@ export default function App() {
           activeSessionId={state.activeSessionId}
           activeScope={effectiveScope}
           supportedActions={state.transcript?.supportedActions ?? null}
+          methodTiers={state.capabilities.methodTiers}
           showNewChatButton
           canCreateSession={canCreateSession}
           onCreateSession={() => {
@@ -1166,6 +1400,9 @@ export default function App() {
             void handleCreateSession();
           }}
           onSelectSession={(s) => void handleSelectSession(s)}
+          onCopyCliCommand={() =>
+            dispatch({ type: "ANNOUNCE", message: getCopy("session.cli.copiedNotice") })
+          }
         />
       </FocusDialog>
 
@@ -1242,6 +1479,16 @@ export default function App() {
                 <div className="scope-list">
                   {scopedProfiles.map((profile) => {
                     const isCurrent = profile.profileId === (effectiveScope?.profileId ?? "default");
+                    const profileHealth =
+                      profile.actual ?? (isCurrent && hasReadyConnection ? "ready" : "idle");
+                    const healthCopyKey = (
+                      profileHealth === "ready" ||
+                      profileHealth === "connecting" ||
+                      profileHealth === "reconnecting" ||
+                      profileHealth === "blocked"
+                        ? `scope.profileHealth.${profileHealth}`
+                        : "scope.profileHealth.idle"
+                    ) as CopyKey;
                     return (
                       <button
                         key={`${profile.connectionId}:${profile.profileId}`}
@@ -1257,13 +1504,80 @@ export default function App() {
                             @{profile.handle}
                           </span>
                         </span>
-                        {isCurrent && <span className="gateway-badge is-primary">Active</span>}
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                          {profile.isDefault && (
+                            <span className="gateway-badge">
+                              {getCopy("scope.profileDefaultBadge")}
+                            </span>
+                          )}
+                          <span className="gateway-badge">{getCopy(healthCopyKey)}</span>
+                          {isCurrent && <span className="gateway-badge is-primary">Active</span>}
+                        </span>
                       </button>
                     );
                   })}
                 </div>
               </section>
             )}
+            {(() => {
+              const profileAvail = resolveProfileManagementAvailability(state.capabilities);
+              return (
+                <section
+                  className="settings-section"
+                  aria-label={getCopy("scope.profileManageTitle")}
+                >
+                  <h3 className="settings-section-title">
+                    {getCopy("scope.profileManageTitle")}
+                  </h3>
+                  {profileAvail.canManageNatively ? (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        className="button button-secondary"
+                        onClick={() => void handleRefreshProfiles()}
+                      >
+                        {getCopy("scope.profileRefreshAction")}
+                      </button>
+                    </div>
+                  ) : (
+                    <div>
+                      <p className="settings-section-body" style={{ marginBottom: 8 }}>
+                        {getCopy(profileAvail.noteKey)}
+                      </p>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                        <code>{profileAvail.cliCommand}</code>
+                        <button
+                          type="button"
+                          className="button button-secondary"
+                          onClick={() => {
+                            try {
+                              void navigator.clipboard?.writeText(profileAvail.cliCommand);
+                            } catch {
+                              // Ignore clipboard errors in headless mode
+                            }
+                            dispatch({
+                              type: "ANNOUNCE",
+                              message: getCopy("capabilities.copiedCliNotice"),
+                            });
+                          }}
+                        >
+                          {getCopy("scope.profileCopyCliAction")}
+                        </button>
+                        <button
+                          type="button"
+                          className="button button-secondary"
+                          onClick={() =>
+                            void host.request("links.openExternal", { url: profileAvail.docsUrl })
+                          }
+                        >
+                          {getCopy("scope.profileOpenDocsAction")}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </section>
+              );
+            })()}
           </div>
         )}
       </FocusDialog>

@@ -1,7 +1,17 @@
 import { useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Plus } from "lucide-react";
-import type { BridgeScope, SessionSummary, SupportedChatActions } from "@hermes/contracts";
-import { getCopy } from "@hermes/domain";
+import type {
+  BridgeScope,
+  CapabilityMethodTier,
+  SessionSummary,
+  SupportedChatActions,
+} from "@hermes/contracts";
+import {
+  buildSessionCliDeepLinks,
+  filterRenderableSessionCapabilities,
+  getCopy,
+  type CopyKey,
+} from "@hermes/domain";
 
 interface SessionRailListProps {
   hasReadyConnection: boolean;
@@ -9,10 +19,13 @@ interface SessionRailListProps {
   activeSessionId: string | null;
   activeScope?: BridgeScope | null;
   supportedActions?: SupportedChatActions | null;
+  methodTiers?: Record<string, CapabilityMethodTier>;
+  extraCapabilities?: readonly string[];
   canCreateSession?: boolean;
   showNewChatButton?: boolean;
   onCreateSession?: () => void;
   onSelectSession: (session: SessionSummary) => void;
+  onCopyCliCommand?: (command: string) => void;
 }
 
 const CAPABILITY_ENTRIES: Array<{ key: keyof SupportedChatActions; label: string }> = [
@@ -29,10 +42,13 @@ export function SessionRailList({
   activeSessionId,
   activeScope,
   supportedActions,
+  methodTiers,
+  extraCapabilities = [],
   canCreateSession = false,
   showNewChatButton = false,
   onCreateSession,
   onSelectSession,
+  onCopyCliCommand,
 }: SessionRailListProps) {
   const [query, setQuery] = useState("");
   const searchInputId = useId();
@@ -80,9 +96,30 @@ export function SessionRailList({
     );
   }
 
-  const servedCapLabels = supportedActions
-    ? CAPABILITY_ENTRIES.filter((entry) => supportedActions[entry.key]).map((entry) => entry.label)
+  const rawCapLabels = [
+    ...(supportedActions
+      ? CAPABILITY_ENTRIES.filter((entry) => supportedActions[entry.key]).map((entry) => entry.label)
+      : []),
+    ...extraCapabilities,
+  ];
+  const servedCapLabels = filterRenderableSessionCapabilities(rawCapLabels, methodTiers);
+  const activeSession = sessions.find((s) => s.sessionId === activeSessionId) ?? null;
+  const cliDeepLinks = activeSessionId
+    ? buildSessionCliDeepLinks({
+        sessionId: activeSessionId,
+        profileId: activeScope?.profileId ?? "default",
+        title: activeSession?.title,
+      })
     : [];
+
+  const handleCopyCli = (command: string) => {
+    try {
+      void navigator.clipboard?.writeText(command);
+    } catch {
+      // Clipboard API may be unavailable in headless test environments
+    }
+    onCopyCliCommand?.(command);
+  };
 
   return (
     <div className="session-rail-body">
@@ -169,6 +206,10 @@ export function SessionRailList({
               </dd>
             </div>
             <div>
+              <dt>{getCopy("nav.sessionDetailsSecurity")}</dt>
+              <dd>{getCopy("nav.sessionDetailsSecurityValue")}</dd>
+            </div>
+            <div>
               <dt>{getCopy("nav.sessionDetailsCapabilities")}</dt>
               <dd>
                 {servedCapLabels.length > 0 ? (
@@ -184,6 +225,36 @@ export function SessionRailList({
                 )}
               </dd>
             </div>
+            {cliDeepLinks.length > 0 && (
+              <div>
+                <dt>{getCopy("nav.sessionDetailsCliActions")}</dt>
+                <dd>
+                  <p className="session-cli-note" style={{ fontSize: 11.5, color: "var(--muted)", margin: "2px 0 6px" }}>
+                    {getCopy("session.cli.neverExecutedNotice")}
+                  </p>
+                  <div className="session-cli-actions" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {cliDeepLinks.map((link) => (
+                      <div
+                        key={link.actionId}
+                        style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}
+                      >
+                        <code style={{ fontSize: 10.5, opacity: 0.85, wordBreak: "break-all" }}>{link.command}</code>
+                        <button
+                          type="button"
+                          className="button button-secondary session-cli-btn"
+                          data-cli-action={link.actionId}
+                          data-cli-command={link.command}
+                          style={{ fontSize: 11, padding: "3px 8px", flexShrink: 0 }}
+                          onClick={() => handleCopyCli(link.command)}
+                        >
+                          {getCopy(link.labelKey as CopyKey)}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </dd>
+              </div>
+            )}
           </dl>
         ) : (
           <p className="session-details-empty">{getCopy("nav.sessionDetailsEmpty")}</p>

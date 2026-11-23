@@ -1036,4 +1036,378 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await expect(page.locator(".transcript-list")).toContainText("ping remote gateway");
     await expect(page.locator(".transcript-list")).toContainText("SSH Mock Gateway");
   });
+
+  test("Ticket #36: Scope popover Profile switching & capability-gated management, Session non-refused details & CLI deep links, Settings 9 sections & focus return", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              kind: "local",
+              label: "This device",
+              originDisplay: "local-control-socket",
+              actual: "ready",
+              degraded: false,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+            {
+              connectionId: "local",
+              profileId: "work",
+              displayName: "Work",
+              handle: "work",
+              isDefault: false,
+              actual: "idle",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-def-1",
+              title: "Default Active Turn",
+              preview: "Streaming in progress",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: "turn-running-1",
+              status: "running",
+            },
+            {
+              connectionId: "local",
+              profileId: "work",
+              sessionId: "sess-work-1",
+              title: "Work Architecture Notes",
+              preview: "Ready on work profile",
+              updatedAt: "2026-11-23T08:01:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-def-1" },
+          activeSessionId: "sess-def-1",
+        },
+        chatState: {
+          windowId: "primary",
+          paneId: "main",
+          lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-def-1" },
+          lastSessionByScope: {
+            "local::default": "sess-def-1",
+            "local::work": "sess-work-1",
+          },
+          lastValidProfileByConnection: { local: "default" },
+          lastValidScopes: [
+            { connectionId: "local", profileId: "default" },
+            { connectionId: "local", profileId: "work" },
+          ],
+          sessionSummaries: {},
+          activeStatus: "ready",
+          lastKnownUnverified: false,
+          missingSession: null,
+          routeBanner: null,
+        },
+        transcripts: {
+          "local::default::sess-def-1": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-def-1",
+            messages: [
+              {
+                messageId: "m-def-1",
+                sessionId: "sess-def-1",
+                role: "assistant",
+                text: "Running background task...",
+                createdAt: "2026-11-23T08:00:00.000Z",
+                turnId: "turn-running-1",
+                streaming: true,
+                status: "streaming",
+              },
+            ],
+            activeTurnId: "turn-running-1",
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+          "local::work::sess-work-1": {
+            connectionId: "local",
+            profileId: "work",
+            sessionId: "sess-work-1",
+            messages: [
+              {
+                messageId: "m-work-1",
+                sessionId: "sess-work-1",
+                role: "assistant",
+                text: "Work profile transcript ready.",
+                createdAt: "2026-11-23T08:01:00.000Z",
+                status: "complete",
+              },
+            ],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+        capabilities: {
+          servedMethods: [
+            "prompt.submit",
+            "prompt.cancel",
+            "session.steer",
+            "session.list",
+            "session.create",
+            "session.resume",
+            "profiles.list",
+            "config.get",
+            "config.update",
+          ],
+          refusedMethods: [
+            "session.delete",
+            "session.title",
+            "session.branch",
+            "session.archive",
+            "session.compress",
+            "session.undo",
+          ],
+        },
+        config: {
+          supported: true,
+          readOnly: false,
+          supportedKeys: ["model.default", "chat.send_on_enter"],
+          values: {
+            "model.default": "claude-3-7-sonnet",
+            "chat.send_on_enter": true,
+          },
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // 1. Session Details: shows security info, never renders refused methods, and exposes 6 CLI deep links
+    const detailsCard = page.locator(".session-details-card");
+    await expect(detailsCard).toBeVisible();
+    await expect(detailsCard).toContainText("安全与隔离");
+    await expect(detailsCard).toContainText("审批与执行严格绑定当前 Scope");
+    await expect(detailsCard).not.toContainText("session.delete");
+    await expect(detailsCard).not.toContainText("session.title");
+    await expect(detailsCard).not.toContainText("session.branch");
+    await expect(detailsCard).not.toContainText("session.archive");
+    await expect(detailsCard).not.toContainText("session.compress");
+    await expect(detailsCard).not.toContainText("session.undo");
+    await expect(detailsCard).toContainText("只读深链 · 不会在此客户端执行");
+
+    for (const actionId of ["rename", "delete", "branch", "archive", "compress", "undo"]) {
+      const btn = detailsCard.locator(`[data-cli-action="${actionId}"]`);
+      await expect(btn).toBeVisible();
+    }
+    await detailsCard.locator('[data-cli-action="rename"]').click();
+    await expect(page.locator('[aria-live="polite"]')).toContainText(
+      "已复制 Session CLI 命令（不会在此客户端执行）",
+    );
+
+    // 2. Scope Popover: lists current Connection's Profiles, default badge, health status, and probed Profile management action
+    const scopeChip = page.locator(".route-strip").getByRole("button", { name: "已连接" });
+    await scopeChip.click();
+    const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+    await expect(scopeDialog).toBeVisible();
+    await expect(scopeDialog).toContainText("Default");
+    await expect(scopeDialog).toContainText("default");
+    await expect(scopeDialog).toContainText("已连接");
+    await expect(scopeDialog).toContainText("Work");
+    await expect(scopeDialog).toContainText("待激活");
+    await expect(scopeDialog.getByRole("button", { name: "刷新 Profile 列表" })).toBeVisible();
+
+    // Switch to Work profile -> updates active scope & thread without tearing down connection or stopping default's running turn
+    await scopeDialog.getByRole("button", { name: /Work/ }).click();
+    await expect(scopeDialog).toBeHidden();
+    await expect(page.locator(".route-strip")).toContainText("Work");
+    await expect(page.locator(".transcript-list")).toContainText("Work profile transcript ready.");
+    await expect(detailsCard.locator('[data-cli-action="delete"]')).toHaveAttribute(
+      "data-cli-command",
+      "hermes session delete --profile work sess-work-1",
+    );
+
+    // Switch back to Default profile -> in-flight turn is still running (Stop button visible)
+    await scopeChip.click();
+    await expect(scopeDialog).toBeVisible();
+    await scopeDialog.getByRole("button", { name: /Default/ }).click();
+    await expect(page.locator(".route-strip")).toContainText("Default");
+    await expect(page.getByRole("button", { name: "停止 Turn" })).toBeVisible();
+
+    // 3. Settings Modal: opened from rail gear button -> Esc returns focus to rail gear button
+    const railGearBtn = page.locator("#rail-settings-gear");
+    await railGearBtn.focus();
+    await railGearBtn.click();
+    const settingsDialog = page.getByRole("dialog", { name: "Settings" });
+    await expect(settingsDialog).toBeVisible();
+
+    for (const sectionName of [
+      "Model",
+      "Workspace",
+      "Safety",
+      "Memory & Context",
+      "Chat",
+      "Gateways",
+      "Updates",
+      "About",
+      "Diagnostics",
+    ]) {
+      await expect(
+        settingsDialog.locator(`section.settings-section[aria-label="${sectionName}"]`),
+      ).toBeVisible();
+    }
+    // Voice / Cloud / Account / Billing must have zero entry
+    await expect(settingsDialog).not.toContainText("Voice");
+    await expect(settingsDialog).not.toContainText("Cloud");
+    await expect(settingsDialog).not.toContainText("Billing");
+
+    // Updates section shows only "本地开发构建，不检查更新" and has 0 buttons
+    const updatesSection = settingsDialog.locator('section.settings-section[aria-label="Updates"]');
+    await expect(updatesSection).toContainText("本地开发构建，不检查更新");
+    await expect(updatesSection.locator("button")).toHaveCount(0);
+
+    // AppInfo in Settings -> About and Settings -> Diagnostics match single source
+    const aboutHeadline = await settingsDialog
+      .locator('section.settings-section[aria-label="About"] .settings-about-headline')
+      .innerText();
+    const diagHeadline = await settingsDialog
+      .locator('section.settings-section[aria-label="Diagnostics"] .settings-about-headline')
+      .innerText();
+    expect(aboutHeadline).toBe(diagHeadline);
+
+    // Feature-detected config field update round-trip
+    const modelSelect = settingsDialog.getByLabel("默认模型");
+    await expect(modelSelect).toHaveValue("claude-3-7-sonnet");
+    await modelSelect.selectOption("gpt-4.1");
+    await expect(modelSelect).toHaveValue("gpt-4.1");
+    // Unsupported key (推理强度) is hidden
+    await expect(settingsDialog.getByLabel("推理强度")).toHaveCount(0);
+
+    // Esc closes Settings and returns focus to rail gear button
+    await page.keyboard.press("Escape");
+    await expect(settingsDialog).toBeHidden();
+    await expect(railGearBtn).toBeFocused();
+
+    // Opening Settings via ⌘, while composer is focused returns focus to composer on Esc
+    const composer = page.locator("#composer-input");
+    await composer.focus();
+    await page.keyboard.press("Control+,");
+    await expect(settingsDialog).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(settingsDialog).toBeHidden();
+    await expect(composer).toBeFocused();
+
+    // 4. 1280x800 adaptive check: Scope popover, Settings modal, and Sessions popover CLI deep links
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await scopeChip.click();
+    await expect(scopeDialog).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(scopeDialog).toBeHidden();
+    await expect(scopeChip).toBeFocused();
+
+    const sessionsTrigger = page.getByRole("button", { name: /Sessions/ });
+    await sessionsTrigger.click();
+    const sessionsDialog = page.getByRole("dialog", { name: "Sessions" });
+    await expect(sessionsDialog).toBeVisible();
+    await expect(sessionsDialog.locator(".session-details-card")).toContainText(
+      "只读深链 · 不会在此客户端执行",
+    );
+    await page.keyboard.press("Escape");
+    await expect(sessionsDialog).toBeHidden();
+  });
+
+  test("Ticket #36: Scope popover hides Profile management when profiles.list capability is unsupported and renders CLI/docs deep links", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              displayName: "本机 Hermes",
+              kind: "local",
+              authorityRole: "primary",
+              desired: "connected",
+              actual: "ready",
+              reconnectAttempt: 0,
+              updatedAt: "2026-11-23T08:00:00.000Z",
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: null },
+          activeSessionId: null,
+        },
+        capabilities: {
+          servedMethods: [
+            "prompt.submit",
+            "prompt.cancel",
+            "session.list",
+            "session.create",
+            "session.resume",
+          ],
+          refusedMethods: ["session.delete"],
+        },
+      };
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const scopeChip = page.locator(".route-strip").getByRole("button", { name: "已连接" });
+    await scopeChip.click();
+    const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+    await expect(scopeDialog).toBeVisible();
+
+    // Read-only probe fails for profiles.list -> management action hidden, CLI & docs deep links visible
+    await expect(scopeDialog.getByRole("button", { name: "刷新 Profile 列表" })).toHaveCount(0);
+    await expect(scopeDialog).toContainText("只读探测未通过或需变更 Profile：请复制 CLI 命令或查阅官方文档（不会在此客户端执行）");
+    await expect(scopeDialog).toContainText("hermes profile list");
+    await expect(scopeDialog.getByRole("button", { name: "复制 Profile CLI 命令" })).toBeVisible();
+    await expect(scopeDialog.getByRole("button", { name: "打开 Profile 官方文档" })).toBeVisible();
+
+    await scopeDialog.getByRole("button", { name: "复制 Profile CLI 命令" }).click();
+    await expect(page.locator('[aria-live="polite"]')).toContainText("已复制只读 CLI 命令");
+  });
 });

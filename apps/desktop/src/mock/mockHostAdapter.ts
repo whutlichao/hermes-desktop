@@ -8,6 +8,7 @@ import {
   type BridgeEvent,
   type BridgeResult,
   type BridgeScope,
+  type CapabilityDomainId,
   type CapabilitySnapshot,
   type ChatSessionProjection,
   type ConnectionHealthSummary,
@@ -15,6 +16,9 @@ import {
   type ConnectionMutationResponse,
   type ConnectionTestResult,
   type FleetSnapshot,
+  type GatewayConfigSnapshot,
+  type GatewayConfigUpdateResult,
+  type GatewayConfigValue,
   type HermesHost,
   type HostCommand,
   type HostTopic,
@@ -32,9 +36,12 @@ import {
   type SessionSummary,
   type SessionTranscriptSnapshot,
   type SshHostKeyConfirmResult,
+  SUPPORTED_GATEWAY_CONFIG_KEYS,
 } from "@hermes/contracts";
 import {
+  CAPABILITY_DOMAIN_CATALOG,
   CapabilityRegistry,
+  SETTINGS_FIELD_CATALOG,
   createBridgeDispatcher,
   createEmptyRegistryDocument,
   diffRegistries,
@@ -44,6 +51,7 @@ import {
   formatSshTargetDisplay,
   getCopy,
   getSshFailureCopy,
+  isAllowedGatewayConfigKey,
   mapLocalFailure,
   normalizeRegistryDocument,
   projectRegistrySnapshot,
@@ -99,6 +107,18 @@ interface MockE2EFixture {
   transcripts?: Record<string, SessionTranscriptSnapshot>;
   resyncedTranscripts?: Record<string, SessionTranscriptSnapshot>;
   transcriptEventsOnSubscribe?: Record<string, BridgeEvent[]>;
+  capabilities?: {
+    servedMethods?: string[];
+    olderMethods?: string[];
+    refusedMethods?: string[];
+    probedDomains?: Record<string, "ok" | "method_not_found" | "refused" | "timeout">;
+  };
+  config?: {
+    supported?: boolean;
+    readOnly?: boolean;
+    supportedKeys?: string[];
+    values?: Record<string, GatewayConfigValue>;
+  };
 }
 
 function readE2EFixture(): MockE2EFixture | undefined {
@@ -175,6 +195,8 @@ export function createMockHostBridge(): HermesHost {
   const fleetListeners = new Set<(event: BridgeEvent<FleetSnapshot>) => void>();
   const sessionsListeners = new Set<(event: BridgeEvent<{ sessions: SessionSummary[] }>) => void>();
   const chatStateListeners = new Set<(event: BridgeEvent<ChatSessionProjection>) => void>();
+  const capabilitiesListeners = new Set<(event: BridgeEvent<CapabilitySnapshot>) => void>();
+  let capabilitiesSeq = 0;
   const registryListeners = new Set<
     (event: BridgeEvent<{ snapshot: RegistrySnapshotView; diff?: RegistryDiff }>) => void
   >();
@@ -215,6 +237,80 @@ export function createMockHostBridge(): HermesHost {
   };
   if (fixture) {
     (globalThis as { __HERMES_E2E_COUNTS__?: typeof e2eCounts }).__HERMES_E2E_COUNTS__ = e2eCounts;
+    const readyConn = currentFleet.connections.find((c) => c.actual === "ready");
+    if (readyConn || fixture.capabilities) {
+      const served = fixture.capabilities?.servedMethods ?? [
+        "prompt.submit",
+        "prompt.cancel",
+        "session.steer",
+        "session.list",
+        "session.create",
+        "session.resume",
+        "profiles.list",
+        "config.get",
+        "config.update",
+      ];
+      capabilityRegistry.applyConnectHandshake({
+        connectionId: currentFleet.activeScope?.connectionId ?? readyConn?.connectionId ?? "local",
+        profileId: currentFleet.activeScope?.profileId ?? "default",
+        ownerGeneration: 1,
+        authorityEpoch: 1,
+        gatewayVersionOrSha: "mock-e2e-v1",
+        serverRequestsSupported: true,
+        describeResult: {
+          served_methods: served,
+          older_methods: fixture.capabilities?.olderMethods ?? [],
+          refused_methods: fixture.capabilities?.refusedMethods ?? [],
+          session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
+        },
+      });
+      if (fixture.capabilities?.probedDomains) {
+        for (const [dom, outcome] of Object.entries(fixture.capabilities.probedDomains)) {
+          const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === dom);
+          if (meta?.probeMethod) {
+            capabilityRegistry.applyProbeOutcome({
+              domain: dom as CapabilityDomainId,
+              method: meta.probeMethod,
+              outcome,
+              expectedOwnerGeneration: 1,
+              expectedAuthorityEpoch: 1,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const defaultConfigValues: Record<string, GatewayConfigValue> = {};
+  for (const field of SETTINGS_FIELD_CATALOG) {
+    defaultConfigValues[field.key] = field.defaultValue;
+  }
+  let mockConfigValues: Record<string, GatewayConfigValue> = {
+    ...defaultConfigValues,
+    ...(fixture?.config?.values ?? {}),
+  };
+  const mockConfigSupportedKeys: string[] = (
+    fixture?.config?.supportedKeys ?? [...SUPPORTED_GATEWAY_CONFIG_KEYS]
+  ).filter((k) => isAllowedGatewayConfigKey(k));
+  const mockConfigSupported =
+    fixture?.config?.supported !== undefined
+      ? fixture.config.supported
+      : mockConfigSupportedKeys.length > 0;
+  const mockConfigReadOnly = Boolean(fixture?.config?.readOnly ?? false);
+
+  function emitCapabilitiesPatch() {
+    capabilitiesSeq += 1;
+    const snap = capabilityRegistry.getSnapshot();
+    for (const listener of capabilitiesListeners) {
+      listener({
+        topic: "capabilities",
+        scope: null,
+        kind: "patch",
+        seq: capabilitiesSeq,
+        revision: snap.generation,
+        payload: snap,
+      });
+    }
   }
 
   const trustedMockHosts = new Set<string>(["lab.example.com", "lab.local", "remote.example.com"]);
@@ -451,6 +547,7 @@ export function createMockHostBridge(): HermesHost {
       mockConnections[existingIdx] = health;
     } else {
       mockConnections.push(health);
+      const secondaryProfile = defaultProfile === "ops" ? "staging" : "ops";
       const profiles: ProfileSummary[] = [
         {
           connectionId,
@@ -458,13 +555,15 @@ export function createMockHostBridge(): HermesHost {
           displayName: defaultProfile === "default" ? "Remote Default" : `Remote ${defaultProfile}`,
           handle: defaultProfile,
           isDefault: true,
+          actual: "ready",
         },
         {
           connectionId,
-          profileId: defaultProfile === "ops" ? "staging" : "ops",
+          profileId: secondaryProfile,
           displayName: defaultProfile === "ops" ? "Remote Staging" : "Remote Ops",
-          handle: defaultProfile === "ops" ? "staging" : "ops",
+          handle: secondaryProfile,
           isDefault: false,
+          actual: "idle",
         },
       ];
       mockProfiles.push(...profiles);
@@ -481,23 +580,38 @@ export function createMockHostBridge(): HermesHost {
         activeTurnId: null,
         status: "idle",
       };
-      mockSessions.push(sess1);
-      mockTranscripts.set(transcriptKey(connectionId, defaultProfile, sess1.sessionId), {
+      const sess2: SessionSummary = {
         connectionId,
-        profileId: defaultProfile,
-        sessionId: sess1.sessionId,
-        messages: [],
+        profileId: secondaryProfile,
+        sessionId: `${connectionId}-${secondaryProfile}-sess-1`,
+        title: `Remote ${secondaryProfile} (${label})`,
+        preview: host,
+        updatedAt: new Date().toISOString(),
+        pinned: false,
+        unreadCount: 0,
+        needsInput: false,
         activeTurnId: null,
-        turnStopping: false,
-        chatAvailable: true,
-        supportedActions: {
-          promptSubmit: true,
-          promptCancel: true,
-          promptSteer: true,
-          sessionCreate: true,
-          sessionResume: true,
-        },
-      });
+        status: "idle",
+      };
+      mockSessions.push(sess1, sess2);
+      for (const s of [sess1, sess2]) {
+        mockTranscripts.set(transcriptKey(connectionId, s.profileId, s.sessionId), {
+          connectionId,
+          profileId: s.profileId,
+          sessionId: s.sessionId,
+          messages: [],
+          activeTurnId: null,
+          turnStopping: false,
+          chatAvailable: true,
+          supportedActions: {
+            promptSubmit: true,
+            promptCancel: true,
+            promptSteer: true,
+            sessionCreate: true,
+            sessionResume: true,
+          },
+        });
+      }
     }
     emitMockFleet();
   }
@@ -1212,7 +1326,63 @@ export function createMockHostBridge(): HermesHost {
     },
     "scopes.switch": async (payload, scope) => {
       if (fixture) {
-        return { ok: false, fleet: currentFleet, transcript: null };
+        const cid =
+          typeof payload.connectionId === "string" && payload.connectionId
+            ? payload.connectionId
+            : scope?.connectionId ?? currentFleet.activeScope?.connectionId ?? "local";
+        const profs = currentFleet.profiles.filter((p) => p.connectionId === cid);
+        const pid =
+          typeof payload.profileId === "string" && payload.profileId
+            ? payload.profileId
+            : scope?.profileId ?? profs[0]?.profileId ?? "default";
+        const candidates = currentFleet.sessions.filter(
+          (s) => s.connectionId === cid && s.profileId === pid,
+        );
+        const requestedSid =
+          typeof payload.sessionId === "string" && payload.sessionId
+            ? payload.sessionId
+            : null;
+        const rememberedSid = currentChatState.lastSessionByScope[`${cid}::${pid}`] ?? null;
+        const validRemembered =
+          rememberedSid && candidates.some((s) => s.sessionId === rememberedSid)
+            ? rememberedSid
+            : null;
+        const nextSessionId = requestedSid ?? validRemembered ?? candidates[0]?.sessionId ?? null;
+        currentFleet = {
+          ...currentFleet,
+          profiles: currentFleet.profiles.map((p) =>
+            p.connectionId === cid && p.profileId === pid
+              ? { ...p, actual: "ready" }
+              : p,
+          ),
+          activeScope: {
+            connectionId: cid,
+            profileId: pid,
+            ...(nextSessionId ? { sessionId: nextSessionId } : {}),
+          },
+          activeSessionId: nextSessionId,
+        };
+        currentChatState = {
+          ...currentChatState,
+          lastActiveChat: {
+            connectionId: cid,
+            profileId: pid,
+            ...(nextSessionId ? { sessionId: nextSessionId } : {}),
+          },
+          lastSessionByScope: {
+            ...currentChatState.lastSessionByScope,
+            ...(nextSessionId ? { [`${cid}::${pid}`]: nextSessionId } : {}),
+          },
+          activeStatus: nextSessionId ? "ready" : "empty",
+          missingSession: null,
+        };
+        const transcript = nextSessionId
+          ? lookupTranscript(transcriptMap, cid, pid, nextSessionId) ??
+            makeEmptyTranscript(cid, pid, nextSessionId)
+          : null;
+        emitFleetSnapshot();
+        emitChatStatePatch();
+        return { ok: true, fleet: currentFleet, transcript };
       }
       const cid =
         typeof payload.connectionId === "string" && payload.connectionId
@@ -1227,11 +1397,16 @@ export function createMockHostBridge(): HermesHost {
         typeof payload.profileId === "string" && payload.profileId
           ? payload.profileId
           : scope?.profileId ?? profs[0]?.profileId ?? "default";
+      for (const p of mockProfiles) {
+        if (p.connectionId === cid && p.profileId === pid) {
+          p.actual = "ready";
+        }
+      }
       const candidates = mockSessions.filter((s) => s.connectionId === cid && s.profileId === pid);
       const sid =
         typeof payload.sessionId === "string" && payload.sessionId
           ? payload.sessionId
-          : scope?.sessionId ?? candidates[0]?.sessionId ?? null;
+          : candidates[0]?.sessionId ?? null;
       mockActiveScope = { connectionId: cid, profileId: pid, ...(sid ? { sessionId: sid } : {}) };
       mockActiveSessionId = sid;
       const transcript = sid ? mockTranscripts.get(transcriptKey(cid, pid, sid)) ?? null : null;
@@ -1666,7 +1841,71 @@ export function createMockHostBridge(): HermesHost {
       inspection: currentInspection,
     }),
     "local.diagnose": async (): Promise<SanitizedDiagnosticsPayload> => buildMockDiagnostics(),
-    "capabilities.describe": async (): Promise<CapabilitySnapshot> => capabilityRegistry.getSnapshot(),
+    "capabilities.describe": async (payload): Promise<CapabilitySnapshot> => {
+      const domain =
+        typeof payload.domain === "string" ? (payload.domain as CapabilityDomainId) : undefined;
+      const snap = capabilityRegistry.getSnapshot();
+      if (domain && snap.capabilitiesReady) {
+        const meta = CAPABILITY_DOMAIN_CATALOG.find((m) => m.domain === domain);
+        if (meta?.probeMethod) {
+          const overrideOutcome = fixture?.capabilities?.probedDomains?.[domain];
+          const tier = capabilityRegistry.getMethodTier(meta.probeMethod);
+          const outcome =
+            overrideOutcome ??
+            (tier === "refused"
+              ? "refused"
+              : tier === "served" || tier === "older"
+                ? "ok"
+                : "method_not_found");
+          capabilityRegistry.applyProbeOutcome({
+            domain,
+            method: meta.probeMethod,
+            outcome,
+            expectedOwnerGeneration: snap.key.ownerGeneration,
+            expectedAuthorityEpoch: snap.key.authorityEpoch,
+            expectedGeneration: snap.generation,
+          });
+          emitCapabilitiesPatch();
+        }
+      }
+      return capabilityRegistry.getSnapshot();
+    },
+    "config.get": async (_payload, scope): Promise<GatewayConfigSnapshot> => {
+      const activeScope = scope ?? (fixture ? currentFleet.activeScope : mockActiveScope);
+      return {
+        scope: activeScope,
+        supported: mockConfigSupported,
+        readOnly: mockConfigReadOnly,
+        supportedKeys: [...mockConfigSupportedKeys],
+        values: { ...mockConfigValues },
+        updatedAt: new Date().toISOString(),
+      };
+    },
+    "config.update": async (payload, scope): Promise<GatewayConfigUpdateResult> => {
+      const key = typeof payload.key === "string" ? payload.key.trim() : "";
+      const value = payload.value as GatewayConfigValue;
+      if (!key || !isAllowedGatewayConfigKey(key) || !mockConfigSupportedKeys.includes(key)) {
+        const err = new Error("Unsupported config key");
+        (err as { code?: string }).code = "invalid_request";
+        throw err;
+      }
+      mockConfigValues = {
+        ...mockConfigValues,
+        [key]: value,
+      };
+      const activeScope = scope ?? (fixture ? currentFleet.activeScope : mockActiveScope);
+      return {
+        ok: true,
+        snapshot: {
+          scope: activeScope,
+          supported: mockConfigSupported,
+          readOnly: mockConfigReadOnly,
+          supportedKeys: [...mockConfigSupportedKeys],
+          values: { ...mockConfigValues },
+          updatedAt: new Date().toISOString(),
+        },
+      };
+    },
     "diagnostics.export": async () => ({
       ...buildMockDiagnostics(),
       appInfo: mockAppInfo,
@@ -1784,6 +2023,8 @@ export function createMockHostBridge(): HermesHost {
           sessionListeners.delete(entry);
         };
       } else if (topic === "capabilities") {
+        const typed = listener as (event: BridgeEvent<CapabilitySnapshot>) => void;
+        capabilitiesListeners.add(typed);
         queueMicrotask(() => {
           listener({
             topic: "capabilities",
@@ -1794,6 +2035,9 @@ export function createMockHostBridge(): HermesHost {
             payload: capabilityRegistry.getSnapshot(),
           });
         });
+        return () => {
+          capabilitiesListeners.delete(typed);
+        };
       } else if (topic === "chat.state") {
         chatStateListeners.add(listener as (event: BridgeEvent<ChatSessionProjection>) => void);
         queueMicrotask(() => {

@@ -295,4 +295,104 @@ describe("MockHostBridge Ticket #28 chat/session parity", () => {
 
     unsub();
   });
+
+  it("supports Ticket #36 scopes.switch across Profiles without tearing down other connections or pausing turns, plus config.get/config.update and AppInfo 3-surface parity", async () => {
+    const mock = createMockHostBridge();
+
+    // Add and connect an SSH gateway so we have a ready connection with multiple profiles (default, ops)
+    await mock.request("connections.confirmHostKey", {
+      host: "unknown-host.example.com",
+      user: "ubuntu",
+    });
+    const addRes = await mock.request<ConnectionMutationResponse>("connections.add", {
+      kind: "ssh",
+      label: "Lab Server",
+      host: "unknown-host.example.com",
+      user: "ubuntu",
+    });
+    expect(addRes.ok && addRes.value.committed).toBe(true);
+
+    // Switch to lab-server default profile and start a turn
+    const switchDefault = await mock.request<{
+      ok: boolean;
+      fleet: {
+        activeScope: { connectionId: string; profileId: string; sessionId?: string } | null;
+        profiles: Array<{ connectionId: string; profileId: string; isDefault: boolean; actual: string }>;
+      };
+    }>("scopes.switch", {
+      connectionId: "lab-server",
+      profileId: "default",
+    });
+    expect(switchDefault.ok && switchDefault.value.ok).toBe(true);
+    if (switchDefault.ok) {
+      const labProfiles = switchDefault.value.fleet.profiles.filter(
+        (p) => p.connectionId === "lab-server",
+      );
+      expect(labProfiles.map((p) => p.profileId)).toEqual(["default", "ops"]);
+      expect(labProfiles.find((p) => p.profileId === "default")?.isDefault).toBe(true);
+      expect(labProfiles.find((p) => p.profileId === "default")?.actual).toBe("ready");
+      expect(labProfiles.find((p) => p.profileId === "ops")?.actual).toBe("idle");
+    }
+
+    // Switch to ops profile via scopes.switch -> activates ops ("ready") without tearing down default
+    const switchOps = await mock.request<{
+      ok: boolean;
+      fleet: {
+        activeScope: { connectionId: string; profileId: string } | null;
+        profiles: Array<{ connectionId: string; profileId: string; actual: string }>;
+      };
+    }>("scopes.switch", {
+      connectionId: "lab-server",
+      profileId: "ops",
+    });
+    expect(switchOps.ok && switchOps.value.ok).toBe(true);
+    if (switchOps.ok) {
+      expect(switchOps.value.fleet.activeScope?.profileId).toBe("ops");
+      const opsProf = switchOps.value.fleet.profiles.find(
+        (p) => p.connectionId === "lab-server" && p.profileId === "ops",
+      );
+      expect(opsProf?.actual).toBe("ready");
+    }
+
+    // config.get and config.update round-trip
+    const cfgGet = await mock.request<{
+      supported: boolean;
+      supportedKeys: string[];
+      values: Record<string, string | number | boolean>;
+    }>("config.get", {}, { connectionId: "lab-server", profileId: "ops" });
+    expect(cfgGet.ok).toBe(true);
+    if (cfgGet.ok) {
+      expect(cfgGet.value.supported).toBe(true);
+      expect(cfgGet.value.supportedKeys).toContain("model.default");
+      expect(cfgGet.value.supportedKeys).not.toContain("voice.enabled");
+    }
+
+    const cfgUpd = await mock.request<{
+      ok: boolean;
+      snapshot: { values: Record<string, string | number | boolean> };
+    }>(
+      "config.update",
+      { key: "model.default", value: "gpt-4.1" },
+      { connectionId: "lab-server", profileId: "ops" },
+    );
+    expect(cfgUpd.ok && cfgUpd.value.ok).toBe(true);
+    if (cfgUpd.ok) {
+      expect(cfgUpd.value.snapshot.values["model.default"]).toBe("gpt-4.1");
+    }
+
+    // AppInfo parity across bridge.hello and diagnostics.export
+    const helloRes = await mock.request<{ appName: string; appVersion: string; gitSha: string }>(
+      "bridge.hello",
+      {},
+    );
+    const exportRes = await mock.request<{
+      appInfo: { appName: string; appVersion: string; gitSha: string };
+      display: { headline: string; updatesNotice: string };
+    }>("diagnostics.export", {});
+    expect(helloRes.ok && exportRes.ok).toBe(true);
+    if (helloRes.ok && exportRes.ok) {
+      expect(exportRes.value.appInfo).toEqual(helloRes.value);
+      expect(exportRes.value.display.updatesNotice).toBe("本地开发构建，不检查更新");
+    }
+  });
 });

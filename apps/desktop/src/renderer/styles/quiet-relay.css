@@ -1119,6 +1119,7 @@ button {
   gap: 4px;
   overflow-y: auto;
   flex: 1;
+  min-height: 120px;
 }
 
 .session-item {
@@ -1599,6 +1600,9 @@ button {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  flex-shrink: 0;
+  max-height: 220px;
+  overflow-y: auto;
 }
 
 .session-details-heading {
