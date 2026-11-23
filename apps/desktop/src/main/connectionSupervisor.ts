@@ -1,6 +1,9 @@
 import type {
   ActivityEventPayload,
   ActiveChatRef,
+  ApprovalHighRiskSheetRequest,
+  ApprovalRespondResult,
+  ApprovalTopicSnapshot,
   BackgroundNotificationKind,
   BridgeEvent,
   BridgeScope,
@@ -33,7 +36,10 @@ import type {
   TranscriptPatchPayload,
 } from "@hermes/contracts";
 import {
+  ApprovalAndRecoveryCoordinator,
   aggregateConnectionHealth,
+  assertApprovalDismissPayloadSafe,
+  assertApprovalRespondPayloadSafe,
   buildSafeBackgroundNotification,
   CAPABILITY_DOMAIN_CATALOG,
   computeFullJitterBackoffMs,
@@ -50,7 +56,11 @@ import {
   resolveExplicitMethodAlias,
   toSupportedChatActions,
   validateRemoteEndpointUrl,
+  type ApprovalIngestInput,
   type ClassifiedRuntimeCapabilities,
+  type GatewayApprovalPayload,
+  type GatewayApprovalRespondOutcome,
+  type GatewayApprovalRespondPayload,
   type HostCommandHandler,
 } from "@hermes/domain";
 import type { ChatSessionStateStore } from "./chatSessionStateStore";
@@ -89,6 +99,7 @@ export interface ConnectionSupervisorOptions {
   clearTimer?: (handle: ReturnType<typeof setTimeout>) => void;
   isAppForeground?: () => boolean;
   onBackgroundNotification?: (notification: SafeBackgroundNotification) => void;
+  confirmHighRiskApproval?: (request: ApprovalHighRiskSheetRequest) => Promise<boolean>;
   maxConcurrentDials?: number;
 }
 
@@ -315,6 +326,10 @@ export class ConnectionSupervisor {
   private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void;
   private readonly isAppForeground: () => boolean;
   private readonly onBackgroundNotification?: (notification: SafeBackgroundNotification) => void;
+  private readonly confirmHighRiskApproval: (
+    request: ApprovalHighRiskSheetRequest,
+  ) => Promise<boolean>;
+  private readonly approvalCoordinator: ApprovalAndRecoveryCoordinator;
   private readonly maxConcurrentDials: number;
 
   private revision = 1;
@@ -324,6 +339,7 @@ export class ConnectionSupervisor {
   private disposed = false;
   private shuttingDown = false;
   private suspended = false;
+  private approvalExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
   private localHealth: ConnectionHealthSummary;
   private readonly remoteHealth = new Map<string, ConnectionHealthSummary>();
@@ -331,6 +347,7 @@ export class ConnectionSupervisor {
   private readonly linksByKey = new Map<string, ConnectionLinkState>();
   private readonly profilesByConnection = new Map<string, ProfileSummary[]>();
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
+  private readonly sessionCwdByScope = new Map<string, string>();
   private readonly transcripts = new Map<string, SessionTranscriptSnapshot>();
   private readonly transports = new Map<string, GatewayTransportEntry>();
   private readonly connectingByKey = new Map<string, Promise<SupervisorConnectResult>>();
@@ -355,7 +372,20 @@ export class ConnectionSupervisor {
     this.clearTimer = options?.clearTimer ?? ((handle) => clearTimeout(handle));
     this.isAppForeground = options?.isAppForeground ?? (() => true);
     this.onBackgroundNotification = options?.onBackgroundNotification;
+    this.confirmHighRiskApproval = options?.confirmHighRiskApproval ?? (async () => false);
     this.maxConcurrentDials = Math.max(1, options?.maxConcurrentDials ?? 4);
+    this.approvalCoordinator = new ApprovalAndRecoveryCoordinator({
+      now: this.now,
+      confirmHighRiskApproval: (req) => this.confirmHighRiskApproval(req),
+      sendApprovalRespond: (payload) => this.sendApprovalRespondOverGateway(payload),
+      fetchPendingApprovals: (scope) =>
+        this.fetchPendingApprovalsFromGateway(scope.connectionId, scope.profileId),
+      onChange: (snap) => {
+        this.syncApprovalNeedsInputToSessions(snap);
+        this.scheduleApprovalExpiryCheck();
+        this.emitTopic("approval", null, "patch", snap);
+      },
+    });
     this.localHealth = {
       connectionId: "local",
       label: this.getLocalLabel(),
@@ -379,6 +409,7 @@ export class ConnectionSupervisor {
         ...(saved.lastActiveChat.sessionId ? { sessionId: saved.lastActiveChat.sessionId } : {}),
       };
       this.activeSessionId = saved.lastActiveChat.sessionId ?? null;
+      this.approvalCoordinator.setActiveScope(this.activeScope);
     }
 
     if (this.registryStore) {
@@ -1159,6 +1190,12 @@ export class ConnectionSupervisor {
         this.transcripts.delete(key);
       }
     }
+    for (const key of [...this.sessionCwdByScope.keys()]) {
+      if (key.startsWith(`${connectionId}::`)) {
+        this.sessionCwdByScope.delete(key);
+      }
+    }
+    this.approvalCoordinator.onScopeRemoved({ connectionId });
     if (this.activeScope?.connectionId === connectionId) {
       const localProfiles = this.profilesByConnection.get("local") ?? [];
       if (this.localHealth.actual === "ready" || localProfiles.length > 0) {
@@ -1183,6 +1220,7 @@ export class ConnectionSupervisor {
       }
       this.syncChatStateWithSnapshot();
     }
+    this.approvalCoordinator.setActiveScope(this.activeScope);
     this.emitFleet();
   }
 
@@ -1346,10 +1384,19 @@ export class ConnectionSupervisor {
       (t) => t.connectionId === connectionId && !t.disposed && t.client.isOpen(),
     );
     if (!hasRemaining) {
+      this.approvalCoordinator.onConnectionOffline(
+        connectionId,
+        entry.transportMode === "shared-host-scope" ? undefined : entry.defaultProfileId,
+      );
       if (connectionId === "local" || this.activeScope?.connectionId === connectionId) {
         this.capabilityRegistry.invalidate({ reason: "transport_closed" });
         this.emitCapabilities();
       }
+    } else if (
+      entry.transportMode === "per-profile" &&
+      !this.getTransport(connectionId, entry.defaultProfileId)
+    ) {
+      this.approvalCoordinator.onConnectionOffline(connectionId, entry.defaultProfileId);
     }
 
     if (entry.kind === "local" && entry.dial) {
@@ -1625,6 +1672,7 @@ export class ConnectionSupervisor {
         message: getCopy(endpointCheck.messageKey),
       });
       this.syncProfileAndConnectionProjections(connectionId);
+      this.approvalCoordinator.setActiveScope(this.activeScope);
       this.emitFleet(connectionId);
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
@@ -1689,6 +1737,7 @@ export class ConnectionSupervisor {
         message: getCopy("remote.authRequiredBody"),
       });
       this.syncProfileAndConnectionProjections(connectionId);
+      this.approvalCoordinator.setActiveScope(this.activeScope);
       this.emitFleet(connectionId);
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
@@ -1825,7 +1874,7 @@ export class ConnectionSupervisor {
     let subscribedToGateway = false;
     try {
       await client.call("subscribe", {
-        topics: ["session.transcript", "prompt", "activity", "sessions", "profiles"],
+        topics: ["session.transcript", "prompt", "activity", "sessions", "profiles", "approval"],
       });
       subscribedToGateway = true;
     } catch {
@@ -1865,8 +1914,8 @@ export class ConnectionSupervisor {
         this.updateReadyLinksLatency(connectionId, rtt);
       }
     });
-    entry.unsubNotification = client.onNotification((method, params) => {
-      this.handleGatewayNotification(entry, method, params);
+    entry.unsubNotification = client.onNotification((method, params, serverRequestId) => {
+      this.handleGatewayNotification(entry, method, params, serverRequestId);
     });
     entry.unsubClose = client.onClose((reason) => {
       if (this.disposed || entry.disposed || reason === "client_closed") return;
@@ -1909,6 +1958,8 @@ export class ConnectionSupervisor {
       this.markLinkReady(connectionId, activeProfileId, latencyMs);
     }
     const sessions = await this.refreshSessionsForProfile(entry, activeProfileId);
+    this.approvalCoordinator.onOwnerGenerationChanged(connectionId, entry.ownerGeneration);
+    await this.rehydrateApprovalsOnConnect(entry, activeProfileId);
 
     if (
       options?.activate ||
@@ -1922,6 +1973,7 @@ export class ConnectionSupervisor {
         ...(initialSessionId ? { sessionId: initialSessionId } : {}),
       };
       this.activeSessionId = initialSessionId;
+      this.approvalCoordinator.setActiveScope(this.activeScope);
       if (this.chatSessionStateStore) {
         this.chatSessionStateStore.recordActiveChat({
           connectionId,
@@ -2288,6 +2340,7 @@ export class ConnectionSupervisor {
         errorCode: "auth_failed",
       });
       this.syncProfileAndConnectionProjections(connectionId);
+      this.approvalCoordinator.setActiveScope(this.activeScope);
       this.emitFleet(connectionId);
       return { ok: false, fleet: this.getFleetSnapshot() };
     }
@@ -2417,7 +2470,7 @@ export class ConnectionSupervisor {
     let subscribedToGateway = false;
     try {
       await client.call("subscribe", {
-        topics: ["session.transcript", "prompt", "activity", "sessions", "profiles"],
+        topics: ["session.transcript", "prompt", "activity", "sessions", "profiles", "approval"],
       });
       subscribedToGateway = true;
     } catch {
@@ -2459,8 +2512,8 @@ export class ConnectionSupervisor {
       }
     });
 
-    entry.unsubNotification = client.onNotification((method, notifParams) => {
-      this.handleGatewayNotification(entry, method, notifParams);
+    entry.unsubNotification = client.onNotification((method, notifParams, serverRequestId) => {
+      this.handleGatewayNotification(entry, method, notifParams, serverRequestId);
     });
 
     entry.unsubClose = client.onClose((reason) => {
@@ -2510,6 +2563,12 @@ export class ConnectionSupervisor {
 
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
+    this.approvalCoordinator.onOwnerGenerationChanged(
+      connectionId,
+      entry.ownerGeneration,
+      entry.transportMode === "shared-host-scope" ? undefined : dial.profileId,
+    );
+    await this.rehydrateApprovalsOnConnect(entry, dial.profileId);
 
     // Resync existing transcripts for dialed profile on reconnect
     for (const tx of this.transcripts.values()) {
@@ -2529,6 +2588,7 @@ export class ConnectionSupervisor {
       for (const otherLink of enabledOtherProfiles) {
         await this.activateOrRefreshProfileOnSharedTransport(entry, otherLink.profileId, {
           resyncTranscripts: true,
+          rehydrateApprovals: true,
         });
       }
     }
@@ -2546,6 +2606,7 @@ export class ConnectionSupervisor {
       ) {
         await this.activateOrRefreshProfileOnSharedTransport(entry, savedActive.profileId, {
           resyncTranscripts: true,
+          rehydrateApprovals: true,
         });
       }
 
@@ -2627,6 +2688,7 @@ export class ConnectionSupervisor {
     }
 
     this.syncProfileAndConnectionProjections(connectionId);
+    this.approvalCoordinator.setActiveScope(this.activeScope);
     this.emitFleet(connectionId);
     return {
       ok: true,
@@ -2637,16 +2699,20 @@ export class ConnectionSupervisor {
   private async activateOrRefreshProfileOnSharedTransport(
     entry: GatewayTransportEntry,
     profileId: string,
-    options?: { resyncTranscripts?: boolean },
+    options?: { resyncTranscripts?: boolean; rehydrateApprovals?: boolean },
   ): Promise<boolean> {
     const connectionId = entry.connectionId;
     const link = this.ensureLinkState(connectionId, profileId, "enabled");
+    const wasReady = link.actual === "ready";
     if (!this.suspended) {
       link.desired = "enabled";
       link.wasDesiredBeforeSuspend = true;
     }
 
     await this.refreshSessionsForProfile(entry, profileId);
+    if (options?.rehydrateApprovals || !wasReady) {
+      await this.rehydrateApprovalsOnConnect(entry, profileId);
+    }
     const updatedLink = this.ensureLinkState(connectionId, profileId, "enabled");
     if (updatedLink.actual === "blocked" && updatedLink.unavailableCode === "profile_unavailable") {
       return false;
@@ -2849,6 +2915,13 @@ export class ConnectionSupervisor {
           link.unavailableCode = undefined;
           link.message = undefined;
           this.sessionsByScope.delete(scopeKey(connectionId, link.profileId));
+          const cwdPrefix = `${connectionId}::${link.profileId}::`;
+          for (const key of [...this.sessionCwdByScope.keys()]) {
+            if (key.startsWith(cwdPrefix)) {
+              this.sessionCwdByScope.delete(key);
+            }
+          }
+          this.approvalCoordinator.onScopeRemoved({ connectionId, profileId: link.profileId });
           const perProfileKey = `${connectionId}::profile:${link.profileId}`;
           const perProfileEntry = this.transports.get(perProfileKey);
           if (perProfileEntry) {
@@ -2928,7 +3001,16 @@ export class ConnectionSupervisor {
     }
 
     const mapped = rawList
-      .map((item) => mapRawSession(item, connectionId, profileId))
+      .map((item) => {
+        const s = mapRawSession(item, connectionId, profileId);
+        if (s && s.profileId === profileId) {
+          this.extractAndStoreSessionCwd(connectionId, profileId, s.sessionId, item);
+          if (this.approvalCoordinator.hasPendingForSession(connectionId, profileId, s.sessionId)) {
+            return { ...s, needsInput: true };
+          }
+        }
+        return s;
+      })
       .filter((item): item is SessionSummary => item !== null && item.profileId === profileId);
 
     this.sessionsByScope.set(scopeKey(connectionId, profileId), mapped);
@@ -3030,6 +3112,18 @@ export class ConnectionSupervisor {
         if (isJsonRpcMethodNotFound(err)) {
           entry.capabilities.sessionTranscript = false;
         }
+      }
+    }
+
+    if (rawResult) {
+      this.extractAndStoreSessionCwd(connectionId, profileId, sessionId, rawResult);
+      if (rawResult.session && typeof rawResult.session === "object") {
+        this.extractAndStoreSessionCwd(
+          connectionId,
+          profileId,
+          sessionId,
+          rawResult.session as Record<string, unknown>,
+        );
       }
     }
 
@@ -3299,6 +3393,7 @@ export class ConnectionSupervisor {
     entry: GatewayTransportEntry,
     method: string,
     params: Record<string, unknown>,
+    serverRequestId?: string | number,
   ): void {
     if (this.disposed || this.shuttingDown || entry.disposed) return;
     const currentEntry = this.transports.get(entry.key);
@@ -3321,9 +3416,24 @@ export class ConnectionSupervisor {
             : entry.authorityEpoch;
       entry.authorityEpoch = nextEpoch;
       const targetProfileId =
-        this.activeScope?.connectionId === connectionId
+        entry.transportMode === "shared-host-scope" && this.activeScope?.connectionId === connectionId
           ? (this.activeScope.profileId ?? entry.defaultProfileId)
           : entry.defaultProfileId;
+      this.approvalCoordinator.onConnectionOffline(
+        connectionId,
+        entry.transportMode === "shared-host-scope" ? undefined : entry.defaultProfileId,
+      );
+      const profilesToResync = new Set<string>([targetProfileId]);
+      if (entry.transportMode === "shared-host-scope") {
+        for (const link of this.getLinksForConnection(connectionId)) {
+          if (link.desired === "enabled") {
+            profilesToResync.add(link.profileId);
+          }
+        }
+      }
+      for (const pid of profilesToResync) {
+        void this.resyncApprovalsForEntry(entry, pid);
+      }
       this.capabilityRegistry.invalidate({
         reason: method,
         authorityEpoch: nextEpoch,
@@ -3351,9 +3461,10 @@ export class ConnectionSupervisor {
     if (incomingEpoch !== undefined && incomingEpoch !== entry.authorityEpoch) {
       entry.authorityEpoch = incomingEpoch;
       const targetProfileId =
-        this.activeScope?.connectionId === connectionId
+        entry.transportMode === "shared-host-scope" && this.activeScope?.connectionId === connectionId
           ? (this.activeScope.profileId ?? entry.defaultProfileId)
           : entry.defaultProfileId;
+      void this.resyncApprovalsForEntry(entry, targetProfileId);
       this.capabilityRegistry.invalidate({
         reason: "authority_epoch_changed",
         authorityEpoch: incomingEpoch,
@@ -3376,8 +3487,14 @@ export class ConnectionSupervisor {
       asString(params.profile_id ?? params.profileId, entry.defaultProfileId).trim() ||
       entry.defaultProfileId;
     const resolvedProfileId = this.findProfileIdForSession(connectionId, sessionId) ?? profileId;
+    if (entry.transportMode === "per-profile" && resolvedProfileId !== entry.defaultProfileId) {
+      return;
+    }
 
     if (method === "approval.requested" || method === "approval.pending") {
+      this.approvalCoordinator.receive(
+        this.toApprovalIngestInput(params, entry, resolvedProfileId, serverRequestId),
+      );
       this.notifyBackgroundEventForTest({
         kind: "approval_pending",
         scope: {
@@ -3387,6 +3504,52 @@ export class ConnectionSupervisor {
         },
         rawPayload: params,
       });
+      return;
+    }
+
+    if (
+      method === "approval.resolved" ||
+      method === "approval.settled_elsewhere" ||
+      method === "approval.settled"
+    ) {
+      const approvalId = asString(
+        params.approval_id ?? params.approvalId ?? params.prompt_id ?? params.promptId,
+      ).trim();
+      if (approvalId) {
+        const turnId = asString(params.turn_id ?? params.turnId).trim() || undefined;
+        const execGen =
+          typeof params.execution_generation === "number"
+            ? params.execution_generation
+            : typeof params.executionGeneration === "number"
+              ? params.executionGeneration
+              : undefined;
+        this.approvalCoordinator.markSettledElsewhereByServer({
+          connectionId,
+          profileId: resolvedProfileId,
+          ...(sessionId ? { sessionId } : {}),
+          approvalId,
+          ...(turnId ? { turnId } : {}),
+          ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+          reason: asString(params.reason ?? params.message) || undefined,
+        });
+      }
+      return;
+    }
+
+    if (method === "approval.expired") {
+      const approvalId = asString(
+        params.approval_id ?? params.approvalId ?? params.prompt_id ?? params.promptId,
+      ).trim();
+      if (approvalId) {
+        const turnId = asString(params.turn_id ?? params.turnId).trim() || undefined;
+        this.approvalCoordinator.markExpired({
+          connectionId,
+          profileId: resolvedProfileId,
+          approvalId,
+          ...(sessionId ? { sessionId } : {}),
+          ...(turnId ? { turnId } : {}),
+        });
+      }
       return;
     }
 
@@ -3755,6 +3918,16 @@ export class ConnectionSupervisor {
           revision: rev,
           payload: this.getChatStateProjection(),
         });
+      } else if (topic === "approval") {
+        this.approvalCoordinator.onExpiryTick(this.now());
+        listener({
+          topic,
+          scope: null,
+          kind: "snapshot",
+          seq: 0,
+          revision: rev,
+          payload: this.approvalCoordinator.snapshot(),
+        });
       }
     });
 
@@ -3786,7 +3959,10 @@ export class ConnectionSupervisor {
     | "chatState.exportMissingSession"
     | "chatState.dismissMissingSession"
     | "config.get"
-    | "config.update",
+    | "config.update"
+    | "approvals.list"
+    | "approvals.respond"
+    | "approvals.dismissOrphaned",
     HostCommandHandler
   > = {
     "capabilities.describe": async (payload, scope) => {
@@ -3937,6 +4113,7 @@ export class ConnectionSupervisor {
         }
       }
       this.syncProfileAndConnectionProjections(connectionId);
+      this.approvalCoordinator.setActiveScope(this.activeScope);
       this.emitFleet(connectionId);
       return {
         ok: connectRes.ok && link.actual !== "blocked",
@@ -3978,6 +4155,7 @@ export class ConnectionSupervisor {
         ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
       };
       this.activeSessionId = resolvedSessionId;
+      this.approvalCoordinator.setActiveScope(this.activeScope);
       if (this.chatSessionStateStore) {
         this.chatSessionStateStore.recordActiveChat({
           connectionId,
@@ -4065,6 +4243,8 @@ export class ConnectionSupervisor {
         sessionId: created.sessionId,
       };
       this.activeSessionId = created.sessionId;
+      this.approvalCoordinator.setActiveScope(this.activeScope);
+      this.extractAndStoreSessionCwd(connectionId, profileId, created.sessionId, rawSession);
       if (this.chatSessionStateStore) {
         this.chatSessionStateStore.recordActiveChat({
           connectionId,
@@ -4481,7 +4661,371 @@ export class ConnectionSupervisor {
         throw makeBridgeError("internal", "更新配置失败");
       }
     },
+
+    "approvals.list": async (): Promise<ApprovalTopicSnapshot> => {
+      this.assertNotShuttingDown();
+      this.approvalCoordinator.onExpiryTick(this.now());
+      return this.approvalCoordinator.snapshot();
+    },
+
+    "approvals.respond": async (payload): Promise<ApprovalRespondResult> => {
+      this.assertNotShuttingDown();
+      this.approvalCoordinator.onExpiryTick(this.now());
+      const { approvalKey, choice } = assertApprovalRespondPayloadSafe(payload);
+      return await this.approvalCoordinator.respond(approvalKey, choice);
+    },
+
+    "approvals.dismissOrphaned": async (payload): Promise<ApprovalTopicSnapshot> => {
+      this.assertNotShuttingDown();
+      const { approvalKey } = assertApprovalDismissPayloadSafe(payload);
+      return this.approvalCoordinator.dismissOrphaned(approvalKey);
+    },
   };
+
+  private extractAndStoreSessionCwd(
+    connectionId: string,
+    profileId: string,
+    sessionId: string,
+    raw: Record<string, unknown>,
+  ): void {
+    const candidate = asString(
+      raw.cwd ?? raw.working_directory ?? raw.workingDirectory ?? raw.workdir,
+    ).trim();
+    if (candidate) {
+      this.sessionCwdByScope.set(transcriptKey(connectionId, profileId, sessionId), candidate);
+    }
+  }
+
+  private buildMainApprovalContext(
+    connectionId: string,
+    profileId: string,
+    sessionId: string,
+    ownerGeneration: number,
+    authorityEpoch: number,
+    connectionOnline: boolean,
+  ): ApprovalIngestInput["main"] {
+    const health = this.getConnectionHealth(connectionId);
+    const profiles = this.profilesByConnection.get(connectionId) ?? [];
+    const profile = profiles.find((p) => p.profileId === profileId);
+    const sessions = this.sessionsByScope.get(scopeKey(connectionId, profileId)) ?? [];
+    const session = sessions.find((s) => s.sessionId === sessionId);
+    const cwd = sessionId
+      ? (this.sessionCwdByScope.get(transcriptKey(connectionId, profileId, sessionId)) ?? null)
+      : null;
+
+    return {
+      connectionLabel: health?.label ?? (connectionId === "local" ? this.getLocalLabel() : connectionId),
+      connectionKind: health?.kind ?? (connectionId === "local" ? "local" : "remote"),
+      hostDisplay: health?.originDisplay ?? "",
+      profileDisplayName: profile?.displayName ?? (profileId || null),
+      sessionTitle: session?.title ?? null,
+      cwd,
+      ownerGeneration,
+      authorityEpoch,
+      connectionOnline,
+    };
+  }
+
+  private toGatewayApprovalPayload(
+    raw: Record<string, unknown>,
+    connectionId: string,
+    defaultProfileId: string,
+    serverRequestId?: string | number,
+  ): GatewayApprovalPayload {
+    const profileId =
+      asString(raw.profile_id ?? raw.profileId, defaultProfileId).trim() || defaultProfileId;
+    const sessionId = asString(raw.session_id ?? raw.sessionId).trim();
+    const approvalId = asString(
+      raw.approval_id ?? raw.approvalId ?? raw.prompt_id ?? raw.promptId,
+    ).trim();
+    const turnId = asString(raw.turn_id ?? raw.turnId).trim() || null;
+    const executionGeneration =
+      typeof raw.execution_generation === "number"
+        ? raw.execution_generation
+        : typeof raw.executionGeneration === "number"
+          ? raw.executionGeneration
+          : null;
+    const rawCmd = raw.command ?? raw.cmd;
+    const command = typeof rawCmd === "string" ? rawCmd : null;
+    const description = asString(raw.description ?? raw.summary ?? raw.reason);
+    const choices = Array.isArray(raw.choices) ? raw.choices.map((c) => String(c)) : undefined;
+    const rawGrant =
+      raw.persistent_grant && typeof raw.persistent_grant === "object"
+        ? (raw.persistent_grant as Record<string, unknown>)
+        : raw.persistentGrant && typeof raw.persistentGrant === "object"
+          ? (raw.persistentGrant as Record<string, unknown>)
+          : null;
+    const persistentGrant = rawGrant
+      ? {
+          pattern: asString(rawGrant.pattern),
+          scope: asString(rawGrant.scope),
+          revokeHint: asString(rawGrant.revoke_hint ?? rawGrant.revokeHint),
+        }
+      : undefined;
+    const rawRisks = raw.risk_categories ?? raw.riskCategories;
+    const riskCategories = Array.isArray(rawRisks) ? rawRisks.map((r) => String(r)) : undefined;
+    const reqId =
+      serverRequestId !== undefined
+        ? serverRequestId
+        : typeof raw.server_request_id === "string" || typeof raw.server_request_id === "number"
+          ? raw.server_request_id
+          : typeof raw.serverRequestId === "string" || typeof raw.serverRequestId === "number"
+            ? raw.serverRequestId
+            : undefined;
+
+    return {
+      approvalId,
+      ...(reqId !== undefined ? { serverRequestId: reqId } : {}),
+      connectionId,
+      profileId,
+      sessionId,
+      turnId,
+      executionGeneration,
+      command,
+      description,
+      ...(choices ? { choices } : {}),
+      smartDenied: Boolean(raw.smart_denied ?? raw.smartDenied),
+      smartDeniedReason: asString(raw.smart_denied_reason ?? raw.smartDeniedReason) || undefined,
+      expiresAt: asString(raw.expires_at ?? raw.expiresAt) || null,
+      ...(persistentGrant ? { persistentGrant } : {}),
+      ...(riskCategories ? { riskCategories } : {}),
+    };
+  }
+
+  private toApprovalIngestInput(
+    raw: Record<string, unknown>,
+    entry: GatewayTransportEntry,
+    defaultProfileId: string,
+    serverRequestId?: string | number,
+  ): ApprovalIngestInput {
+    const gateway = this.toGatewayApprovalPayload(
+      raw,
+      entry.connectionId,
+      defaultProfileId,
+      serverRequestId,
+    );
+    const main = this.buildMainApprovalContext(
+      entry.connectionId,
+      gateway.profileId,
+      gateway.sessionId,
+      entry.ownerGeneration,
+      entry.authorityEpoch,
+      !entry.disposed && entry.client.isOpen(),
+    );
+    return { gateway, main };
+  }
+
+  private syncApprovalNeedsInputToSessions(snap: ApprovalTopicSnapshot): void {
+    const pendingScopes = new Set<string>();
+    for (const item of snap.approvals) {
+      if (
+        item.state === "actionable" ||
+        item.state === "context_incomplete" ||
+        item.state === "unverified" ||
+        item.state === "submitting" ||
+        item.state === "delivery_unknown"
+      ) {
+        pendingScopes.add(transcriptKey(item.connectionId, item.profileId, item.sessionId));
+      }
+    }
+
+    const updatedConnections = new Set<string>();
+    const updatedProfileScopes = new Set<string>();
+    for (const [sKey, list] of this.sessionsByScope.entries()) {
+      let scopeChanged = false;
+      const nextList = list.map((s) => {
+        const nextNeeds = pendingScopes.has(transcriptKey(s.connectionId, s.profileId, s.sessionId));
+        if (s.needsInput !== nextNeeds) {
+          scopeChanged = true;
+          updatedConnections.add(s.connectionId);
+          updatedProfileScopes.add(sKey);
+          return { ...s, needsInput: nextNeeds };
+        }
+        return s;
+      });
+      if (scopeChanged) {
+        this.sessionsByScope.set(sKey, nextList);
+      }
+    }
+
+    for (const sKey of updatedProfileScopes) {
+      const [cid, pid] = sKey.split("::");
+      if (cid && pid) {
+        this.emitSessions(cid, pid);
+      }
+    }
+    for (const cid of updatedConnections) {
+      this.emitFleet(cid);
+    }
+  }
+
+  private scheduleApprovalExpiryCheck(): void {
+    if (this.approvalExpiryTimer) {
+      this.clearTimer(this.approvalExpiryTimer);
+      this.approvalExpiryTimer = null;
+    }
+    if (this.disposed || this.shuttingDown) return;
+
+    const nowMs = this.now();
+    let soonestMs: number | null = null;
+    for (const item of this.approvalCoordinator.snapshot().approvals) {
+      if (
+        item.state !== "actionable" &&
+        item.state !== "context_incomplete" &&
+        item.state !== "unverified" &&
+        item.state !== "delivery_unknown"
+      ) {
+        continue;
+      }
+      if (!item.expiresAt) continue;
+      const expMs = Date.parse(item.expiresAt);
+      if (!Number.isFinite(expMs)) continue;
+      if (expMs <= nowMs) {
+        soonestMs = nowMs;
+        break;
+      }
+      if (soonestMs === null || expMs < soonestMs) {
+        soonestMs = expMs;
+      }
+    }
+    if (soonestMs === null) return;
+    const delayMs = Math.max(5, soonestMs - nowMs);
+    this.approvalExpiryTimer = this.setTimer(() => {
+      this.approvalExpiryTimer = null;
+      if (this.disposed || this.shuttingDown) return;
+      this.approvalCoordinator.onExpiryTick(this.now());
+      this.scheduleApprovalExpiryCheck();
+    }, delayMs);
+  }
+
+  private async fetchPendingApprovalsFromGateway(
+    connectionId: string,
+    profileId: string,
+  ): Promise<ApprovalIngestInput[]> {
+    const entry = this.getTransport(connectionId, profileId);
+    if (!entry || entry.disposed || !entry.client.isOpen()) {
+      throw makeBridgeError("unreachable", "当前 Gateway 未连接，无法校验待处理 Approval");
+    }
+
+    let res: Record<string, unknown> | null = null;
+    const methods = ["approval.pending", "approval.list"] as const;
+    for (const method of methods) {
+      if (this.capabilityRegistry.isMethodRefused(method)) continue;
+      try {
+        res = await entry.client.call<Record<string, unknown>>(method, {
+          profile_id: profileId,
+        });
+        break;
+      } catch (err) {
+        if (isJsonRpcMethodNotFound(err)) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!res) return [];
+    const rawList = Array.isArray(res.approvals)
+      ? (res.approvals as Array<Record<string, unknown>>)
+      : Array.isArray(res.pending)
+        ? (res.pending as Array<Record<string, unknown>>)
+        : [];
+    return rawList.map((raw) => this.toApprovalIngestInput(raw, entry, profileId));
+  }
+
+  private async rehydrateApprovalsOnConnect(
+    entry: GatewayTransportEntry,
+    profileId: string,
+  ): Promise<void> {
+    if (this.disposed || this.shuttingDown || entry.disposed) return;
+    try {
+      const pending = await this.fetchPendingApprovalsFromGateway(entry.connectionId, profileId);
+      if (this.disposed || this.shuttingDown || entry.disposed) return;
+      this.approvalCoordinator.reconcile(
+        {
+          connectionId: entry.connectionId,
+          profileId,
+          ownerGeneration: entry.ownerGeneration,
+        },
+        pending,
+      );
+    } catch {
+      // Gateway may not implement approval.pending yet -> leave empty / stale_owner cleanly
+    }
+  }
+
+  private async resyncApprovalsForEntry(
+    entry: GatewayTransportEntry,
+    profileId: string,
+  ): Promise<void> {
+    if (this.disposed || this.shuttingDown || entry.disposed) return;
+    const expectedGen = entry.ownerGeneration;
+    try {
+      const pending = await this.fetchPendingApprovalsFromGateway(entry.connectionId, profileId);
+      if (this.disposed || this.shuttingDown || entry.disposed) return;
+      if (entry.ownerGeneration !== expectedGen) return;
+      this.approvalCoordinator.reconcile(
+        {
+          connectionId: entry.connectionId,
+          profileId,
+          ownerGeneration: expectedGen,
+        },
+        pending,
+      );
+    } catch {
+      // Keep unverified on transient resync failure
+    }
+  }
+
+  private async sendApprovalRespondOverGateway(
+    payload: GatewayApprovalRespondPayload,
+  ): Promise<GatewayApprovalRespondOutcome> {
+    const entry = this.requireTransport(payload.connectionId, payload.profileId);
+    if (entry.ownerGeneration !== payload.ownerGeneration) {
+      throw makeBridgeError("approval_stale", "所属 Gateway 连接代次已变更，旧 Approval 已失效");
+    }
+
+    try {
+      const res = await entry.client.call<Record<string, unknown>>("approval.respond", {
+        profile_id: payload.profileId,
+        session_id: payload.sessionId,
+        turn_id: payload.turnId,
+        approval_id: payload.approvalId,
+        owner_generation: payload.ownerGeneration,
+        execution_generation: payload.executionGeneration,
+        choice: payload.choice,
+        ...(payload.serverRequestId !== undefined
+          ? { server_request_id: payload.serverRequestId }
+          : {}),
+      });
+      const statusStr = asString(res?.status);
+      if (
+        statusStr === "settled_elsewhere_by_server" ||
+        statusStr === "settled_elsewhere" ||
+        statusStr === "already_settled" ||
+        Boolean(res?.settled_elsewhere ?? res?.already_resolved)
+      ) {
+        return {
+          status: "settled_elsewhere_by_server",
+          message: asString(res?.message) || undefined,
+        };
+      }
+      return {
+        status: "settled",
+        choice: payload.choice,
+      };
+    } catch (err) {
+      if (
+        err instanceof GatewayRpcError &&
+        (err.rpcCode === 409 || err.rpcCode === -32009 || err.rpcCode === -32008)
+      ) {
+        return {
+          status: "settled_elsewhere_by_server",
+        };
+      }
+      throw err;
+    }
+  }
 
   private parseGatewayConfigSnapshot(
     connectionId: string,
@@ -4591,6 +5135,10 @@ export class ConnectionSupervisor {
   async suspend(): Promise<void> {
     if (this.disposed || this.shuttingDown) return;
     this.suspended = true;
+    if (this.approvalExpiryTimer) {
+      this.clearTimer(this.approvalExpiryTimer);
+      this.approvalExpiryTimer = null;
+    }
     for (const timer of this.staggerTimers) {
       this.clearTimer(timer);
     }
@@ -4658,6 +5206,7 @@ export class ConnectionSupervisor {
     }
 
     for (const cid of connectionIds) {
+      this.approvalCoordinator.onConnectionOffline(cid);
       this.syncProfileAndConnectionProjections(cid);
       this.emitProfiles(cid);
     }
@@ -4719,7 +5268,11 @@ export class ConnectionSupervisor {
     // 1. Stop new commands & unsubscribe registry
     this.unsubRegistry?.();
 
-    // 2. Cancel all backoff, stability, and stagger timers
+    // 2. Cancel all backoff, stability, approval expiry, and stagger timers
+    if (this.approvalExpiryTimer) {
+      this.clearTimer(this.approvalExpiryTimer);
+      this.approvalExpiryTimer = null;
+    }
     for (const timer of this.staggerTimers) {
       this.clearTimer(timer);
     }

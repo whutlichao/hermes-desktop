@@ -48,7 +48,9 @@ export const HOST_COMMANDS = [
   "prompts.send",
   "prompts.stop",
   "prompts.steer",
+  "approvals.list",
   "approvals.respond",
+  "approvals.dismissOrphaned",
   "clarify.respond",
   "capabilities.describe",
   "config.get",
@@ -1136,5 +1138,112 @@ export interface GatewayConfigUpdateResult {
   ok: boolean;
   snapshot: GatewayConfigSnapshot;
   errorCode?: ErrorCode;
+}
+
+export const APPROVAL_CHOICES = ["once", "session", "always", "deny"] as const;
+export type ApprovalChoice = (typeof APPROVAL_CHOICES)[number];
+
+export const APPROVAL_RISK_CATEGORIES = [
+  "sudo",
+  "secret",
+  "vault",
+  "destructive",
+  "always",
+] as const;
+export type ApprovalRiskCategory = (typeof APPROVAL_RISK_CATEGORIES)[number];
+
+export const APPROVAL_STATES = [
+  "received",
+  "unverified",
+  "context_incomplete",
+  "actionable",
+  "submitting",
+  "settled",
+  "settled_elsewhere_by_server",
+  "delivery_unknown",
+  "stale_owner",
+  "expired",
+  "orphaned",
+] as const;
+export type ApprovalState = (typeof APPROVAL_STATES)[number];
+
+export interface ApprovalPersistentGrantInfo {
+  readonly pattern: string;
+  readonly scope: string;
+  readonly revokeHint: string;
+}
+
+export interface ApprovalView {
+  readonly approvalKey: string;
+  readonly state: ApprovalState;
+  readonly connectionId: string;
+  readonly profileId: string;
+  readonly sessionId: string;
+  readonly connectionLabel: string;
+  readonly connectionKind: ConnectionKind;
+  readonly hostDisplay: string;
+  readonly profileDisplayName: string;
+  readonly sessionTitle: string;
+  readonly turnId: string | null;
+  readonly cwd: string | null;
+  readonly ownerGeneration: number;
+  readonly authorityEpoch: number;
+  readonly executionGeneration: number;
+  readonly riskCategories: readonly ApprovalRiskCategory[];
+  readonly requiresHighRiskSheet: boolean;
+  readonly command: string | null;
+  readonly description: string;
+  readonly allowedChoices: readonly ApprovalChoice[];
+  readonly smartDenied: boolean;
+  readonly smartDeniedReason?: string;
+  readonly expiresAt: string | null;
+  readonly missingContextFields: readonly string[];
+  readonly persistentGrant?: ApprovalPersistentGrantInfo;
+  readonly isOwningSessionActive: boolean;
+  readonly inFlight: boolean;
+  readonly settledChoice?: ApprovalChoice;
+  readonly statusReason?: string;
+  readonly canApprove: boolean;
+  readonly canDeny: boolean;
+  readonly canInspect: boolean;
+  readonly canDismiss: boolean;
+  readonly updatedAt: string;
+}
+
+export interface ApprovalTopicSnapshot {
+  readonly approvals: readonly ApprovalView[];
+  readonly pendingCount: number;
+  readonly orphanedCount: number;
+}
+
+export interface ApprovalRespondRequest {
+  approvalKey: string;
+  choice: ApprovalChoice;
+}
+
+export interface ApprovalRespondResult {
+  status:
+    | "settled"
+    | "settled_elsewhere_by_server"
+    | "cancelled_pending"
+    | "delivery_unknown"
+    | "pending_reconciled";
+  approval: ApprovalView | null;
+  message?: string;
+}
+
+export interface ApprovalHighRiskSheetRequest {
+  readonly approvalKey: string;
+  readonly choice: ApprovalChoice;
+  readonly connectionLabel: string;
+  readonly connectionKind: ConnectionKind;
+  readonly hostDisplay: string;
+  readonly profileDisplayName: string;
+  readonly sessionTitle: string;
+  readonly isOwningSessionBackground: boolean;
+  readonly command: string;
+  readonly cwd: string;
+  readonly riskCategories: readonly ApprovalRiskCategory[];
+  readonly persistentGrant?: ApprovalPersistentGrantInfo;
 }
 

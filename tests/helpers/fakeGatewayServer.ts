@@ -25,6 +25,7 @@ export interface FakeGatewayServerOptions {
     title: string;
     preview?: string;
     updated_at?: string;
+    cwd?: string;
   }>;
   onRpc?: (
     method: string,
@@ -67,6 +68,8 @@ export interface FakeGatewayServerHandle {
   wsUrl: string;
   connections: FakeGatewayConnectionRecord[];
   rpcCalls: Array<{ method: string; params: Record<string, unknown> }>;
+  sendNotification: (method: string, params: Record<string, unknown>) => void;
+  sendServerRequest: (id: string | number, method: string, params: Record<string, unknown>) => void;
   closeAllClients: () => void;
   close: () => Promise<void>;
 }
@@ -358,6 +361,18 @@ export async function startFakeGatewayServer(
     wsUrl: `ws://127.0.0.1:${addr.port}/api/ws`,
     connections,
     rpcCalls,
+    sendNotification(method, params) {
+      const frame = encodeServerTextFrame(JSON.stringify({ jsonrpc: "2.0", method, params }));
+      for (const sock of activeSockets) {
+        if (!sock.destroyed) sock.write(frame);
+      }
+    },
+    sendServerRequest(id, method, params) {
+      const frame = encodeServerTextFrame(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      for (const sock of activeSockets) {
+        if (!sock.destroyed) sock.write(frame);
+      }
+    },
     closeAllClients() {
       for (const sock of activeSockets) {
         sock.destroy();
@@ -390,6 +405,7 @@ export interface FakeRemoteGatewayServerOptions {
     title: string;
     preview?: string;
     updated_at?: string;
+    cwd?: string;
   }>;
   onRpc?: FakeGatewayServerOptions["onRpc"];
 }

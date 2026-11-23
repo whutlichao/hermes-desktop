@@ -13,3 +13,4 @@ export * from "./workspace";
 export * from "./focusReturnController";
 export * from "./settingsAndScope";
 export * from "./fleetLifecycle";
+export * from "./approvalCoordinator";

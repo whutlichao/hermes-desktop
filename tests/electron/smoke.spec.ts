@@ -998,4 +998,168 @@ test.describe("Electron hardened smoke", () => {
       sandbox.cleanup(passed);
     }
   });
+
+  test("Ticket #39: Electron Main binds WS approval.requested with session cwd, enforces rail needs-input confinement, settles approval.respond, and leaks zero secrets", async () => {
+    const sandbox = createTestSandbox("hr-t39-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2"]);
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+        "prompt.submit",
+        "prompt.cancel",
+        "session.steer",
+        "approval.pending",
+        "approval.respond",
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "sess-elec-fg",
+          title: "Electron Active Session",
+          preview: "fg ready",
+          cwd: "/srv/hermes/active",
+        },
+        {
+          profile_id: "default",
+          session_id: "sess-elec-bg",
+          title: "Electron Background Session",
+          preview: "bg ready",
+          cwd: "/srv/hermes/bg",
+        },
+      ],
+      onRpc: async (method, params, { replyResult }) => {
+        if (method === "approval.pending") {
+          replyResult({ approvals: [] });
+          return true;
+        }
+        if (method === "approval.respond") {
+          replyResult({ status: "settled", choice: params.choice ?? "once" });
+          return true;
+        }
+        return false;
+      },
+    });
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+      withHostScope: false,
+    });
+    fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("load");
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+      await expect(page.locator("nav.sidebar")).toContainText("Electron Active Session");
+      // Wait for initial connect approval.pending rehydration RPC before sending live approval.requested
+      await expect
+        .poll(() => gw.rpcCalls.some((c) => c.method === "approval.pending"))
+        .toBe(true);
+
+      // Push a background session high-risk request + foreground normal request over real WS
+      gw.sendServerRequest(701, "approval.requested", {
+        approval_id: "apr-elec-bg",
+        profile_id: "default",
+        session_id: "sess-elec-bg",
+        turn_id: "turn-bg-1",
+        execution_generation: 1,
+        command: "sudo systemctl status hermes",
+        description: "Check background status",
+        choices: ["once", "deny"],
+      });
+      gw.sendServerRequest(703, "approval.requested", {
+        approval_id: "apr-elec-fg-real",
+        profile_id: "default",
+        session_id: "sess-elec-fg",
+        turn_id: "turn-fg-2",
+        execution_generation: 1,
+        command: "ls -la",
+        description: "List active workspace",
+        choices: ["once", "deny"],
+      });
+
+      // Only owning foreground session renders its approval; background approval surfaces only as needs-input badge
+      const fgCard = page.locator('[data-testid="approval-card"]').filter({ hasText: "ls -la" });
+      await expect(fgCard).toBeVisible({ timeout: 10_000 });
+      await expect(fgCard).toContainText("/srv/hermes/active");
+      await expect(fgCard.locator("input, select, textarea")).toHaveCount(0);
+      await expect(
+        page.locator('[data-testid="approval-card"]').filter({ hasText: "sudo systemctl status hermes" }),
+      ).toHaveCount(0);
+
+      const bgRow = page.locator("nav.sidebar").getByRole("button", { name: /Electron Background Session/ });
+      await expect(bgRow.getByTestId("session-needs-input-badge")).toBeVisible();
+
+      // Approve active foreground card (`once`) -> sends approval.respond with approval_id + server_request_id
+      await fgCard.getByTestId("approval-choice-once").click();
+      await expect(fgCard).toHaveAttribute("data-approval-state", "settled");
+      await expect
+        .poll(() =>
+          gw.rpcCalls.some(
+            (c) =>
+              c.method === "approval.respond" &&
+              c.params.approval_id === "apr-elec-fg-real" &&
+              c.params.server_request_id === 703 &&
+              c.params.choice === "once",
+          ),
+        )
+        .toBe(true);
+
+      // Switch to background session -> deny sudo approval (skipping native sheet since deny never needs confirm)
+      await bgRow.click();
+      const bgCard = page
+        .locator('[data-testid="approval-card"]')
+        .filter({ hasText: "sudo systemctl status hermes" });
+      await expect(bgCard).toBeVisible();
+      await expect(bgCard).toContainText("/srv/hermes/bg");
+      await expect(bgCard).toHaveAttribute("data-approval-state", "actionable");
+      await bgCard.getByTestId("approval-choice-deny").click();
+      await expect(bgCard).toHaveAttribute("data-approval-state", "settled");
+      await expect(bgRow.getByTestId("session-needs-input-badge")).toHaveCount(0);
+
+      // Verify zero ticket / wsUrl leak in DOM or diagnostics
+      const bodyText = await page.locator("body").innerText();
+      expect(bodyText).not.toContain("tkt_elec_");
+      expect(bodyText).not.toContain(gw.wsUrl);
+      const diagJson = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: { request: (cmd: string, p?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return JSON.stringify(await w.hermesHost.request("diagnostics.export", {}));
+      });
+      expect(diagJson).not.toContain("tkt_elec_");
+      expect(diagJson).not.toContain(gw.wsUrl);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

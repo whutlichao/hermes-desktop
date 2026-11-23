@@ -1,5 +1,9 @@
 import type { RefObject } from "react";
 import type {
+  ApprovalChoice,
+  ApprovalTopicSnapshot,
+  ApprovalView,
+  BridgeScope,
   ChatSessionProjection,
   ConnectionHealthSummary,
   LocalInspectResult,
@@ -9,12 +13,17 @@ import type {
   ToolExecutionRow,
 } from "@hermes/contracts";
 import { getCopy } from "@hermes/domain";
+import { ApprovalCard } from "./ApprovalCard";
 import { LocalRepairCard } from "./LocalRepairCard";
 import { MarkdownText } from "./MarkdownText";
 
 interface ChatThreadProps {
   hasReadyConnection: boolean;
   activeConnection?: ConnectionHealthSummary | null;
+  activeScope: BridgeScope | null;
+  activeSessionId: string | null;
+  approvals: ApprovalTopicSnapshot;
+  cancelledApprovalKey: string | null;
   transcript: SessionTranscriptSnapshot | null;
   chatState: ChatSessionProjection | null;
   exportedMissing: MissingSessionExport | null;
@@ -32,6 +41,9 @@ interface ChatThreadProps {
   onExportMissingSession: () => void;
   onDismissMissingSession: () => void;
   onLocalAction: (action: LocalSafeActionId) => void;
+  onRespondApproval: (approval: ApprovalView, choice: ApprovalChoice) => void;
+  onInspectApproval: (approval: ApprovalView) => void;
+  onDismissOrphanedApproval: (approval: ApprovalView) => void;
   onOpenSettings: () => void;
   onOpenPalette: () => void;
   onOpenShortcuts: () => void;
@@ -65,6 +77,10 @@ function getRoleLabel(role: "user" | "assistant" | "system"): string {
 export function ChatThread({
   hasReadyConnection,
   activeConnection,
+  activeScope,
+  activeSessionId,
+  approvals,
+  cancelledApprovalKey,
   transcript,
   chatState,
   exportedMissing,
@@ -82,11 +98,66 @@ export function ChatThread({
   onExportMissingSession,
   onDismissMissingSession,
   onLocalAction,
+  onRespondApproval,
+  onInspectApproval,
+  onDismissOrphanedApproval,
   onOpenSettings,
   onOpenPalette,
   onOpenShortcuts,
   onOpenRemoteEscape,
 }: ChatThreadProps) {
+  const owningScope = activeScope ?? chatState?.lastActiveChat ?? null;
+  const owningConnId = owningScope?.connectionId ?? null;
+  const owningProfileId = owningScope?.profileId ?? "default";
+  const owningSessionId = activeSessionId ?? owningScope?.sessionId ?? null;
+
+  const owningApprovals = approvals.approvals.filter(
+    (item) =>
+      item.state !== "orphaned" &&
+      owningConnId !== null &&
+      owningSessionId !== null &&
+      item.connectionId === owningConnId &&
+      item.profileId === owningProfileId &&
+      item.sessionId === owningSessionId,
+  );
+  const orphanedApprovals = approvals.approvals.filter((item) => item.state === "orphaned");
+
+  const approvalSections = (
+    <>
+      {owningApprovals.length > 0 && (
+        <section className="approval-section" aria-label={getCopy("approval.sectionLabel")}>
+          {owningApprovals.map((approval) => (
+            <ApprovalCard
+              key={approval.approvalKey}
+              approval={approval}
+              cancelledNotice={cancelledApprovalKey === approval.approvalKey}
+              onRespond={onRespondApproval}
+              onInspect={onInspectApproval}
+              onDismissOrphaned={onDismissOrphanedApproval}
+            />
+          ))}
+        </section>
+      )}
+      {orphanedApprovals.length > 0 && (
+        <section
+          className="approval-orphaned-section"
+          aria-label={getCopy("approval.orphanedSectionLabel")}
+        >
+          {orphanedApprovals.map((approval) => (
+            <ApprovalCard
+              key={approval.approvalKey}
+              approval={approval}
+              cancelledNotice={false}
+              onRespond={onRespondApproval}
+              onInspect={onInspectApproval}
+              onDismissOrphaned={onDismissOrphanedApproval}
+            />
+          ))}
+        </section>
+      )}
+    </>
+  );
+
   if (!hasReadyConnection) {
     const unverifiedChat = chatState?.lastKnownUnverified ? chatState.lastActiveChat : null;
     const unverifiedSummary =
@@ -153,6 +224,8 @@ export function ChatThread({
             />
           </>
         )}
+
+        {approvalSections}
 
         <form
           className="composer-shell"
@@ -243,6 +316,7 @@ export function ChatThread({
             </div>
           )}
         </section>
+        {approvalSections}
       </div>
     );
   }
@@ -316,6 +390,8 @@ export function ChatThread({
           {stopError}
         </div>
       )}
+
+      {approvalSections}
 
       {transcript && !transcript.chatAvailable ? (
         <section className="empty-relay-card chat-unavailable-card" role="status">

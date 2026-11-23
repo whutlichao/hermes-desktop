@@ -125,4 +125,29 @@ describe("Quiet Relay shell state & layout invariants", () => {
     expect(getCopy("local.escapeRemoteSsh")).toBe("改连 Remote / SSH");
     expect(getCopy("diagnostics.title")).toBe("脱敏诊断摘要");
   });
+
+  it("tracks ApprovalTopicSnapshot and approvalInspect modal surface with Esc topmost dismissal", () => {
+    let state = createInitialShellState();
+    expect(state.approvals).toEqual({ approvals: [], pendingCount: 0, orphanedCount: 0 });
+    expect(state.inspectedApprovalKey).toBeNull();
+
+    state = shellReducer(state, {
+      type: "APPLY_APPROVAL_SNAPSHOT",
+      snapshot: {
+        approvals: [],
+        pendingCount: 2,
+        orphanedCount: 1,
+      },
+    });
+    expect(state.approvals.pendingCount).toBe(2);
+    expect(state.approvals.orphanedCount).toBe(1);
+
+    state = shellReducer(state, { type: "OPEN_APPROVAL_INSPECT", approvalKey: "apr-key-1" });
+    expect(getTopmostSurface(state)).toBe("approvalInspect");
+    expect(state.inspectedApprovalKey).toBe("apr-key-1");
+
+    state = shellReducer(state, { type: "CLOSE_TOPMOST_SURFACE" });
+    expect(getTopmostSurface(state)).toBeNull();
+    expect(state.inspectedApprovalKey).toBeNull();
+  });
 });
