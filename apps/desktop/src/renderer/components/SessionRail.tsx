@@ -25,6 +25,7 @@ interface SessionRailListProps {
   showNewChatButton?: boolean;
   onCreateSession?: () => void;
   onSelectSession: (session: SessionSummary) => void;
+  onMarkSessionRead?: (session: SessionSummary) => void;
   onCopyCliCommand?: (command: string) => void;
 }
 
@@ -48,6 +49,7 @@ export function SessionRailList({
   showNewChatButton = false,
   onCreateSession,
   onSelectSession,
+  onMarkSessionRead,
   onCopyCliCommand,
 }: SessionRailListProps) {
   const [query, setQuery] = useState("");
@@ -171,8 +173,12 @@ export function SessionRailList({
         >
           {filteredSessions.map((session, idx) => {
             const isActive = session.sessionId === activeSessionId;
+            const hasBadges = session.needsInput || session.unreadCount > 0 || session.pinned;
             return (
-              <li key={`${session.connectionId}:${session.profileId}:${session.sessionId}`}>
+              <li
+                key={`${session.connectionId}:${session.profileId}:${session.sessionId}`}
+                className="session-item-row"
+              >
                 <button
                   ref={(el) => {
                     rowRefs.current[idx] = el;
@@ -187,7 +193,37 @@ export function SessionRailList({
                 >
                   <span className="session-item-title">{session.title}</span>
                   {session.preview && <span className="session-item-preview">{session.preview}</span>}
+                  {hasBadges && (
+                    <span className="session-item-badges">
+                      {session.needsInput && (
+                        <span className="status-pill is-blocked session-badge-needs-input">
+                          {getCopy("nav.needsInputBadge")}
+                        </span>
+                      )}
+                      {session.unreadCount > 0 && (
+                        <span className="status-pill is-warn session-badge-unread">
+                          {session.unreadCount} {getCopy("nav.unreadBadge")}
+                        </span>
+                      )}
+                      {session.pinned && (
+                        <span className="status-pill session-badge-pinned">
+                          {getCopy("nav.pinnedBadge")}
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </button>
+                {session.unreadCount > 0 && onMarkSessionRead && (
+                  <button
+                    type="button"
+                    className="session-mark-read-btn"
+                    data-testid={`session-mark-read-${session.sessionId}`}
+                    aria-label={`${getCopy("nav.markReadAction")}：${session.title}`}
+                    onClick={() => onMarkSessionRead(session)}
+                  >
+                    {getCopy("nav.markReadAction")}
+                  </button>
+                )}
               </li>
             );
           })}

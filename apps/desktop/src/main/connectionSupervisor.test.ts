@@ -2446,4 +2446,377 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   });
+
+
+  it("maintains bounded background session journals, unread rules, lazy active transcript fetch, resync_required replacement, and quit/restart rebuild from 0 (#37 S1/S3)", async () => {
+    const sandbox = createTestSandbox("hermes-s1-journal-37-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_j_1", "tkt_j_2", "tkt_j_3"]);
+    let ticketIdx = 1;
+    let appFocused = true;
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      initialSessions: [
+        { profile_id: "default", session_id: "s-fg", title: "Foreground" },
+        { profile_id: "default", session_id: "s-bg-progress", title: "Background Progress" },
+        { profile_id: "default", session_id: "s-bg-overflow", title: "Background Overflow" },
+      ],
+    });
+
+    gw.setTranscriptMessages("s-bg-overflow", [
+      {
+        message_id: "gw-clean-1",
+        role: "assistant",
+        text: "clean full gateway transcript after overflow",
+        created_at: "2026-11-23T10:00:00Z",
+      },
+    ]);
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+          else validTickets.add(`tkt_dyn_${++ticketIdx}`);
+        }
+        return res;
+      };
+
+      const chatStore = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const backend = new LocalBackendManager(ports);
+      const supervisor1 = new LocalConnectionSupervisor(backend, {
+        chatSessionStateStore: chatStore,
+        isAppForeground: () => appFocused,
+      });
+
+      await supervisor1.connectLocal("default");
+
+      // Only s-fg transcript may have been requested — zero background transcript RPCs
+      const initialTxCalls = gw.rpcCalls.filter(
+        (c) => c.method === "session.resume" || c.method === "session.transcript",
+      );
+      expect(initialTxCalls.every((c) => c.params.session_id === "s-fg")).toBe(true);
+
+      const fgTranscriptEvents: Array<{ kind: string; payload: unknown }> = [];
+      const unsubFg = supervisor1.subscribe(
+        "session.transcript",
+        { connectionId: "local", profileId: "default", sessionId: "s-fg" },
+        (ev) => fgTranscriptEvents.push({ kind: ev.kind, payload: ev.payload }),
+      );
+      await new Promise((r) => setTimeout(r, 20));
+      fgTranscriptEvents.length = 0;
+
+      // Background session receives token deltas (0 unread), tool running (0 unread), tool completed (+1), turn completed (+1), approval (+needsInput)
+      for (let i = 1; i <= 5; i += 1) {
+        gw.sendNotification("prompt.delta", {
+          session_id: "s-bg-progress",
+          turn_id: "t-bg-1",
+          message_id: "m-bg-1",
+          delta: `tok-${i} `,
+          seq: i,
+        });
+      }
+      gw.sendNotification("tool.execution", {
+        session_id: "s-bg-progress",
+        turn_id: "t-bg-1",
+        tool_call_id: "tc-bg-1",
+        name: "shell",
+        status: "running",
+        seq: 6,
+      });
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Still zero unread from token deltas or running tool, and zero patches leaked to s-fg subscriber
+      expect(fgTranscriptEvents).toHaveLength(0);
+      let bgSummary = supervisor1
+        .getFleetSnapshot()
+        .sessions.find((s) => s.sessionId === "s-bg-progress");
+      expect(bgSummary?.unreadCount).toBe(0);
+
+      gw.sendNotification("tool.execution", {
+        session_id: "s-bg-progress",
+        turn_id: "t-bg-1",
+        tool_call_id: "tc-bg-1",
+        name: "shell",
+        status: "completed",
+        summary: "10 passed",
+        seq: 7,
+      });
+      gw.sendNotification("prompt.completed", {
+        session_id: "s-bg-progress",
+        turn_id: "t-bg-1",
+        message_id: "m-bg-1",
+        seq: 8,
+      });
+      gw.sendNotification("approval.requested", {
+        session_id: "s-bg-progress",
+        turn_id: "t-bg-1",
+        approval_id: "appr-1",
+      });
+      await new Promise((r) => setTimeout(r, 40));
+
+      bgSummary = supervisor1
+        .getFleetSnapshot()
+        .sessions.find((s) => s.sessionId === "s-bg-progress");
+      expect(bgSummary?.unreadCount).toBe(2);
+      expect(bgSummary?.needsInput).toBe(true);
+      expect(bgSummary?.pinned).toBe(true);
+
+      // Still NEVER fetched full transcript for background sessions
+      const bgTxCallsBeforeSwitch = gw.rpcCalls.filter(
+        (c) =>
+          (c.method === "session.resume" || c.method === "session.transcript") &&
+          c.params.session_id !== "s-fg",
+      );
+      expect(bgTxCallsBeforeSwitch).toHaveLength(0);
+
+      // Explicit markRead clears unread on background session without switching away from s-fg
+      await supervisor1.handlers["sessions.markRead"](
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-progress" },
+        null,
+      );
+      bgSummary = supervisor1
+        .getFleetSnapshot()
+        .sessions.find((s) => s.sessionId === "s-bg-progress");
+      expect(bgSummary?.unreadCount).toBe(0);
+      expect(bgSummary?.needsInput).toBe(true);
+      expect(bgSummary?.pinned).toBe(true); // still pinned by pending approval
+      expect(supervisor1.getFleetSnapshot().activeSessionId).toBe("s-fg");
+
+      // Focus gating on active session: unfocused window accumulates unread, focused advances lastReadSeq
+      appFocused = false;
+      gw.sendNotification("prompt.completed", {
+        session_id: "s-fg",
+        turn_id: "t-fg-unfocused",
+        message_id: "m-fg-1",
+        seq: 1,
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(
+        supervisor1.getFleetSnapshot().sessions.find((s) => s.sessionId === "s-fg")?.unreadCount,
+      ).toBe(1);
+
+      await supervisor1.handlers["sessions.markRead"](
+        { connectionId: "local", profileId: "default", sessionId: "s-fg" },
+        null,
+      );
+      expect(
+        supervisor1.getFleetSnapshot().sessions.find((s) => s.sessionId === "s-fg")?.unreadCount,
+      ).toBe(0);
+
+      appFocused = true;
+      unsubFg();
+
+      // Overflow s-bg-overflow (> 2,000 events) while still in background
+      for (let i = 1; i <= 2_005; i += 1) {
+        gw.sendNotification("prompt.delta", {
+          session_id: "s-bg-overflow",
+          turn_id: "t-ovf",
+          message_id: "m-ovf",
+          delta: "d",
+          seq: i,
+        });
+      }
+      // Wait for WS notifications to process
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Still zero RPC fetches for s-bg-overflow until user switches to it!
+      expect(
+        gw.rpcCalls.some(
+          (c) =>
+            (c.method === "session.resume" || c.method === "session.transcript") &&
+            c.params.session_id === "s-bg-overflow",
+        ),
+      ).toBe(false);
+
+      // Select s-bg-overflow and subscribe -> must emit resync_required, then sessions.resume({ resync: true }) whole-replaces cleanly
+      const ovfEvents: Array<{ kind: string; payload: unknown }> = [];
+      const selectRes = (await supervisor1.handlers["sessions.select"](
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
+      )) as { resyncRequired?: boolean; transcript: unknown };
+
+      const unsubOvf = supervisor1.subscribe(
+        "session.transcript",
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
+        (ev) => ovfEvents.push({ kind: ev.kind, payload: ev.payload }),
+      );
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(selectRes.resyncRequired || ovfEvents.some((e) => e.kind === "resync_required")).toBe(
+        true,
+      );
+
+      const resumed = (await supervisor1.handlers["sessions.resume"](
+        { resync: true },
+        { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
+      )) as {
+        transcript: {
+          sessionId: string;
+          resynced?: boolean;
+          messages: Array<{ messageId: string; text: string }>;
+        };
+      };
+      expect(resumed.transcript.resynced).toBe(true);
+      expect(resumed.transcript.messages).toHaveLength(1);
+      expect(resumed.transcript.messages[0]).toMatchObject({
+        messageId: "gw-clean-1",
+        text: "clean full gateway transcript after overflow",
+      });
+      unsubOvf();
+
+      // Re-create unread before Quit to verify Quit clears & Restart rebuilds unread from 0
+      gw.sendNotification("prompt.completed", {
+        session_id: "s-fg",
+        turn_id: "t-fg-before-quit",
+        message_id: "m-fg-q",
+        seq: 99,
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(
+        supervisor1.getFleetSnapshot().sessions.find((s) => s.sessionId === "s-fg")?.unreadCount,
+      ).toBe(1);
+
+      await supervisor1.shutdown();
+      const chatStore2 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const supervisor2 = new LocalConnectionSupervisor(backend, {
+        chatSessionStateStore: chatStore2,
+      });
+      await supervisor2.connectLocal("default");
+      const rebuiltSessions = supervisor2.getFleetSnapshot().sessions;
+      expect(rebuiltSessions.every((s) => s.unreadCount === 0)).toBe(true);
+
+      await supervisor2.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("enforces per-scope 16 LRU eviction with pinned immunity (queuedAdmission / pendingInput / unread / runningTurn), 4 MiB byte cap, and seq gap resync (#37 S1)", async () => {
+    const sandbox = createTestSandbox("hermes-s1-lru-37-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_lru_1"]);
+
+    const initialSessions: Array<{ profile_id: string; session_id: string; title: string }> = [
+      { profile_id: "default", session_id: "s-active", title: "Active" },
+      { profile_id: "default", session_id: "s-pin-running", title: "Pin Running" },
+      { profile_id: "default", session_id: "s-pin-clarify", title: "Pin Clarify" },
+      { profile_id: "default", session_id: "s-pin-unread", title: "Pin Unread" },
+      { profile_id: "default", session_id: "s-pin-queued", title: "Pin Queued" },
+      { profile_id: "default", session_id: "s-gap", title: "Seq Gap" },
+      { profile_id: "default", session_id: "s-bytes", title: "Byte Limit" },
+    ];
+    for (let i = 1; i <= 14; i += 1) {
+      initialSessions.push({ profile_id: "default", session_id: `u-${i}`, title: `Unpinned ${i}` });
+    }
+
+    const gw = await startFakeGatewayServer({ validTickets, initialSessions });
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      const backend = new LocalBackendManager(ports);
+      const supervisor = new LocalConnectionSupervisor(backend);
+      await supervisor.connectLocal("default");
+
+      // Set pin states on the 4 pinned sessions + buffer 1 event in each + 12 unpinned = 16 buffered in scope
+      gw.sendNotification("prompt.started", { session_id: "s-pin-running", turn_id: "t-run", seq: 1 });
+      gw.sendNotification("clarify.requested", { session_id: "s-pin-clarify", clarify_id: "cl-1" });
+      gw.sendNotification("prompt.delta", { session_id: "s-pin-clarify", turn_id: "t-cl", message_id: "m-cl", delta: "hi", seq: 1 });
+      gw.sendNotification("prompt.completed", { session_id: "s-pin-unread", turn_id: "t-unr", message_id: "m-unr", seq: 1 });
+      gw.sendNotification("admission.queued", { session_id: "s-pin-queued", queued: true });
+      gw.sendNotification("prompt.delta", { session_id: "s-pin-queued", turn_id: "t-q", message_id: "m-q", delta: "hi", seq: 1 });
+
+      for (let i = 1; i <= 12; i += 1) {
+        gw.sendNotification("prompt.delta", {
+          session_id: `u-${i}`,
+          turn_id: `t-u-${i}`,
+          message_id: `m-u-${i}`,
+          delta: "ok",
+          seq: 1,
+        });
+      }
+      await new Promise((r) => setTimeout(r, 60));
+
+      // Now add u-13 and u-14 -> must evict oldest unpinned u-1, u-2, NEVER any of the 4 pinned sessions
+      gw.sendNotification("prompt.delta", { session_id: "u-13", turn_id: "t-13", message_id: "m-13", delta: "ok", seq: 1 });
+      gw.sendNotification("prompt.delta", { session_id: "u-14", turn_id: "t-14", message_id: "m-14", delta: "ok", seq: 1 });
+      await new Promise((r) => setTimeout(r, 50));
+
+      // u-1 was evicted -> switching to u-1 requires resync; s-pin-running / clarify / unread / queued were NOT evicted
+      const selPin = (await supervisor.handlers["sessions.select"](
+        { connectionId: "local", profileId: "default", sessionId: "s-pin-running" },
+        { connectionId: "local", profileId: "default", sessionId: "s-pin-running" },
+      )) as { resyncRequired?: boolean };
+      expect(selPin.resyncRequired).toBeFalsy();
+
+      const selEvicted = (await supervisor.handlers["sessions.select"](
+        { connectionId: "local", profileId: "default", sessionId: "u-1" },
+        { connectionId: "local", profileId: "default", sessionId: "u-1" },
+      )) as { resyncRequired?: boolean };
+      expect(selEvicted.resyncRequired).toBe(true);
+
+      // Sequence gap on s-gap
+      gw.sendNotification("prompt.delta", { session_id: "s-gap", turn_id: "t-g", message_id: "m-g", delta: "a", seq: 1 });
+      gw.sendNotification("prompt.delta", { session_id: "s-gap", turn_id: "t-g", message_id: "m-g", delta: "c", seq: 3 });
+      // > 4 MiB byte cap on s-bytes (5 * 1 MiB payloads)
+      const oneMiB = "z".repeat(1024 * 1024);
+      for (let i = 1; i <= 5; i += 1) {
+        gw.sendNotification("prompt.delta", { session_id: "s-bytes", turn_id: "t-b", message_id: "m-b", delta: oneMiB, seq: i });
+      }
+      await new Promise((r) => setTimeout(r, 80));
+
+      const selGap = (await supervisor.handlers["sessions.select"](
+        { connectionId: "local", profileId: "default", sessionId: "s-gap" },
+        { connectionId: "local", profileId: "default", sessionId: "s-gap" },
+      )) as { resyncRequired?: boolean };
+      expect(selGap.resyncRequired).toBe(true);
+
+      const selBytes = (await supervisor.handlers["sessions.select"](
+        { connectionId: "local", profileId: "default", sessionId: "s-bytes" },
+        { connectionId: "local", profileId: "default", sessionId: "s-bytes" },
+      )) as { resyncRequired?: boolean };
+      expect(selBytes.resyncRequired).toBe(true);
+
+      await supervisor.dispose();
+      passed = true;
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

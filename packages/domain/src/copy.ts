@@ -548,6 +548,13 @@ export const COPY_CATALOG = {
   "chat.approvalStatus.pending": "待审批",
   "chat.approvalStatus.approved": "已批准",
   "chat.approvalStatus.denied": "已拒绝",
+  "nav.markReadAction": "标记已读",
+  "nav.markReadAria": "标记为已读",
+  "nav.unreadBadge": "条未读",
+  "nav.needsInputBadge": "待处理 Approval",
+  "nav.pinnedBadge": "已固定",
+  "route.attentionNeedsInput": "待处理 Approval",
+  "route.attentionUnread": "未读进展",
 } as const;
 
 export type CopyKey = keyof typeof COPY_CATALOG;

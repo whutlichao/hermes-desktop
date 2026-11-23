@@ -455,6 +455,12 @@ function createMainWindow(): BrowserWindow {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(persistBoundsNow, 120);
   };
+  win.on("focus", () => {
+    connectionSupervisor.setWindowFocused(true);
+  });
+  win.on("blur", () => {
+    connectionSupervisor.setWindowFocused(false);
+  });
   win.on("move", scheduleBoundsSave);
   win.on("resize", scheduleBoundsSave);
   win.on("close", () => {

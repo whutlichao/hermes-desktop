@@ -38,10 +38,13 @@ import type {
 } from "@hermes/contracts";
 import {
   aggregateConnectionHealth,
+  BackgroundJournalManager,
+  type BackgroundJournalEventKind,
   buildSafeBackgroundNotification,
   CAPABILITY_DOMAIN_CATALOG,
   computeFullJitterBackoffMs,
   computeResumeStaggerMs,
+  computeSessionPinned,
   CORE_CAPABILITY_DOMAINS,
   CapabilityRegistry,
   boundSubagentTailLines,
@@ -51,6 +54,8 @@ import {
   isAllowedGatewayConfigKey,
   isJsonRpcMethodNotFound,
   isProfileLinkException,
+  isUserVisibleProgressKind,
+  makeSessionJournalKey,
   reduceTranscriptEvent,
   resolveExplicitMethodAlias,
   resolveExternalAttribution,
@@ -243,9 +248,10 @@ function mapRawSession(
     title,
     preview,
     updatedAt,
-    pinned: Boolean(raw.pinned),
-    unreadCount: typeof raw.unread_count === "number" ? raw.unread_count : 0,
+    pinned: Boolean(raw.pinned || activeTurnId || raw.needs_input || raw.needsInput || raw.queued_admission || raw.queuedAdmission),
+    unreadCount: 0,
     needsInput: Boolean(raw.needs_input ?? raw.needsInput),
+    queuedAdmission: Boolean(raw.queued_admission ?? raw.queuedAdmission),
     activeTurnId,
     status: activeTurnId ? "running" : "idle",
   };
@@ -360,6 +366,9 @@ export class ConnectionSupervisor {
   private readonly profilesByConnection = new Map<string, ProfileSummary[]>();
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
   private readonly transcripts = new Map<string, SessionTranscriptSnapshot>();
+  private readonly backgroundJournal = new BackgroundJournalManager();
+  private readonly pendingResyncKeys = new Set<string>();
+  private explicitWindowFocused: boolean | null = null;
   private readonly lastKnownSubagentsBySession = new Map<string, WorkspaceAgentItem[]>();
   private readonly transports = new Map<string, GatewayTransportEntry>();
   private readonly connectingByKey = new Map<string, Promise<SupervisorConnectResult>>();
@@ -488,7 +497,14 @@ export class ConnectionSupervisor {
     const sk = scopeKey(connectionId, profileId);
     const sessions = this.sessionsByScope.get(sk) ?? [];
     for (const s of sessions) {
-      if (s.activeTurnId || s.status === "running" || s.needsInput) {
+      if (
+        s.activeTurnId ||
+        s.status === "running" ||
+        s.needsInput ||
+        s.unreadCount > 0 ||
+        s.queuedAdmission ||
+        s.pinned
+      ) {
         return true;
       }
     }
@@ -500,6 +516,153 @@ export class ConnectionSupervisor {
       }
     }
     return false;
+  }
+
+  setWindowFocused(focused: boolean): void {
+    this.explicitWindowFocused = focused;
+  }
+
+  private isEffectiveWindowFocused(): boolean {
+    return this.explicitWindowFocused !== null ? this.explicitWindowFocused : this.isAppForeground();
+  }
+
+  private isSessionCurrentlyActive(
+    connectionId: string,
+    profileId: string,
+    sessionId: string,
+  ): boolean {
+    return Boolean(
+      this.activeScope &&
+        this.activeScope.connectionId === connectionId &&
+        (this.activeScope.profileId ?? "default") === profileId &&
+        (this.activeSessionId ?? this.activeScope.sessionId ?? null) === sessionId,
+    );
+  }
+
+  private applyJournalOverlayToSession(session: SessionSummary): SessionSummary {
+    const key = makeSessionJournalKey(session.connectionId, session.profileId, session.sessionId);
+    const journal = this.backgroundJournal.getState(key);
+    const runningTurn = Boolean(
+      journal?.pinnedFlags.runningTurn || session.activeTurnId || session.status === "running",
+    );
+    const pendingInput = Boolean(journal?.pinnedFlags.pendingInput ?? session.needsInput);
+    const queuedAdmission = Boolean(journal?.pinnedFlags.queuedAdmission ?? session.queuedAdmission);
+    const unreadCount = journal ? journal.unreadCount : 0;
+    const pinnedReasons = {
+      ...(journal?.pinnedFlags ?? {}),
+      runningTurn,
+      pendingInput,
+      unread: unreadCount > 0,
+      queuedAdmission,
+    };
+    const pinned = computeSessionPinned(pinnedReasons, unreadCount);
+    return {
+      ...session,
+      unreadCount,
+      needsInput: pendingInput,
+      queuedAdmission,
+      pinned,
+      pinnedReasons,
+      ...(journal ? { progressSeq: journal.progressSeq, lastReadSeq: journal.lastReadSeq } : {}),
+    };
+  }
+
+  private updateSessionSummary(
+    connectionId: string,
+    profileId: string,
+    sessionId: string,
+    updater: (prev: SessionSummary) => SessionSummary,
+  ): void {
+    const sk = scopeKey(connectionId, profileId);
+    const list = this.sessionsByScope.get(sk) ?? [];
+    const idx = list.findIndex((s) => s.sessionId === sessionId);
+    if (idx === -1) return;
+    const updated = this.applyJournalOverlayToSession(updater(list[idx]));
+    const nextList = [...list];
+    nextList[idx] = updated;
+    this.sessionsByScope.set(sk, nextList);
+    this.syncProfileAndConnectionProjections(connectionId);
+    this.emitSessions(connectionId, profileId);
+    this.emitFleet(connectionId);
+  }
+
+  private async syncActiveSessionOnSwitch(
+    entry: GatewayTransportEntry,
+    connectionId: string,
+    profileId: string,
+    sessionId: string,
+  ): Promise<{ transcript: SessionTranscriptSnapshot | null; resyncRequired: boolean }> {
+    const jKey = makeSessionJournalKey(connectionId, profileId, sessionId);
+    const tk = transcriptKey(connectionId, profileId, sessionId);
+    if (this.isEffectiveWindowFocused()) {
+      this.backgroundJournal.markRead(jKey);
+      this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+        ...prev,
+        unreadCount: 0,
+      }));
+    }
+
+    const journal = this.backgroundJournal.getState(jKey);
+    if (journal?.resyncRequired || this.pendingResyncKeys.has(jKey)) {
+      this.pendingResyncKeys.add(jKey);
+      this.transcripts.delete(tk);
+      this.emitTopic(
+        "session.transcript",
+        { connectionId, profileId, sessionId },
+        "resync_required",
+        { reason: journal?.resyncReason ?? "resync_required" },
+        (sub) =>
+          Boolean(
+            sub.scope &&
+              sub.scope.connectionId === connectionId &&
+              (sub.scope.profileId ?? "default") === profileId &&
+              sub.scope.sessionId === sessionId,
+          ),
+      );
+      return { transcript: null, resyncRequired: true };
+    }
+
+    let snapshot = await this.loadTranscriptSnapshot(entry, profileId, sessionId);
+    if (journal && journal.events.length > 0) {
+      let current = snapshot;
+      for (const ev of journal.events) {
+        const patch = ev.patch;
+        if (patch.type === "token_delta") {
+          const existingMsg = current.messages.find((m) => m.messageId === patch.messageId);
+          if (existingMsg && existingMsg.status === "complete" && existingMsg.text.length > 0) {
+            continue;
+          }
+        }
+        const next = reduceTranscriptEvent(current, {
+          topic: "session.transcript",
+          scope: { connectionId, profileId, sessionId },
+          kind: "patch",
+          seq: 1,
+          revision: this.revision,
+          payload: patch,
+        });
+        if (next) {
+          current = next;
+        }
+      }
+      this.transcripts.set(tk, current);
+      this.backgroundJournal.dropBufferOnly(jKey);
+      snapshot = current;
+      this.emitTopic(
+        "session.transcript",
+        { connectionId, profileId, sessionId },
+        "snapshot",
+        snapshot,
+        (sub) =>
+          Boolean(
+            sub.scope &&
+              sub.scope.connectionId === connectionId &&
+              (sub.scope.profileId ?? "default") === profileId &&
+              sub.scope.sessionId === sessionId,
+          ),
+      );
+    }
+    return { transcript: snapshot, resyncRequired: false };
   }
 
   private syncProfileAndConnectionProjections(connectionId: string): void {
@@ -2562,13 +2725,18 @@ export class ConnectionSupervisor {
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
 
-    // Resync existing transcripts for dialed profile on reconnect
-    for (const tx of this.transcripts.values()) {
+    // Resync ONLY active transcript on reconnect; mark any non-active cached transcript for lazy resync without prefetching background sessions
+    for (const [tk, tx] of [...this.transcripts.entries()]) {
       if (tx.connectionId === connectionId && tx.profileId === dial.profileId && tx.sessionId) {
-        await this.loadTranscriptSnapshot(entry, dial.profileId, tx.sessionId, {
-          replace: true,
-          resynced: true,
-        });
+        if (this.isSessionCurrentlyActive(connectionId, dial.profileId, tx.sessionId)) {
+          await this.loadTranscriptSnapshot(entry, dial.profileId, tx.sessionId, {
+            replace: true,
+            resynced: true,
+          });
+        } else {
+          this.transcripts.delete(tk);
+          this.backgroundJournal.markResyncRequired(tk, "reconnect");
+        }
       }
     }
 
@@ -2707,12 +2875,17 @@ export class ConnectionSupervisor {
     this.markLinkReady(connectionId, profileId, baseLatency);
 
     if (options?.resyncTranscripts) {
-      for (const tx of this.transcripts.values()) {
+      for (const [tk, tx] of [...this.transcripts.entries()]) {
         if (tx.connectionId === connectionId && tx.profileId === profileId && tx.sessionId) {
-          await this.loadTranscriptSnapshot(entry, profileId, tx.sessionId, {
-            replace: true,
-            resynced: true,
-          });
+          if (this.isSessionCurrentlyActive(connectionId, profileId, tx.sessionId)) {
+            await this.loadTranscriptSnapshot(entry, profileId, tx.sessionId, {
+              replace: true,
+              resynced: true,
+            });
+          } else {
+            this.transcripts.delete(tk);
+            this.backgroundJournal.markResyncRequired(tk, "reconnect");
+          }
         }
       }
     }
@@ -2980,7 +3153,8 @@ export class ConnectionSupervisor {
 
     const mapped = rawList
       .map((item) => mapRawSession(item, connectionId, profileId))
-      .filter((item): item is SessionSummary => item !== null && item.profileId === profileId);
+      .filter((item): item is SessionSummary => item !== null && item.profileId === profileId)
+      .map((item) => this.applyJournalOverlayToSession(item));
 
     this.sessionsByScope.set(scopeKey(connectionId, profileId), mapped);
     this.syncProfileAndConnectionProjections(connectionId);
@@ -3773,47 +3947,150 @@ export class ConnectionSupervisor {
       entry.defaultProfileId;
     const resolvedProfileId = this.findProfileIdForSession(connectionId, sessionId) ?? profileId;
 
-    if (method === "approval.requested" || method === "approval.pending") {
-      this.notifyBackgroundEventForTest({
-        kind: "approval_pending",
-        scope: {
-          connectionId,
-          profileId: resolvedProfileId,
-          ...(sessionId ? { sessionId } : {}),
-        },
-        rawPayload: params,
-      });
+    if (
+      method === "approval.requested" ||
+      method === "approval.pending" ||
+      method === "clarify.requested" ||
+      method === "clarify.pending"
+    ) {
+      if (method === "approval.requested" || method === "approval.pending") {
+        this.notifyBackgroundEventForTest({
+          kind: "approval_pending",
+          scope: {
+            connectionId,
+            profileId: resolvedProfileId,
+            ...(sessionId ? { sessionId } : {}),
+          },
+          rawPayload: params,
+        });
+      }
+      if (sessionId) {
+        const jKey = makeSessionJournalKey(connectionId, resolvedProfileId, sessionId);
+        this.backgroundJournal.setPinnedFlags(jKey, { pendingInput: true });
+        this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+          ...prev,
+          needsInput: true,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      return;
+    }
+
+    if (
+      method === "approval.resolved" ||
+      method === "approval.decided" ||
+      method === "clarify.resolved" ||
+      method === "clarify.decided"
+    ) {
+      if (sessionId) {
+        const jKey = makeSessionJournalKey(connectionId, resolvedProfileId, sessionId);
+        this.backgroundJournal.setPinnedFlags(jKey, { pendingInput: false });
+        this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+          ...prev,
+          needsInput: false,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      return;
+    }
+
+    if (method === "admission.queued" || method === "session.queued") {
+      if (sessionId) {
+        const queued = params.queued !== false;
+        const jKey = makeSessionJournalKey(connectionId, resolvedProfileId, sessionId);
+        this.backgroundJournal.setPinnedFlags(jKey, { queuedAdmission: queued });
+        this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+          ...prev,
+          queuedAdmission: queued,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
       return;
     }
 
     if (!sessionId) return;
 
+    const seqRaw =
+      typeof params.seq === "number"
+        ? params.seq
+        : typeof params.sequence === "number"
+          ? params.sequence
+          : undefined;
+    const isActive = this.isSessionCurrentlyActive(connectionId, resolvedProfileId, sessionId);
+    const isFocused = this.isEffectiveWindowFocused();
+    const jKey = makeSessionJournalKey(connectionId, resolvedProfileId, sessionId);
+    const scopeMatchesSession = (sub: SubscriberRecord) =>
+      !sub.scope ||
+      (sub.scope.connectionId === connectionId &&
+        (!sub.scope.profileId || sub.scope.profileId === resolvedProfileId) &&
+        (!sub.scope.sessionId || sub.scope.sessionId === sessionId));
+
+    if (method === "prompt.started" || method === "turn.started") {
+      const turnId = asString(params.turn_id ?? params.turnId, `turn-${Date.now()}`);
+      this.backgroundJournal.setPinnedFlags(jKey, { runningTurn: true });
+      if (isActive) {
+        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
+          type: "turn_state",
+          sessionId,
+          activeTurnId: turnId,
+          turnStopping: false,
+        });
+      }
+      this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+        ...prev,
+        activeTurnId: turnId,
+        status: "running",
+        updatedAt: new Date().toISOString(),
+      }));
+      return;
+    }
+
     if (method === "prompt.delta" || method === "prompt.token") {
       const messageId = asString(params.message_id ?? params.messageId, `assistant-${Date.now()}`);
       const turnId = asString(params.turn_id ?? params.turnId) || undefined;
       const delta = asString(params.delta ?? params.text, "");
-      this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
+      const patch: TranscriptPatchPayload = {
         type: "token_delta",
         sessionId,
         turnId,
         messageId,
         delta,
-      });
-      const promptPayload: PromptEventPayload = {
-        connectionId,
-        profileId: resolvedProfileId,
-        sessionId,
-        turnId: turnId ?? "",
-        kind: "delta",
-        delta,
-        messageId,
       };
-      this.emitTopic(
-        "prompt",
-        { connectionId, profileId: resolvedProfileId, sessionId },
-        "patch",
-        promptPayload,
-      );
+      if (isActive) {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: "token_delta",
+          countsAsUnread: false,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: true,
+        });
+        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
+        const promptPayload: PromptEventPayload = {
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+          turnId: turnId ?? "",
+          kind: "delta",
+          delta,
+          messageId,
+        };
+        this.emitTopic(
+          "prompt",
+          { connectionId, profileId: resolvedProfileId, sessionId },
+          "patch",
+          promptPayload,
+          scopeMatchesSession,
+        );
+      } else {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: "token_delta",
+          countsAsUnread: false,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: false,
+          patch,
+        });
+      }
       return;
     }
 
@@ -3875,26 +4152,112 @@ export class ConnectionSupervisor {
       };
       const turnId = asString(params.turn_id ?? params.turnId) || undefined;
       const messageId = asString(params.message_id ?? params.messageId) || undefined;
-      this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
+      const patch: TranscriptPatchPayload = {
         type: "tool_row",
         sessionId,
         turnId,
         messageId,
         toolRow,
-      });
-      const activityPayload: ActivityEventPayload = {
-        connectionId,
-        profileId: resolvedProfileId,
-        sessionId,
-        turnId,
-        toolRow,
       };
-      this.emitTopic(
-        "activity",
-        { connectionId, profileId: resolvedProfileId, sessionId },
-        "patch",
-        activityPayload,
-      );
+      const hasResultSummary =
+        toolRow.status === "completed" ||
+        toolRow.status === "failed" ||
+        toolRow.status === "cancelled" ||
+        Boolean(toolRow.summary && toolRow.summary.trim().length > 0);
+      const journalKind: BackgroundJournalEventKind = hasResultSummary
+        ? "tool_result_summary"
+        : "tool_running";
+      const countsAsUnread = isUserVisibleProgressKind(journalKind);
+
+      if (isActive) {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: journalKind,
+          countsAsUnread,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: true,
+        });
+        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
+        const activityPayload: ActivityEventPayload = {
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+          turnId,
+          toolRow,
+        };
+        this.emitTopic(
+          "activity",
+          { connectionId, profileId: resolvedProfileId, sessionId },
+          "patch",
+          activityPayload,
+          scopeMatchesSession,
+        );
+      } else {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: journalKind,
+          countsAsUnread,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: false,
+          patch,
+        });
+      }
+
+      if (countsAsUnread) {
+        this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+          ...prev,
+          preview: toolRow.summary ? `${toolRow.name}: ${toolRow.summary}` : prev.preview,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      return;
+    }
+
+    if (
+      method === "message.created" ||
+      method === "message.upsert" ||
+      method === "assistant.message"
+    ) {
+      const rawMsg =
+        params.message && typeof params.message === "object"
+          ? (params.message as Record<string, unknown>)
+          : params;
+      const mapped = mapRawMessage(rawMsg, sessionId);
+      if (!mapped) return;
+      const journalKind: BackgroundJournalEventKind =
+        mapped.role === "assistant" ? "assistant_message" : "other";
+      const countsAsUnread = isUserVisibleProgressKind(journalKind);
+      const patch: TranscriptPatchPayload = {
+        type: "message_upsert",
+        sessionId,
+        message: mapped,
+      };
+      if (isActive) {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: journalKind,
+          countsAsUnread,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: true,
+        });
+        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
+      } else {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: journalKind,
+          countsAsUnread,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: false,
+          patch,
+        });
+      }
+      if (countsAsUnread) {
+        this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+          ...prev,
+          preview: mapped.text ? mapped.text.slice(0, 140) : prev.preview,
+          updatedAt: mapped.createdAt || new Date().toISOString(),
+        }));
+      }
       return;
     }
 
@@ -3912,28 +4275,63 @@ export class ConnectionSupervisor {
           : method === "prompt.error"
             ? "error"
             : "complete";
-      this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, {
+      const patch: TranscriptPatchPayload = {
         type: "turn_state",
         sessionId,
         activeTurnId: null,
         turnStopping: false,
         messageId,
         status,
-      });
-      const kind: PromptEventPayload["kind"] =
-        method === "prompt.stopped"
-          ? "stopped"
-          : method === "prompt.error"
-            ? "error"
-            : "completed";
-      this.emitTopic("prompt", { connectionId, profileId: resolvedProfileId, sessionId }, "patch", {
-        connectionId,
-        profileId: resolvedProfileId,
-        sessionId,
-        turnId,
-        kind,
-        messageId,
-      } satisfies PromptEventPayload);
+      };
+      this.backgroundJournal.setPinnedFlags(jKey, { runningTurn: false });
+
+      if (isActive) {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: "turn_boundary",
+          countsAsUnread: true,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: true,
+        });
+        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
+        const kind: PromptEventPayload["kind"] =
+          method === "prompt.stopped"
+            ? "stopped"
+            : method === "prompt.error"
+              ? "error"
+              : "completed";
+        this.emitTopic(
+          "prompt",
+          { connectionId, profileId: resolvedProfileId, sessionId },
+          "patch",
+          {
+            connectionId,
+            profileId: resolvedProfileId,
+            sessionId,
+            turnId,
+            kind,
+            messageId,
+          } satisfies PromptEventPayload,
+          scopeMatchesSession,
+        );
+      } else {
+        this.backgroundJournal.recordEvent(jKey, {
+          kind: "turn_boundary",
+          countsAsUnread: true,
+          gatewaySeq: seqRaw,
+          isWindowFocused: isFocused,
+          isViewingSession: false,
+          patch,
+        });
+      }
+
+      this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
+        ...prev,
+        activeTurnId: null,
+        status: method === "prompt.error" ? "error" : "idle",
+        updatedAt: new Date().toISOString(),
+      }));
+
       if (method === "prompt.completed" || method === "prompt.done") {
         this.notifyBackgroundEventForTest({
           kind: "turn_completed",
@@ -4146,6 +4544,19 @@ export class ConnectionSupervisor {
         });
       } else if (topic === "session.transcript") {
         const sid = scope?.sessionId ?? this.activeSessionId;
+        const jKey = sid ? makeSessionJournalKey(cid, pid, sid) : "";
+        const journal = jKey ? this.backgroundJournal.getState(jKey) : undefined;
+        if (sid && (this.pendingResyncKeys.has(jKey) || journal?.resyncRequired)) {
+          listener({
+            topic,
+            scope: { connectionId: cid, profileId: pid, sessionId: sid },
+            kind: "resync_required",
+            seq: 0,
+            revision: rev,
+            payload: { reason: journal?.resyncReason ?? "resync_required" },
+          });
+          return;
+        }
         const existing = sid ? this.transcripts.get(transcriptKey(cid, pid, sid)) : null;
         const transport = this.getTransport(cid, pid);
         const snap: SessionTranscriptSnapshot =
@@ -4206,6 +4617,8 @@ export class ConnectionSupervisor {
     | "sessions.create"
     | "sessions.select"
     | "sessions.resume"
+    | "sessions.markRead"
+    | "app.setFocused"
     | "prompts.send"
     | "prompts.stop"
     | "prompts.steer"
@@ -4322,6 +4735,7 @@ export class ConnectionSupervisor {
       const entry = this.getTransport(connectionId, profileId);
       const link = this.ensureLinkState(connectionId, profileId, "enabled");
       let transcript: SessionTranscriptSnapshot | null = null;
+      let resyncRequired = false;
       if (entry && link.actual !== "blocked") {
         await this.refreshProfiles(entry, profileId);
         const sessions = await this.refreshSessionsForProfile(entry, profileId);
@@ -4368,7 +4782,9 @@ export class ConnectionSupervisor {
           this.scheduleCoreProbes(entry, profileId);
         }
         if (resolvedSessionId) {
-          transcript = await this.loadTranscriptSnapshot(entry, profileId, resolvedSessionId);
+          const synced = await this.syncActiveSessionOnSwitch(entry, connectionId, profileId, resolvedSessionId);
+          transcript = synced.transcript;
+          resyncRequired = synced.resyncRequired;
         }
       } else {
         this.activeScope = { connectionId, profileId };
@@ -4384,6 +4800,7 @@ export class ConnectionSupervisor {
         ok: connectRes.ok && link.actual !== "blocked",
         fleet: this.getFleetSnapshot(),
         transcript,
+        ...(resyncRequired ? { resyncRequired: true } : {}),
       };
     },
 
@@ -4430,8 +4847,11 @@ export class ConnectionSupervisor {
       }
 
       let transcript: SessionTranscriptSnapshot | null = null;
+      let resyncRequired = false;
       if (resolvedSessionId) {
-        transcript = await this.loadTranscriptSnapshot(entry, profileId, resolvedSessionId);
+        const synced = await this.syncActiveSessionOnSwitch(entry, connectionId, profileId, resolvedSessionId);
+        transcript = synced.transcript;
+        resyncRequired = synced.resyncRequired;
       }
       const capKey = this.capabilityRegistry.getSnapshot().key;
       if (capKey.connectionId !== connectionId || capKey.profileId !== profileId) {
@@ -4451,7 +4871,38 @@ export class ConnectionSupervisor {
       return {
         fleet: this.getFleetSnapshot(),
         transcript,
+        ...(resyncRequired ? { resyncRequired: true } : {}),
       };
+    },
+
+    "sessions.markRead": async (payload, scope) => {
+      this.assertNotShuttingDown();
+      const connectionId = this.resolveTargetConnectionId(payload, scope);
+      const profileId = this.resolveTargetProfile(payload, scope, connectionId);
+      const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
+      if (!sessionId) {
+        throw makeBridgeError("invalid_request", "缺少目标 Session");
+      }
+      const jKey = makeSessionJournalKey(connectionId, profileId, sessionId);
+      this.backgroundJournal.markRead(jKey);
+      this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+        ...prev,
+        unreadCount: 0,
+      }));
+      return {
+        ok: true,
+        connectionId,
+        profileId,
+        sessionId,
+        unreadCount: 0,
+      };
+    },
+
+    "app.setFocused": async (payload) => {
+      this.assertNotShuttingDown();
+      const focused = Boolean(payload.focused);
+      this.setWindowFocused(focused);
+      return { ok: true, focused };
     },
 
     "sessions.create": async (payload, scope) => {
@@ -4552,6 +5003,9 @@ export class ConnectionSupervisor {
         replace: resync,
         resynced: resync,
       });
+      const jKey = makeSessionJournalKey(connectionId, profileId, sessionId);
+      this.pendingResyncKeys.delete(jKey);
+      this.backgroundJournal.clearResyncAndBuffer(jKey);
       return { transcript };
     },
 
@@ -4624,6 +5078,16 @@ export class ConnectionSupervisor {
         messageId: assistantMsgId,
         status: "streaming",
       });
+      this.backgroundJournal.setPinnedFlags(
+        makeSessionJournalKey(connectionId, profileId, sessionId),
+        { runningTurn: true },
+      );
+      this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+        ...prev,
+        activeTurnId: turnId,
+        status: "running",
+        updatedAt: nowIso,
+      }));
       this.syncProfileAndConnectionProjections(connectionId);
 
       this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
@@ -5649,7 +6113,10 @@ export class ConnectionSupervisor {
       }),
     ]);
 
-    // 5. Mark links idle/disabled and clear subscribers
+    // 5. Mark links idle/disabled, clear background journal on Quit, and clear subscribers
+    this.backgroundJournal.clear();
+    this.pendingResyncKeys.clear();
+    this.transcripts.clear();
     for (const link of this.linksByKey.values()) {
       link.actual = "idle";
     }

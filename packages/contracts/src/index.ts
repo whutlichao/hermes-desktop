@@ -45,6 +45,8 @@ export const HOST_COMMANDS = [
   "sessions.create",
   "sessions.select",
   "sessions.resume",
+  "sessions.markRead",
+  "app.setFocused",
   "prompts.send",
   "prompts.stop",
   "prompts.steer",
@@ -259,6 +261,14 @@ export interface SafeBackgroundNotification {
   focusCommand: { type: "focus_scope"; scope: BridgeScope };
 }
 
+export interface SessionPinnedReasons {
+  runningTurn?: boolean;
+  pendingInput?: boolean;
+  unread?: boolean;
+  queuedAdmission?: boolean;
+  explicit?: boolean;
+}
+
 export interface SessionSummary {
   connectionId: string;
   profileId: string;
@@ -271,6 +281,30 @@ export interface SessionSummary {
   needsInput: boolean;
   activeTurnId?: string | null;
   status?: "idle" | "running" | "error";
+  queuedAdmission?: boolean;
+  pinnedReasons?: SessionPinnedReasons;
+  progressSeq?: number;
+  lastReadSeq?: number;
+}
+
+export interface AttentionTarget {
+  connectionId: string;
+  profileId: string;
+  sessionId: string;
+  title: string;
+  unreadCount: number;
+  needsInput: boolean;
+  isActive: boolean;
+}
+
+export interface AttentionAggregation {
+  totalUnread: number;
+  totalNeedsInput: number;
+  backgroundUnread: number;
+  backgroundNeedsInput: number;
+  needsInputTargets: AttentionTarget[];
+  unreadTargets: AttentionTarget[];
+  primaryTarget: AttentionTarget | null;
 }
 
 export type CapabilityOrigin = "builtin" | "external" | "unknown";
