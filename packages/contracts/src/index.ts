@@ -50,6 +50,12 @@ export const HOST_COMMANDS = [
   "prompts.send",
   "prompts.stop",
   "prompts.steer",
+  "prompts.resolveUnknown",
+  "prompts.queue",
+  "prompts.checkQueueReceipt",
+  "prompts.retryQueue",
+  "prompts.cancelQueued",
+  "prompts.dismissSteerFallback",
   "approvals.list",
   "approvals.respond",
   "approvals.dismissOrphaned",
@@ -87,6 +93,10 @@ export const HOST_COMMANDS = [
   "chatState.exportOrphanedDraft",
   "chatState.exportMissingSession",
   "chatState.dismissMissingSession",
+  "cron.status",
+  "cron.submit",
+  "cron.cancel",
+  "cron.recover",
 ] as const;
 
 export type HostCommand = (typeof HOST_COMMANDS)[number];
@@ -98,6 +108,7 @@ export const HOST_TOPICS = [
   "sessions",
   "session.transcript",
   "prompt",
+  "turn.recovery",
   "activity",
   "approval",
   "clarify",
@@ -377,6 +388,8 @@ export interface SessionTranscriptSnapshot {
   messages: TranscriptMessage[];
   activeTurnId: string | null;
   turnStopping: boolean;
+  executionGeneration?: number;
+  stopState?: TurnStopState;
   chatAvailable: boolean;
   chatUnavailableReason?: string;
   supportedActions: SupportedChatActions;
@@ -411,6 +424,8 @@ export type TranscriptPatchPayload =
       sessionId: string;
       activeTurnId: string | null;
       turnStopping?: boolean;
+      executionGeneration?: number;
+      stopState?: TurnStopState;
       messageId?: string;
       status?: TranscriptMessage["status"];
     }
@@ -427,7 +442,21 @@ export interface PromptEventPayload {
   profileId: string;
   sessionId: string;
   turnId: string;
-  kind: "accepted" | "delta" | "completed" | "stopped" | "stop_failed" | "error";
+  executionGeneration?: number;
+  kind:
+    | "accepted"
+    | "delta"
+    | "completed"
+    | "stopping"
+    | "stopped"
+    | "stop_failed"
+    | "cancel_outcome_unknown"
+    | "unknown_turn"
+    | "unknown_resolved"
+    | "queued"
+    | "queue_cancelled"
+    | "steer_failed"
+    | "error";
   delta?: string;
   messageId?: string;
   reason?: string;
@@ -680,6 +709,113 @@ export interface ExtensionInventoryView {
   mcp: McpInventoryView;
 }
 
+export type DomainInspectTab = "memory" | "messaging" | "cron";
+
+export type DomainInspectStatus = ExtensionInventoryStatus;
+
+export interface MemoryContextSection {
+  id: string;
+  label: string;
+  tokens?: number;
+  percentage?: number;
+  entryCount?: number;
+  summary?: string;
+}
+
+export interface MemoryContextView {
+  status: DomainInspectStatus;
+  readOnly: true;
+  sourceMethod?: "session.context_breakdown" | "session.info";
+  sessionId?: string;
+  totalTokens?: number;
+  maxTokens?: number;
+  sections: MemoryContextSection[];
+  notes: string[];
+  errorCode?: string;
+  degradation?: CapabilityDegradation;
+  cliActions: ExtensionCliAction[];
+  docsUrl: string;
+  fetchedAt: string | null;
+}
+
+export interface MessagingConnectorRow {
+  connectorId: string;
+  platform: string;
+  label: string;
+  status: "connected" | "disconnected" | "configured" | "error" | "unknown";
+  statusLabel: string;
+  detail?: string;
+  errorCode?: string;
+  attribution: ExternalAttribution;
+  cliCommand?: string;
+}
+
+export interface MessagingStatusView {
+  status: DomainInspectStatus;
+  readOnly: true;
+  connectors: MessagingConnectorRow[];
+  errorCode?: string;
+  degradation?: CapabilityDegradation;
+  cliActions: ExtensionCliAction[];
+  docsUrl: string;
+  fetchedAt: string | null;
+}
+
+export type CronJobStatus = "scheduled" | "running" | "succeeded" | "failed" | "paused" | "cancelled";
+
+export interface CronJobRow {
+  jobId: string;
+  name: string;
+  schedule: string;
+  promptSummary?: string;
+  status: CronJobStatus;
+  statusLabel: string;
+  lastRunAt?: string;
+  nextRunAt?: string;
+  lastOutcome?: string;
+  errorCode?: string;
+  canCancel: boolean;
+  canRecover: boolean;
+  attribution: ExternalAttribution;
+}
+
+export interface CronSupportedActions {
+  canStatus: boolean;
+  canSubmit: boolean;
+  canCancel: boolean;
+  canRecover: boolean;
+}
+
+export interface CronStateView {
+  status: DomainInspectStatus;
+  mode: "interactive" | "read_only" | "unavailable";
+  routinesFoldedIntoCron: true;
+  supportedActions: CronSupportedActions;
+  jobs: CronJobRow[];
+  recentRunSummary?: string;
+  errorCode?: string;
+  degradation?: CapabilityDegradation;
+  cliActions: ExtensionCliAction[];
+  docsUrl: string;
+  fetchedAt: string | null;
+}
+
+export interface CronSubmitRequest {
+  name: string;
+  schedule: string;
+  prompt: string;
+}
+
+export interface CronJobActionRequest {
+  jobId: string;
+}
+
+export interface CronMutationResult {
+  ok: true;
+  jobId?: string;
+  cron: CronStateView;
+}
+
 export interface CapabilitySnapshotKey {
   connectionId: string;
   profileId: string;
@@ -710,6 +846,9 @@ export interface CapabilitySnapshot {
   entries: CapabilityEntry[];
   methodTiers: Record<string, CapabilityMethodTier>;
   extensions: ExtensionInventoryView;
+  memory: MemoryContextView;
+  messaging: MessagingStatusView;
+  cron: CronStateView;
   invalidatedReason?: string;
   updatedAt: string;
 }
@@ -993,6 +1132,7 @@ export interface ChatSessionProjection {
   lastValidProfileByConnection: Record<string, string>;
   lastValidScopes: Array<{ connectionId: string; profileId: string }>;
   sessionSummaries: Record<string, SessionRecoverySummary>;
+  scopeDrafts?: Record<string, string>;
   activeStatus: ActiveChatStatus;
   lastKnownUnverified: boolean;
   missingSession: SessionRecoverySummary | null;
@@ -1545,6 +1685,7 @@ export interface ApprovalView {
   readonly canDeny: boolean;
   readonly canInspect: boolean;
   readonly canDismiss: boolean;
+  readonly attribution?: ExternalAttribution;
   readonly updatedAt: string;
 }
 
@@ -1638,5 +1779,129 @@ export interface GitWorktreeDeepLinkCatalog {
   boundaryNote: string;
   cliItems: GitWorktreeCliItem[];
   docLinks: GitWorktreeDocLink[];
+}
+
+export type TurnStopState =
+  | "idle"
+  | "stopping"
+  | "cancel_outcome_unknown"
+  | "stopped";
+
+export interface UnknownTurnRecord {
+  readonly admissionId: string;
+  readonly executionGeneration: number;
+  readonly ownerGeneration: number;
+  readonly turnId?: string;
+  readonly originalInput?: string;
+  readonly message: string;
+  readonly lostReason: string;
+  readonly detectedAt: string;
+  readonly resolving?: boolean;
+  readonly lastKnownUnverified?: boolean;
+}
+
+export type QueuedAdmissionState =
+  | "queued"
+  | "cancelling"
+  | "cancel_unknown"
+  | "cancelled"
+  | "stopped"
+  | "already_started"
+  | "completed"
+  | "error"
+  | "interrupted";
+
+export interface QueuedAdmissionView {
+  readonly admissionId: string;
+  readonly submissionId: string;
+  readonly sessionId: string;
+  readonly connectionId: string;
+  readonly profileId: string;
+  readonly text: string;
+  readonly position: number;
+  readonly state: QueuedAdmissionState;
+  readonly executionGeneration?: number;
+  readonly turnId?: string;
+  readonly statusReason?: string;
+  readonly lastKnownUnverified?: boolean;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export type QueueDeliveryUnknownState =
+  | "delivery_unknown"
+  | "reconciling"
+  | "retry_ready";
+
+export interface QueueDeliveryUnknownView {
+  readonly submissionId: string;
+  readonly sessionId: string;
+  readonly connectionId: string;
+  readonly profileId: string;
+  readonly text: string;
+  readonly state: QueueDeliveryUnknownState;
+  readonly executionGeneration?: number;
+  readonly statusReason?: string;
+  readonly canRetrySameSubmission: boolean;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export type SteerFailureReason =
+  | "turn_finished"
+  | "generation_mismatch"
+  | "not_running"
+  | "rejected"
+  | "unreachable"
+  | "timeout";
+
+export type SteerFallbackChoice = "new_turn" | "queue";
+
+export interface SteerFallbackPromptView {
+  readonly text: string;
+  readonly reason: SteerFailureReason;
+  readonly message: string;
+  readonly turnId?: string;
+  readonly executionGeneration?: number;
+  readonly allowedFallbacks: readonly SteerFallbackChoice[];
+  readonly createdAt: string;
+}
+
+export interface PromptSteerResult {
+  readonly ok: boolean;
+  readonly steered: boolean;
+  readonly sessionId: string;
+  readonly turnId?: string;
+  readonly executionGeneration?: number;
+  readonly status: "steered" | "failed";
+  readonly requiresExplicitFallback?: boolean;
+  readonly reason?: SteerFailureReason;
+  readonly message?: string;
+  readonly text?: string;
+  readonly allowedFallbacks?: readonly SteerFallbackChoice[];
+}
+
+export interface TurnSessionRecoveryView {
+  readonly connectionId: string;
+  readonly profileId: string;
+  readonly sessionId: string;
+  readonly activeTurnId: string | null;
+  readonly executionGeneration: number;
+  readonly ownerGeneration: number;
+  readonly stopState: TurnStopState;
+  readonly stopRequestedTurnId?: string;
+  readonly stopRequestedGeneration?: number;
+  readonly stopOutcomeMessage?: string;
+  readonly queuePaused: boolean;
+  readonly unknownTurn: UnknownTurnRecord | null;
+  readonly queuedAdmissions: readonly QueuedAdmissionView[];
+  readonly pendingDeliveryUnknown: readonly QueueDeliveryUnknownView[];
+  readonly pendingSteerFallback: SteerFallbackPromptView | null;
+  readonly lastKnownUnverified: boolean;
+  readonly updatedAt: string;
+}
+
+export interface TurnRecoveryTopicSnapshot {
+  readonly sessions: readonly TurnSessionRecoveryView[];
 }
 

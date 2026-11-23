@@ -17,3 +17,4 @@ export * from "./backgroundJournal";
 export * from "./approvalCoordinator";
 export * from "./terminal";
 export * from "./drafts";
+export * from "./turnRecoveryCoordinator";

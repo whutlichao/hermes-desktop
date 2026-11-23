@@ -499,6 +499,10 @@ export function reduceTranscriptEvent(
         messages,
         activeTurnId: patch.activeTurnId,
         turnStopping: patch.turnStopping ?? false,
+        ...(typeof patch.executionGeneration === "number"
+          ? { executionGeneration: patch.executionGeneration }
+          : {}),
+        ...(patch.stopState !== undefined ? { stopState: patch.stopState } : {}),
       };
     }
     case "capabilities_update":
