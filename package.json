@@ -22,6 +22,7 @@
     "test:e2e": "playwright test --project=e2e",
     "test:a11y": "playwright test --project=a11y",
     "test:electron": "playwright test --config playwright.electron.config.ts smoke.spec.ts",
+    "test:real-gateway": "node scripts/real-gateway.mjs",
     "verify:architecture": "node scripts/verify-architecture.mjs",
     "verify:no-official-desktop": "node scripts/verify-no-official-desktop.mjs",
     "verify:no-mock-in-build": "node scripts/verify-no-mock-in-build.mjs",
