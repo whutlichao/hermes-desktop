@@ -462,6 +462,48 @@ function isInvalidParamsRpcError(err: unknown): boolean {
   return err.rpcMessage?.toLowerCase() === "invalid_params";
 }
 
+function normalizeCanonicalInterruptReceipt(
+  res: Record<string, unknown>,
+): Record<string, unknown> {
+  // `session.interrupt` returns a CanonicalSessionHandle, not a legacy stop receipt. The handle
+  // proves the interrupt was accepted; the turn is still stopping until prompt.stopped/terminal.
+  return {
+    ...res,
+    accepted: true,
+    status: "stopping",
+    ...(typeof res.execution_generation === "number"
+      ? { execution_generation: res.execution_generation }
+      : {}),
+  };
+}
+
+function normalizeCanonicalQueuedCancelReceipt(
+  res: Record<string, unknown>,
+): Record<string, unknown> {
+  const status = asString(res.status).toLowerCase();
+  if (status === "started") {
+    return { ...res, status: "already_started" };
+  }
+  if (status === "unknown") {
+    return { ...res, status: "cancel_unknown" };
+  }
+  if (status !== "terminal") {
+    return res;
+  }
+  const outcome = asString(res.outcome).toLowerCase();
+  const mapped =
+    outcome === "cancelled" || outcome === "canceled"
+      ? "cancelled"
+      : outcome === "stopped" || outcome === "interrupted"
+        ? outcome
+        : outcome === "completed" || outcome === "settled"
+          ? "completed"
+          : outcome === "failed" || outcome === "error"
+            ? "error"
+            : "cancel_unknown";
+  return { ...res, status: mapped };
+}
+
 export class ConnectionSupervisor {
   private readonly localBackend: LocalBackendManager;
   private readonly getLocalLabel: () => string;
@@ -3388,26 +3430,32 @@ export class ConnectionSupervisor {
           runtimeCapabilities.includes("session-list-picker-v1") ||
           runtimeCapabilities.includes("session-list-cursor-v1");
 
-        try {
+        if (supportsScopedLiveFeed) {
+          // picker/cursor are the owner's promise that both scoped feeds exist. A refusal here is
+          // a protocol failure, not an older Gateway; returning stored-only would hide it.
           const stored = await callList("session.list", { scope: "stored" });
-          let live: Array<Record<string, unknown>> = [];
-          if (supportsScopedLiveFeed) {
+          const live = await callList("session.list", { scope: "live" });
+          rawList = mergeSessionListFeeds(stored, live);
+        } else {
+          try {
+            const stored = await callList("session.list", { scope: "stored" });
+            let live: Array<Record<string, unknown>> = [];
             try {
               live = await callList("session.list", { scope: "live" });
             } catch (err) {
               if (!isJsonRpcMethodNotFound(err) && !isInvalidParamsRpcError(err)) {
                 throw err;
               }
-              // The stored picker feed is authoritative; an unsupported live feed must not hide it.
+              // Older owners may not serve the live scope; the stored picker feed still stands.
             }
+            rawList = mergeSessionListFeeds(stored, live);
+          } catch (err) {
+            if (!isInvalidParamsRpcError(err)) {
+              throw err;
+            }
+            // Older owners serve a singular session.list with no scope parameter.
+            rawList = await callList("session.list");
           }
-          rawList = mergeSessionListFeeds(stored, live);
-        } catch (err) {
-          if (!isInvalidParamsRpcError(err) || supportsScopedLiveFeed) {
-            throw err;
-          }
-          // Older owners serve a singular session.list with no scope parameter.
-          rawList = await callList("session.list");
         }
       } catch (err) {
         if (isProfileUnavailableRpcError(err)) {
@@ -5363,6 +5411,27 @@ export class ConnectionSupervisor {
     return {};
   }
 
+  private usesCanonicalSessionControlWire(entry: GatewayTransportEntry): boolean {
+    if (entry.kind === "remote") {
+      return false;
+    }
+    if (entry.kind === "ssh" && entry.transportMode === "per-profile") {
+      return false;
+    }
+    const rawCapabilities = entry.describeResult?.capabilities;
+    if (!Array.isArray(rawCapabilities)) {
+      return false;
+    }
+    const has = (tag: string) => rawCapabilities.includes(tag);
+    return (
+      has("local-cli-create-v1") &&
+      has("durable-admission-v1") &&
+      has("session-transcript-v1") &&
+      has("session-list-picker-v1") &&
+      has("session-list-cursor-v1")
+    );
+  }
+
   private async callPromptSubmit(
     entry: GatewayTransportEntry,
     profileId: string,
@@ -6386,7 +6455,8 @@ export class ConnectionSupervisor {
       const servedMethods = Array.isArray(entry.describeResult?.served_methods)
         ? (entry.describeResult?.served_methods as unknown[])
         : [];
-      let usedRpcMethod = servedMethods.includes("session.interrupt")
+      const canonicalWire = this.usesCanonicalSessionControlWire(entry);
+      let usedRpcMethod = canonicalWire || servedMethods.includes("session.interrupt")
         ? "session.interrupt"
         : "prompt.cancel";
 
@@ -6400,20 +6470,27 @@ export class ConnectionSupervisor {
             executionGeneration,
           },
           async ({ turnId: tId, executionGeneration: execGen }) => {
-            const rpcPayload = {
-              ...this.gatewayProfileParams(entry, profileId),
-              session_id: sessionId,
-              turn_id: tId,
-              ...(execGen > 0 ? { execution_generation: execGen } : {}),
-            };
+            const rpcPayload = canonicalWire
+              ? {
+                  ...this.gatewayProfileParams(entry, profileId),
+                  session_id: sessionId,
+                  execution_generation: execGen,
+                }
+              : {
+                  ...this.gatewayProfileParams(entry, profileId),
+                  session_id: sessionId,
+                  turn_id: tId,
+                  ...(execGen > 0 ? { execution_generation: execGen } : {}),
+                };
             if (usedRpcMethod === "session.interrupt") {
               try {
-                return await entry.client.call<Record<string, unknown>>(
+                const receipt = await entry.client.call<Record<string, unknown>>(
                   "session.interrupt",
                   rpcPayload,
                 );
+                return canonicalWire ? normalizeCanonicalInterruptReceipt(receipt) : receipt;
               } catch (err) {
-                if (isJsonRpcMethodNotFound(err)) {
+                if (!canonicalWire && isJsonRpcMethodNotFound(err)) {
                   usedRpcMethod = "prompt.cancel";
                   return entry.client.call<Record<string, unknown>>("prompt.cancel", rpcPayload);
                 }
@@ -6766,12 +6843,18 @@ export class ConnectionSupervisor {
       try {
         const res = await this.turnCoordinator.cancelQueued(
           { connectionId, profileId, sessionId, admissionId },
-          async ({ admission_id }) =>
-            entry.client.call<Record<string, unknown>>("prompt.cancel", {
-              ...this.gatewayProfileParams(entry, profileId),
+          async ({ admission_id }) => {
+            const canonicalWire = this.usesCanonicalSessionControlWire(entry);
+            const receipt = await entry.client.call<Record<string, unknown>>("prompt.cancel", {
+              // Canonical `prompt.cancel` routes by admission_id alone; its params are extra=forbid.
+              ...(canonicalWire ? {} : this.gatewayProfileParams(entry, profileId)),
               session_id: sessionId,
               admission_id,
-            }),
+            });
+            return canonicalWire
+              ? normalizeCanonicalQueuedCancelReceipt(receipt)
+              : receipt;
+          },
         );
         this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
           connectionId,
@@ -6805,6 +6888,7 @@ export class ConnectionSupervisor {
       if (!entry.supportedActions.promptSteer) {
         throw makeBridgeError("capability_unavailable", getCopy("turn.steer.unsupportedError"));
       }
+      const canonicalWire = this.usesCanonicalSessionControlWire(entry);
 
       const hasTurnHistory = this.turnCoordinator.hasTurnHistory({
         connectionId,
@@ -6846,17 +6930,41 @@ export class ConnectionSupervisor {
         (currentView && currentView.executionGeneration > 0
           ? currentView.executionGeneration
           : undefined);
+      if (canonicalWire && (effectiveGen === undefined || effectiveGen <= 0)) {
+        return this.turnCoordinator.recordSteerFailure({
+          connectionId,
+          profileId,
+          sessionId,
+          ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+          text,
+          reason: "not_running",
+          message: getCopy("turn.steer.reason.not_running"),
+        });
+      }
 
       try {
-        const res = await entry.client.call<Record<string, unknown>>("session.steer", {
-          profile_id: profileId,
-          session_id: sessionId,
-          ...(effectiveTurnId ? { turn_id: effectiveTurnId } : {}),
-          ...(effectiveGen !== undefined ? { execution_generation: effectiveGen } : {}),
-          text,
-        });
-        if (res?.steered === false) {
-          const reasonRaw = asString(res.reason, "rejected");
+        const rpcPayload = canonicalWire
+          ? {
+              ...this.gatewayProfileParams(entry, profileId),
+              session_id: sessionId,
+              execution_generation: effectiveGen,
+              text,
+            }
+          : {
+              profile_id: profileId,
+              session_id: sessionId,
+              ...(effectiveTurnId ? { turn_id: effectiveTurnId } : {}),
+              ...(effectiveGen !== undefined ? { execution_generation: effectiveGen } : {}),
+              text,
+            };
+        const res = await entry.client.call<Record<string, unknown>>("session.steer", rpcPayload);
+        const canonicalAccepted =
+          canonicalWire &&
+          (asString(res.status).toLowerCase() === "queued" ||
+            asString(res.status).toLowerCase() === "redirected");
+        const canonicalRejected = canonicalWire && !canonicalAccepted;
+        if (canonicalRejected || res?.steered === false) {
+          const reasonRaw = canonicalRejected ? "rejected" : asString(res.reason, "rejected");
           const reason =
             reasonRaw === "turn_finished" ||
             reasonRaw === "generation_mismatch" ||
@@ -6882,7 +6990,9 @@ export class ConnectionSupervisor {
             ...(effectiveGen !== undefined ? { executionGeneration: effectiveGen } : {}),
             text,
             reason,
-            message: asString(res.message, getCopy("turn.steer.fallbackBody")),
+            message: canonicalRejected
+              ? getCopy("turn.steer.fallbackBody")
+              : asString(res.message, getCopy("turn.steer.fallbackBody")),
           });
         }
         return this.turnCoordinator.recordSteerSuccess({

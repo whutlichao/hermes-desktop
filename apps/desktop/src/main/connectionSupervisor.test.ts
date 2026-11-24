@@ -4799,6 +4799,7 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
     liveSessions?: Array<Record<string, unknown>>;
     promptFailure?: { reason: string } | null;
     promptStatus?: string;
+    promptExecutionGeneration?: number;
     promptResult?: Record<string, unknown>;
     legacySessionListNoScope?: boolean;
   };
@@ -4905,14 +4906,17 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
           }
           const sessionId = String(params.session_id ?? "");
           if (options.promptStatus) {
+            const queued = params.queued === true;
             ctx.replyResult({
-              admission_id: "adm-strict-status",
+              admission_id: queued ? "adm-strict-queued" : "adm-strict-status",
               ref: { profile_id: options.profileIdentity, session_id: sessionId },
               sequence: 1,
-              status: options.promptStatus,
+              status: queued ? "queued" : options.promptStatus,
               outcome: null,
               authority_epoch: 1,
-              execution_generation: null,
+              execution_generation: queued
+                ? null
+                : (options.promptExecutionGeneration ?? null),
             });
             return true;
           }
@@ -5988,6 +5992,335 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
 
       expect(routeFor(opsProfile)).toEqual({ profile: "ops" });
       expect(routeFor(defaultProfile)).toEqual({});
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("sends the canonical 0.23.3 control payloads and maps canonical receipt semantics", async () => {
+    const sandbox = createTestSandbox("hermes-canonical-control-");
+    const profileIdentity = "/private/tmp/hermes-canonical-control-home";
+    const validTickets = new Set<string>();
+    let steerStatus: "queued" | "rejected" = "queued";
+    const strict = makeStrictOnRpc({
+      profileIdentity,
+      promptStatus: "started",
+      promptExecutionGeneration: 7,
+    });
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+        {
+          profile_id: "ops",
+          display_name: "Ops",
+          handle: "ops",
+          is_default: false,
+        },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: (method, params, ctx) => {
+        if (method === "session.steer") {
+          if (
+            "profile_id" in params ||
+            "turn_id" in params ||
+            typeof params.execution_generation !== "number" ||
+            typeof params.text !== "string"
+          ) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: Object.keys(params),
+            });
+            return true;
+          }
+          ctx.replyResult({
+            status: steerStatus,
+            text: params.text,
+            execution_generation: params.execution_generation,
+            authority_epoch: 1,
+            ...(steerStatus === "rejected" ? { delivered: false } : {}),
+          });
+          return true;
+        }
+        if (method === "session.interrupt") {
+          if (
+            "profile_id" in params ||
+            "turn_id" in params ||
+            typeof params.execution_generation !== "number"
+          ) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: Object.keys(params),
+            });
+            return true;
+          }
+          ctx.replyResult({
+            ref: { profile_id: profileIdentity, session_id: params.session_id },
+            instance_id: "inst-canonical-control",
+            authority_epoch: 1,
+            revision: 3,
+            execution_generation: params.execution_generation,
+            execution_state: "running",
+          });
+          return true;
+        }
+        if (method === "prompt.cancel") {
+          if (
+            "profile_id" in params ||
+            "profile" in params ||
+            "turn_id" in params ||
+            typeof params.admission_id !== "string"
+          ) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: Object.keys(params),
+            });
+            return true;
+          }
+          ctx.replyResult({
+            admission_id: params.admission_id,
+            ref: { profile_id: profileIdentity, session_id: params.session_id },
+            sequence: 2,
+            status: "terminal",
+            outcome: "cancelled",
+            authority_epoch: 1,
+            execution_generation: 7,
+          });
+          return true;
+        }
+        return strict(method, params, ctx);
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+      // The fake CLI only mints per-profile attach tickets. Promote the live socket to the
+      // shared-host-scope topology a Hermes 0.23.3 control-socket ticket produces, so the canonical
+      // profile handle and the exact control wire payloads are exercised end to end.
+      const internal = supervisor as unknown as {
+        transports: Map<
+          string,
+          { key: string; transportMode: "shared-host-scope" | "per-profile" }
+        >;
+      };
+      const perProfileEntry = internal.transports.get(`local::profile:${profileIdentity}`);
+      expect(perProfileEntry).toBeDefined();
+      internal.transports.delete(`local::profile:${profileIdentity}`);
+      perProfileEntry!.key = "local::shared";
+      perProfileEntry!.transportMode = "shared-host-scope";
+      internal.transports.set("local::shared", perProfileEntry!);
+      const scope = { connectionId: "local", profileId: "ops" };
+
+      const created = (await supervisor.handlers["sessions.create"](
+        { title: "Canonical Control" },
+        scope,
+      )) as { session: SessionSummary };
+      const sessionScope = { ...scope, sessionId: created.session.sessionId };
+
+      const send = (await supervisor.handlers["prompts.send"](
+        { sessionId: created.session.sessionId, text: "canonical turn" },
+        sessionScope,
+      )) as { turnId: string; executionGeneration: number };
+      expect(send.executionGeneration).toBe(7);
+
+      const steered = (await supervisor.handlers["prompts.steer"](
+        {
+          sessionId: created.session.sessionId,
+          text: "focus on the failing test",
+          executionGeneration: 7,
+        },
+        sessionScope,
+      )) as { steered: boolean; status: string };
+      expect(steered).toMatchObject({ steered: true, status: "steered" });
+      expect(gw.rpcCalls.filter((call) => call.method === "session.steer").at(-1)?.params).toEqual({
+        profile: "ops",
+        session_id: created.session.sessionId,
+        execution_generation: 7,
+        text: "focus on the failing test",
+      });
+
+      steerStatus = "rejected";
+      const rejectedSteer = (await supervisor.handlers["prompts.steer"](
+        {
+          sessionId: created.session.sessionId,
+          text: "do not silently resend",
+          executionGeneration: 7,
+        },
+        sessionScope,
+      )) as {
+        steered: boolean;
+        status: string;
+        reason: string;
+        requiresExplicitFallback: boolean;
+      };
+      expect(rejectedSteer).toMatchObject({
+        steered: false,
+        status: "failed",
+        reason: "rejected",
+        requiresExplicitFallback: true,
+      });
+
+      const queued = (await supervisor.handlers["prompts.queue"](
+        {
+          sessionId: created.session.sessionId,
+          text: "queued canonical text",
+          submissionId: "sub-canonical-queued",
+        },
+        sessionScope,
+      )) as { status: string; admission: { admissionId: string } };
+      expect(queued.status).toBe("admitted");
+
+      const cancelled = (await supervisor.handlers["prompts.cancelQueued"](
+        { sessionId: created.session.sessionId, admissionId: queued.admission.admissionId },
+        sessionScope,
+      )) as { outcome: string };
+      expect(cancelled.outcome).toBe("cancelled");
+      expect(gw.rpcCalls.filter((call) => call.method === "prompt.cancel").at(-1)?.params).toEqual({
+        session_id: created.session.sessionId,
+        admission_id: queued.admission.admissionId,
+      });
+
+      const stopped = (await supervisor.handlers["prompts.stop"](
+        {
+          sessionId: created.session.sessionId,
+          turnId: send.turnId,
+          executionGeneration: 7,
+        },
+        sessionScope,
+      )) as { stopped: boolean; status: string };
+      expect(stopped).toMatchObject({ stopped: false, status: "stopping" });
+      expect(gw.rpcCalls.filter((call) => call.method === "session.interrupt").at(-1)?.params).toEqual({
+        profile: "ops",
+        session_id: created.session.sessionId,
+        execution_generation: 7,
+      });
+      expect(
+        gw.rpcCalls.some(
+          (call) => call.method === "prompt.cancel" && "turn_id" in call.params,
+        ),
+      ).toBe(false);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("surfaces an advertised live session-list protocol failure instead of silently returning stored sessions", async () => {
+    const sandbox = createTestSandbox("hermes-canonical-live-failure-");
+    const profileIdentity = "/private/tmp/hermes-canonical-live-failure-home";
+    const validTickets = new Set<string>();
+    let rejectLiveScope = false;
+    const strict = makeStrictOnRpc({
+      profileIdentity,
+      storedSessions: [
+        {
+          session_id: "sess-stored-live-failure",
+          id: "sess-stored-live-failure",
+          title: "Stored Only",
+          source: "cli",
+          started_at: 1795510000,
+          message_count: 1,
+        },
+      ],
+    });
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: (method, params, ctx) => {
+        if (method === "session.list" && rejectLiveScope && params.scope === "live") {
+          ctx.replyError(4001, "invalid_params", {
+            reason: "invalid_params",
+            fields: ["scope"],
+          });
+          return true;
+        }
+        return strict(method, params, ctx);
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+      rejectLiveScope = true;
+      const callStart = gw.rpcCalls.length;
+
+      await expect(supervisor.handlers["sessions.list"]({}, scope)).rejects.toMatchObject({
+        name: "GatewayRpcError",
+        rpcCode: 4001,
+        reason: "invalid_params",
+      });
+
+      const calls = gw.rpcCalls.slice(callStart);
+      expect(
+        calls.some((call) => call.method === "session.list" && call.params.scope === "stored"),
+      ).toBe(true);
+      expect(
+        calls.some((call) => call.method === "session.list" && call.params.scope === "live"),
+      ).toBe(true);
+      expect(
+        calls.some((call) => call.method === "session.list" && !("scope" in call.params)),
+      ).toBe(false);
+      expect(calls.some((call) => call.method === "sessions.list")).toBe(false);
 
       passed = true;
     } finally {

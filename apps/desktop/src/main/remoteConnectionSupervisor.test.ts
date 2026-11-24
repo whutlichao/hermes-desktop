@@ -233,7 +233,7 @@ describe("ConnectionSupervisor multi-gateway Local + Remote HTTP(S)/WS (S1)", ()
     }
   });
 
-  it("routes a non-default Remote profile over the legacy profile_id path for list/create/resume and submit/cancel", async () => {
+  it("routes a non-default Remote profile over the legacy profile_id path for list/create/resume, submit/cancel, and steer", async () => {
     const sandbox = createTestSandbox("hermes-remote-non-default-profile-");
     let passed = false;
     const remoteGw = await startFakeRemoteGatewayServer({
@@ -323,12 +323,27 @@ describe("ConnectionSupervisor multi-gateway Local + Remote HTTP(S)/WS (S1)", ()
       expect(submitCall?.params).not.toHaveProperty("profile");
       expect(typeof submitCall?.params.submission_id).toBe("string");
 
+      const steered = (await supervisor.handlers["prompts.steer"](
+        {
+          sessionId: created.session.sessionId,
+          turnId: send.turnId,
+          text: "ops legacy steer",
+        },
+        { connectionId: remoteId, profileId: "ops", sessionId: created.session.sessionId },
+      )) as { steered: boolean };
+      expect(steered.steered).toBe(true);
+      const steerCall = remoteGw.rpcCalls.find((c) => c.method === "session.steer");
+      expect(steerCall?.params.profile_id).toBe("ops");
+      expect(steerCall?.params.turn_id).toBe(send.turnId);
+      expect(steerCall?.params).not.toHaveProperty("profile");
+
       await supervisor.handlers["prompts.stop"](
         { sessionId: created.session.sessionId, turnId: send.turnId },
         { connectionId: remoteId, profileId: "ops", sessionId: created.session.sessionId },
       );
       const cancelCall = remoteGw.rpcCalls.find((c) => c.method === "prompt.cancel");
       expect(cancelCall?.params.profile_id).toBe("ops");
+      expect(cancelCall?.params.turn_id).toBe(send.turnId);
       expect(cancelCall?.params).not.toHaveProperty("profile");
 
       for (const method of [
@@ -336,6 +351,7 @@ describe("ConnectionSupervisor multi-gateway Local + Remote HTTP(S)/WS (S1)", ()
         "session.resume",
         "session.create",
         "prompt.submit",
+        "session.steer",
         "prompt.cancel",
       ]) {
         for (const call of remoteGw.rpcCalls.filter((c) => c.method === method)) {
