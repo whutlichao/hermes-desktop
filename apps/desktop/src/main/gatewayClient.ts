@@ -89,6 +89,8 @@ export type GatewayInboundFrameListener = (opcode: number, payload: Buffer) => v
 export class GatewayClient {
   private socket: net.Socket;
   private closed = false;
+  private pendingDisconnectReason: string | null = null;
+  private closeNotified = false;
   private rpcSeq = 0;
   private rxBuffer = Buffer.alloc(0);
   private readonly pendingTextFrames: string[] = [];
@@ -246,14 +248,32 @@ export class GatewayClient {
   private handleDisconnect(reason: string): void {
     if (this.closed) return;
     this.closed = true;
+    this.pendingDisconnectReason = reason;
+    if (this.pendingTextFrames.length === 0) {
+      this.finishDisconnect();
+      return;
+    }
+    if (!this.textFrameDispatchScheduled) {
+      this.textFrameDispatchScheduled = true;
+      setImmediate(() => this.dispatchNextTextFrame());
+    }
+  }
+
+  private finishDisconnect(): void {
+    if (this.closeNotified) return;
+    this.closeNotified = true;
     this.pendingTextFrames.length = 0;
+    this.textFrameDispatchScheduled = false;
     for (const [id, entry] of this.pending.entries()) {
       clearTimeout(entry.timer);
       entry.reject(new GatewayTransportError("unreachable", "Gateway connection closed"));
       this.pending.delete(id);
     }
-    for (const listener of this.closeListeners) {
-      listener(reason);
+    const reason = this.pendingDisconnectReason;
+    if (reason !== null) {
+      for (const listener of this.closeListeners) {
+        listener(reason);
+      }
     }
   }
 
@@ -339,6 +359,7 @@ export class GatewayClient {
   }
 
   private enqueueTextFrame(text: string): void {
+    if (this.closed) return;
     this.pendingTextFrames.push(text);
     if (!this.textFrameDispatchScheduled) {
       this.dispatchNextTextFrame();
@@ -346,14 +367,12 @@ export class GatewayClient {
   }
 
   private dispatchNextTextFrame(): void {
-    if (this.closed) {
-      this.pendingTextFrames.length = 0;
-      this.textFrameDispatchScheduled = false;
-      return;
-    }
     const next = this.pendingTextFrames.shift();
     if (next === undefined) {
       this.textFrameDispatchScheduled = false;
+      if (this.pendingDisconnectReason !== null) {
+        this.finishDisconnect();
+      }
       return;
     }
     this.textFrameDispatchScheduled = true;
