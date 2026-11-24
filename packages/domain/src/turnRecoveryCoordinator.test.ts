@@ -585,4 +585,117 @@ describe("TurnRecoveryCoordinator (Issue #43 TDD slices)", () => {
     expect(afterMalformedDiscard?.queuePaused).toBe(true);
     expect(afterMalformedDiscard?.unknownTurnProtocolError).toContain("无法解析");
   });
+
+  it("keeps delivery_unknown unresolved when a canonical pending snapshot cannot prove absence", async () => {
+    const coord = new TurnRecoveryCoordinator({
+      now: () => Date.parse("2026-11-23T11:00:00.000Z"),
+    });
+
+    const lost = await coord.submitQueued(
+      {
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "s-unresolved",
+        text: "cannot prove",
+        online: true,
+        submissionId: "sub-unresolved",
+      },
+      async () => {
+        const err = new Error("ACK lost");
+        (err as { code?: string }).code = "timeout";
+        throw err;
+      },
+    );
+    expect(lost.status).toBe("delivery_unknown");
+
+    const check = await coord.checkQueueReceipt(
+      {
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "s-unresolved",
+        submissionId: "sub-unresolved",
+      },
+      async () => ({ found: false, absenceConfirmed: false }),
+    );
+    expect(check).toMatchObject({ found: false, canRetrySameSubmission: false });
+
+    const view = coord.getSessionView({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-unresolved",
+    });
+    expect(view?.pendingDeliveryUnknown).toHaveLength(1);
+    expect(view?.pendingDeliveryUnknown[0]).toMatchObject({
+      submissionId: "sub-unresolved",
+      state: "delivery_unknown",
+      canRetrySameSubmission: false,
+    });
+    expect(view?.pendingDeliveryUnknown[0]?.statusReason).toContain("无法确认");
+
+    await expect(
+      coord.retryQueued(
+        {
+          connectionId: "local",
+          profileId: "default",
+          sessionId: "s-unresolved",
+          submissionId: "sub-unresolved",
+          online: true,
+        },
+        async () => ({ admitted: true, admission_id: "adm-dup" }),
+      ),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("does not unlock retry from a canonical pending snapshot that omits terminal rows", async () => {
+    const coord = new TurnRecoveryCoordinator({
+      now: () => Date.parse("2026-11-23T11:10:00.000Z"),
+    });
+
+    await coord.submitQueued(
+      {
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "s-canonical-absence",
+        text: "terminal row absent",
+        online: true,
+        submissionId: "sub-canonical-absence",
+      },
+      async () => {
+        const err = new Error("ACK lost");
+        (err as { code?: string }).code = "timeout";
+        throw err;
+      },
+    );
+
+    const canonical = coord.reconcileFromResume({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-canonical-absence",
+      ownerGeneration: 1,
+      activeTurnId: null,
+      executionGeneration: 2,
+      queuedAdmissions: [],
+      queueSnapshotProvesAbsence: false,
+    });
+    expect(canonical.pendingDeliveryUnknown[0]).toMatchObject({
+      submissionId: "sub-canonical-absence",
+      state: "delivery_unknown",
+      canRetrySameSubmission: false,
+    });
+
+    const legacy = coord.reconcileFromResume({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-canonical-absence",
+      ownerGeneration: 1,
+      activeTurnId: null,
+      executionGeneration: 2,
+      queuedAdmissions: [],
+    });
+    expect(legacy.pendingDeliveryUnknown[0]).toMatchObject({
+      submissionId: "sub-canonical-absence",
+      state: "retry_ready",
+      canRetrySameSubmission: true,
+    });
+  });
 });

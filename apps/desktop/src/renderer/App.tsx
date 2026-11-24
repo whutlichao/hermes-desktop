@@ -2055,7 +2055,9 @@ export default function App() {
           message: getCopy(
             res.value.found
               ? "turn.queue.receiptAdmittedNotice"
-              : "turn.queue.receiptMissingNotice",
+              : res.value.canRetrySameSubmission
+                ? "turn.queue.receiptMissingNotice"
+                : "turn.queue.receiptUnresolvedNotice",
           ),
         });
       } finally {

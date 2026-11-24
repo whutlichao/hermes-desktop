@@ -870,6 +870,7 @@ export const COPY_CATALOG = {
   "turn.queue.queuedNotice": "已将消息加入 Gateway 排队。",
   "turn.queue.receiptAdmittedNotice": "回执已确认，排队条目已入队。",
   "turn.queue.receiptMissingNotice": "未找到排队回执，可按原 submission ID 重试。",
+  "turn.queue.receiptUnresolvedNotice": "Gateway 当前 pending 中没有该提交，且终态回执不可查；已保留核对状态，请勿直接重试。",
   "turn.queue.retriedNotice": "已按原 submission ID 重新排队。",
   "turn.queue.retryDeliveryUnknownNotice": "重试后仍未收到 admission_id 回执，投递仍未确认；请再次检查回执后再重试。",
   "turn.queue.rejectedError": "发生了什么：Gateway 拒绝了本次排队请求。可能原因：队列已满或当前 Scope 不允许排队。下一步：稍后重试，或发送为普通 Turn。",

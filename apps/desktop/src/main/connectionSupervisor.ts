@@ -504,6 +504,162 @@ function normalizeCanonicalQueuedCancelReceipt(
   return { ...res, status: mapped };
 }
 
+interface CanonicalPendingAdmission {
+  admissionId: string;
+  inputId: string;
+  text: string;
+  status: "queued" | "started" | "unknown";
+  executionGeneration?: number;
+  position: number;
+}
+
+interface CanonicalPendingProjection {
+  present: boolean;
+  admissions: CanonicalPendingAdmission[];
+  unknownTurns: RawGatewayUnknownTurn[];
+  queuedAdmissions: RawGatewayQueueItem[];
+}
+
+function projectCanonicalPending(
+  rawResult: Record<string, unknown> | null | undefined,
+): CanonicalPendingProjection {
+  if (!Array.isArray(rawResult?.pending)) {
+    return { present: false, admissions: [], unknownTurns: [], queuedAdmissions: [] };
+  }
+  const admissions: CanonicalPendingAdmission[] = [];
+  const unknownTurns: RawGatewayUnknownTurn[] = [];
+  const queuedAdmissions: RawGatewayQueueItem[] = [];
+  rawResult.pending.forEach((raw, index) => {
+    if (!raw || typeof raw !== "object") return;
+    const row = raw as Record<string, unknown>;
+    const admissionId = asString(row.admission_id ?? row.admissionId).trim();
+    const inputId = asString(row.input_id ?? row.inputId).trim();
+    const statusRaw = asString(row.status).trim().toLowerCase();
+    const status =
+      statusRaw === "queued" || statusRaw === "started" || statusRaw === "unknown"
+        ? statusRaw
+        : null;
+    if (!status) return;
+    const text = typeof row.text === "string" ? row.text : "";
+    const executionGenerationRaw = row.execution_generation ?? row.executionGeneration;
+    const executionGeneration =
+      typeof executionGenerationRaw === "number" && Number.isFinite(executionGenerationRaw)
+        ? executionGenerationRaw
+        : undefined;
+
+    if (status === "unknown") {
+      // Keep even an incomplete row so reconcileFromResume can surface a protocol error rather
+      // than silently dropping an unknown admission.
+      unknownTurns.push({
+        ...(admissionId ? { admission_id: admissionId } : {}),
+        ...(executionGeneration !== undefined
+          ? { execution_generation: executionGeneration }
+          : {}),
+        ...(text ? { text } : {}),
+      });
+      // The row still carries its request identity, so prompt.receipt can address it even though
+      // it must never be projected into the queued-admission list.
+      if (admissionId && inputId) {
+        admissions.push({
+          admissionId,
+          inputId,
+          text,
+          status,
+          ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+          position: index + 1,
+        });
+      }
+      return;
+    }
+    if (!admissionId || !inputId) return;
+
+    const admission: CanonicalPendingAdmission = {
+      admissionId,
+      inputId,
+      text,
+      status,
+      ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+      position: index + 1,
+    };
+    admissions.push(admission);
+    queuedAdmissions.push({
+      admission_id: admissionId,
+      submission_id: inputId,
+      text,
+      position: index + 1,
+      status,
+      ...(executionGeneration !== undefined
+        ? { execution_generation: executionGeneration }
+        : {}),
+    });
+  });
+  return { present: true, admissions, unknownTurns, queuedAdmissions };
+}
+
+function canonicalTerminalState(outcome: string): QueuedAdmissionState | null {
+  switch (outcome) {
+    case "cancelled":
+    case "canceled":
+      return "cancelled";
+    case "stopped":
+      return "stopped";
+    case "interrupted":
+      return "interrupted";
+    case "completed":
+    case "settled":
+      return "completed";
+    case "failed":
+    case "error":
+      return "error";
+    default:
+      return null;
+  }
+}
+
+function canonicalReceiptToQueueItem(
+  receipt: Record<string, unknown>,
+  pending: CanonicalPendingAdmission,
+  submissionId: string,
+): RawGatewayQueueItem | null {
+  const admissionId = asString(receipt.admission_id ?? receipt.admissionId).trim();
+  const status = asString(receipt.status).trim().toLowerCase();
+  if (!admissionId || admissionId !== pending.admissionId) return null;
+  const state =
+    status === "queued"
+      ? "queued"
+      : status === "started"
+        ? "started"
+        : status === "terminal"
+          ? canonicalTerminalState(asString(receipt.outcome).trim().toLowerCase())
+          : null;
+  if (!state) return null;
+  const executionGenerationRaw =
+    receipt.execution_generation ?? receipt.executionGeneration ?? pending.executionGeneration;
+  const executionGeneration =
+    typeof executionGenerationRaw === "number" && Number.isFinite(executionGenerationRaw)
+      ? executionGenerationRaw
+      : undefined;
+  return {
+    admission_id: admissionId,
+    submission_id: submissionId,
+    text: pending.text,
+    position: pending.position,
+    state,
+    ...(executionGeneration !== undefined
+      ? { execution_generation: executionGeneration }
+      : {}),
+  };
+}
+
+function normalizeCanonicalResolveUnknownReceipt(
+  res: Record<string, unknown>,
+): Record<string, unknown> {
+  const status = asString(res.status).trim().toLowerCase();
+  // Canonical resolve_unknown returns AdmissionStatus. Only a terminal row proves the unknown
+  // admission was acknowledged; queued/started/unknown must not remove it locally.
+  return { ...res, settled: status === "terminal" };
+}
+
 export class ConnectionSupervisor {
   private readonly localBackend: LocalBackendManager;
   private readonly getLocalLabel: () => string;
@@ -3684,14 +3840,23 @@ export class ConnectionSupervisor {
       rawResult && typeof (rawResult.execution_generation ?? rawResult.executionGeneration) === "number"
         ? Number(rawResult.execution_generation ?? rawResult.executionGeneration)
         : undefined;
-    const rawUnknownTurns = rawResult
-      ? ((rawResult.unknown_turns ?? rawResult.unknownTurns) as RawGatewayUnknownTurn[] | undefined)
-      : undefined;
-    const rawQueue = rawResult
-      ? ((rawResult.queued_admissions ?? rawResult.queuedAdmissions ?? rawResult.queue) as
-          | RawGatewayQueueItem[]
-          | undefined)
-      : undefined;
+    const canonicalPending = this.usesCanonicalSessionControlWire(entry)
+      ? projectCanonicalPending(rawResult)
+      : null;
+    const rawUnknownTurns = canonicalPending?.present
+      ? canonicalPending.unknownTurns
+      : rawResult
+        ? ((rawResult.unknown_turns ?? rawResult.unknownTurns) as
+            | RawGatewayUnknownTurn[]
+            | undefined)
+        : undefined;
+    const rawQueue = canonicalPending?.present
+      ? canonicalPending.queuedAdmissions
+      : rawResult
+        ? ((rawResult.queued_admissions ?? rawResult.queuedAdmissions ?? rawResult.queue) as
+            | RawGatewayQueueItem[]
+            | undefined)
+        : undefined;
     const rawLastOutcome = rawResult
       ? ((rawResult.last_turn_outcome ?? rawResult.lastTurnOutcome) as
           | "completed"
@@ -3713,6 +3878,7 @@ export class ConnectionSupervisor {
           ...(gwExecGen !== undefined ? { executionGeneration: gwExecGen } : {}),
           ...(Array.isArray(rawUnknownTurns) ? { unknownTurns: rawUnknownTurns } : {}),
           ...(Array.isArray(rawQueue) ? { queuedAdmissions: rawQueue } : {}),
+          ...(canonicalPending?.present ? { queueSnapshotProvesAbsence: false } : {}),
           ...(rawLastOutcome !== undefined ? { lastTurnOutcome: rawLastOutcome } : {}),
         })
       : this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
@@ -6643,6 +6809,7 @@ export class ConnectionSupervisor {
           : undefined;
       const executionGeneration =
         typeof payload.executionGeneration === "number" ? payload.executionGeneration : undefined;
+      const canonicalWire = this.usesCanonicalSessionControlWire(entry);
 
       try {
         const result = await this.turnCoordinator.resolveUnknown(
@@ -6653,13 +6820,20 @@ export class ConnectionSupervisor {
             admissionId,
             executionGeneration,
           },
-          async ({ admission_id, execution_generation }) =>
-            entry.client.call<Record<string, unknown>>("prompt.resolve_unknown", {
-              ...this.gatewayProfileParams(entry, profileId),
-              session_id: sessionId,
-              admission_id,
-              execution_generation,
-            }),
+          async ({ admission_id, execution_generation }) => {
+            const receipt = await entry.client.call<Record<string, unknown>>(
+              "prompt.resolve_unknown",
+              {
+                ...(canonicalWire ? {} : this.gatewayProfileParams(entry, profileId)),
+                session_id: sessionId,
+                admission_id,
+                execution_generation,
+              },
+            );
+            return canonicalWire
+              ? normalizeCanonicalResolveUnknownReceipt(receipt)
+              : receipt;
+          },
         );
         this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
           type: "turn_state",
@@ -6725,6 +6899,34 @@ export class ConnectionSupervisor {
       return this.turnCoordinator.checkQueueReceipt(
         { connectionId, profileId, sessionId, submissionId },
         async (subId) => {
+          if (this.usesCanonicalSessionControlWire(entry)) {
+            // PromptReceiptParams is extra=forbid and has no submission_id/profile. Resolve the
+            // admission from the canonical resume snapshot's pending[].input_id first, then ask
+            // for the exact admission receipt.
+            const resumeRes = await entry.client.call<Record<string, unknown>>("session.resume", {
+              ...this.gatewayProfileParams(entry, profileId),
+              session_id: sessionId,
+            });
+            const pending = projectCanonicalPending(resumeRes);
+            if (!pending.present) {
+              return { found: false, absenceConfirmed: false };
+            }
+            const match = pending.admissions.find((item) => item.inputId === subId);
+            if (!match) {
+              // Terminal admissions are not listed in canonical pending. Absence there cannot
+              // prove the submission never entered the FIFO.
+              return { found: false, absenceConfirmed: false };
+            }
+            const receiptRes = await entry.client.call<Record<string, unknown>>("prompt.receipt", {
+              session_id: sessionId,
+              admission_id: match.admissionId,
+            });
+            const admission = canonicalReceiptToQueueItem(receiptRes, match, subId);
+            return admission
+              ? { found: true, admission }
+              : { found: false, absenceConfirmed: false };
+          }
+
           try {
             const receiptRes = await entry.client.call<Record<string, unknown>>("prompt.receipt", {
               ...this.gatewayProfileParams(entry, profileId),

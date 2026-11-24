@@ -602,6 +602,7 @@ export class TurnRecoveryCoordinator {
     queuedAdmissions?: readonly RawGatewayQueueItem[];
     lastTurnOutcome?: "completed" | "stopped" | "interrupted" | "error" | null;
     matchedSubmissionIds?: readonly string[];
+    queueSnapshotProvesAbsence?: boolean;
   }): TurnSessionRecoveryView {
     const nowIso = new Date(this.now()).toISOString();
     const rec = this.ensureSession(input.connectionId, input.profileId, input.sessionId, nowIso);
@@ -696,7 +697,10 @@ export class TurnRecoveryCoordinator {
 
     if (input.queuedAdmissions !== undefined) {
       this.replaceQueueFromGateway(rec, input.queuedAdmissions, nowIso, input.matchedSubmissionIds);
-      if (rec.pendingDeliveryUnknown.length > 0) {
+      // Canonical session.resume only lists queued/started/unknown admissions. A terminal row is
+      // absent from that list, so an empty/missing submission is not proof it never entered the
+      // authoritative queue. Legacy snapshots keep their historical retry-ready behavior.
+      if (input.queueSnapshotProvesAbsence !== false && rec.pendingDeliveryUnknown.length > 0) {
         rec.pendingDeliveryUnknown = rec.pendingDeliveryUnknown.map((u) =>
           Object.freeze({
             ...u,
@@ -838,6 +842,7 @@ export class TurnRecoveryCoordinator {
       found: boolean;
       admission?: RawGatewayQueueItem;
       queuedAdmissions?: RawGatewayQueueItem[];
+      absenceConfirmed?: boolean;
     }>,
   ): Promise<{
     found: boolean;
@@ -916,6 +921,25 @@ export class TurnRecoveryCoordinator {
         found: true,
         canRetrySameSubmission: false,
         admission: alreadyInQueue,
+      };
+    }
+
+    if (res.absenceConfirmed === false) {
+      const unresolved = pending
+        ? this.upsertDeliveryUnknown(
+            rec,
+            input.submissionId,
+            pending.text,
+            "delivery_unknown",
+            false,
+            "Gateway pending 中未找到该 submission_id，无法确认是否已入队或已进入终态",
+            afterIso,
+          )
+        : undefined;
+      return {
+        found: false,
+        canRetrySameSubmission: false,
+        ...(unresolved ? { deliveryUnknown: unresolved } : {}),
       };
     }
 

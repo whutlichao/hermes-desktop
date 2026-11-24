@@ -4813,6 +4813,7 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
     "prompt.submit",
     "prompt.cancel",
     "prompt.receipt",
+    "prompt.resolve_unknown",
   ]);
 
   function makeStrictOnRpc(options: StrictGatewayOptions) {
@@ -5977,12 +5978,18 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
         (
           supervisor as unknown as {
             gatewayProfileParams: (
-              entry: { connectionId: string; defaultProfileId: string; transportMode: string },
+              entry: {
+                kind: "local" | "remote" | "ssh";
+                connectionId: string;
+                defaultProfileId: string;
+                transportMode: string;
+              },
               profileId: string,
             ) => { profile?: string };
           }
         ).gatewayProfileParams(
           {
+            kind: "local",
             connectionId: "local",
             defaultProfileId: defaultProfile,
             transportMode: "shared-host-scope",
@@ -5993,6 +6000,738 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
       expect(routeFor(opsProfile)).toEqual({ profile: "ops" });
       expect(routeFor(defaultProfile)).toEqual({});
 
+      const legacyRouteFor = (
+        kind: "remote" | "ssh",
+        profileId: string,
+      ) =>
+        (
+          supervisor as unknown as {
+            gatewayProfileParams: (
+              entry: {
+                kind: "local" | "remote" | "ssh";
+                connectionId: string;
+                defaultProfileId: string;
+                transportMode: string;
+              },
+              profileId: string,
+            ) => { profile?: string; profile_id?: string };
+          }
+        ).gatewayProfileParams(
+          {
+            kind,
+            connectionId: kind === "remote" ? "remote-1" : "ssh-1",
+            defaultProfileId: defaultProfile,
+            transportMode: "per-profile",
+          },
+          profileId,
+        );
+
+      expect(legacyRouteFor("remote", opsProfile)).toEqual({ profile_id: opsProfile });
+      expect(legacyRouteFor("ssh", opsProfile)).toEqual({ profile_id: opsProfile });
+      expect(legacyRouteFor("ssh", defaultProfile)).toEqual({ profile_id: defaultProfile });
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("maps canonical pending input_id to admission_id for prompt.receipt and keeps absent pending unresolved", async () => {
+    const sandbox = createTestSandbox("hermes-canonical-receipt-");
+    const profileIdentity = "/private/tmp/hermes-canonical-receipt-home";
+    const validTickets = new Set<string>();
+    const pending: Array<Record<string, unknown>> = [
+      {
+        admission_id: "adm-pending",
+        input_id: "sub-pending",
+        ref: { profile_id: profileIdentity, session_id: "sess-receipt" },
+        sequence: 1,
+        status: "queued",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 4,
+        text: "pending text",
+      },
+      {
+        admission_id: "adm-terminal",
+        input_id: "sub-terminal",
+        ref: { profile_id: profileIdentity, session_id: "sess-receipt" },
+        sequence: 2,
+        status: "queued",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 4,
+        text: "terminal text",
+      },
+      {
+        admission_id: "adm-unknown",
+        input_id: "sub-unknown",
+        ref: { profile_id: profileIdentity, session_id: "sess-receipt" },
+        sequence: 3,
+        status: "unknown",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 4,
+        text: "unknown text",
+      },
+    ];
+    const receiptParams: Array<Record<string, unknown>> = [];
+    const strict = makeStrictOnRpc({ profileIdentity });
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume") {
+          ctx.replyResult({
+            session_id: params.session_id,
+            messages: [],
+            active_turn_id: null,
+            execution_generation: 4,
+            pending,
+          });
+          return true;
+        }
+        if (method === "prompt.submit") {
+          ctx.replyResult({ admitted: true, status: "queued" });
+          return true;
+        }
+        if (method === "prompt.receipt") {
+          receiptParams.push({ ...params });
+          if ("profile" in params || "profile_id" in params || "submission_id" in params) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: Object.keys(params),
+            });
+            return true;
+          }
+          const item = pending.find((row) => row.admission_id === params.admission_id);
+          if (!item) {
+            ctx.replyError(4001, "not_found", { reason: "not_found" });
+            return true;
+          }
+          const terminal = item.admission_id === "adm-terminal";
+          const status =
+            item.admission_id === "adm-unknown" ? "unknown" : terminal ? "terminal" : "queued";
+          ctx.replyResult({
+            admission_id: item.admission_id,
+            ref: item.ref,
+            sequence: item.sequence,
+            status,
+            outcome: terminal ? "completed" : null,
+            authority_epoch: 1,
+            execution_generation: item.execution_generation,
+          });
+          return true;
+        }
+        return strict(method, params, ctx);
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+      const scope = {
+        connectionId: "local",
+        profileId: profileIdentity,
+        sessionId: "sess-receipt",
+      };
+      const recoveryEvents: TurnRecoveryTopicSnapshot[] = [];
+      const unsub = supervisor.subscribe("turn.recovery", null, (event) => {
+        recoveryEvents.push(event.payload as TurnRecoveryTopicSnapshot);
+      });
+      const latest = () =>
+        recoveryEvents[recoveryEvents.length - 1]?.sessions.find(
+          (item) => item.sessionId === "sess-receipt",
+        ) ?? null;
+
+      const lost = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-receipt", text: "pending text", submissionId: "sub-pending" },
+        scope,
+      )) as { status: string; deliveryUnknown?: { submissionId: string } };
+      expect(lost).toMatchObject({
+        status: "delivery_unknown",
+        deliveryUnknown: { submissionId: "sub-pending" },
+      });
+      expect(latest()?.pendingDeliveryUnknown).toHaveLength(1);
+
+      const receipt = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-receipt", submissionId: "sub-pending" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(receipt).toMatchObject({ found: true, canRetrySameSubmission: false });
+      expect(receiptParams).toEqual([{ session_id: "sess-receipt", admission_id: "adm-pending" }]);
+      expect(gw.rpcCalls.filter((call) => call.method === "session.resume").at(-1)?.params).toEqual({
+        session_id: "sess-receipt",
+      });
+      expect(latest()?.pendingDeliveryUnknown).toHaveLength(0);
+      expect(
+        latest()?.queuedAdmissions.find((item) => item.submissionId === "sub-pending"),
+      ).toMatchObject({
+        admissionId: "adm-pending",
+        state: "queued",
+      });
+
+      const lostTerminal = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-receipt", text: "terminal text", submissionId: "sub-terminal" },
+        scope,
+      )) as { status: string };
+      expect(lostTerminal.status).toBe("delivery_unknown");
+      const terminalReceipt = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-receipt", submissionId: "sub-terminal" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(terminalReceipt).toMatchObject({ found: true, canRetrySameSubmission: false });
+      expect(receiptParams.at(-1)).toEqual({
+        session_id: "sess-receipt",
+        admission_id: "adm-terminal",
+      });
+      expect(latest()?.pendingDeliveryUnknown).toHaveLength(0);
+      expect(
+        latest()?.queuedAdmissions.find((item) => item.submissionId === "sub-terminal")?.state,
+      ).toBe("completed");
+
+      const lostMissing = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-receipt", text: "missing text", submissionId: "sub-missing" },
+        scope,
+      )) as { status: string };
+      expect(lostMissing.status).toBe("delivery_unknown");
+      const callsBeforeMissing = receiptParams.length;
+      const missing = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-receipt", submissionId: "sub-missing" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(missing).toMatchObject({ found: false, canRetrySameSubmission: false });
+      expect(receiptParams).toHaveLength(callsBeforeMissing);
+      expect(
+        latest()?.pendingDeliveryUnknown.find((item) => item.submissionId === "sub-missing"),
+      ).toMatchObject({
+        state: "delivery_unknown",
+        canRetrySameSubmission: false,
+      });
+
+      const lostUnknown = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-receipt", text: "unknown text", submissionId: "sub-unknown" },
+        scope,
+      )) as { status: string };
+      expect(lostUnknown.status).toBe("delivery_unknown");
+      const unknownReceipt = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-receipt", submissionId: "sub-unknown" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(unknownReceipt).toMatchObject({ found: false, canRetrySameSubmission: false });
+      expect(receiptParams.at(-1)).toEqual({
+        session_id: "sess-receipt",
+        admission_id: "adm-unknown",
+      });
+      expect(
+        latest()?.pendingDeliveryUnknown.find((item) => item.submissionId === "sub-unknown"),
+      ).toMatchObject({
+        state: "delivery_unknown",
+        canRetrySameSubmission: false,
+      });
+
+      unsub();
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("normalizes canonical session.resume pending into recovery and only resolves terminal resolve_unknown receipts", async () => {
+    const sandbox = createTestSandbox("hermes-canonical-pending-recovery-");
+    const profileIdentity = "/private/tmp/hermes-canonical-pending-recovery-home";
+    const validTickets = new Set<string>();
+    const pending: Array<Record<string, unknown>> = [
+      {
+        admission_id: "adm-unknown-1",
+        input_id: "sub-unknown-1",
+        ref: { profile_id: profileIdentity, session_id: "sess-recovery" },
+        sequence: 1,
+        status: "unknown",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 7,
+        text: "lost one",
+      },
+      {
+        admission_id: "adm-unknown-2",
+        input_id: "sub-unknown-2",
+        ref: { profile_id: profileIdentity, session_id: "sess-recovery" },
+        sequence: 2,
+        status: "unknown",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 8,
+        text: "lost two",
+      },
+      {
+        admission_id: "adm-queued",
+        input_id: "sub-queued",
+        ref: { profile_id: profileIdentity, session_id: "sess-recovery" },
+        sequence: 3,
+        status: "queued",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 7,
+        text: "queued text",
+      },
+      {
+        admission_id: "adm-started",
+        input_id: "sub-started",
+        ref: { profile_id: profileIdentity, session_id: "sess-recovery" },
+        sequence: 4,
+        status: "started",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 7,
+        text: "started text",
+      },
+    ];
+    let resolveStatus: "terminal" | "unknown" = "terminal";
+    const resolveParams: Array<Record<string, unknown>> = [];
+    const strict = makeStrictOnRpc({
+      profileIdentity,
+      storedSessions: [
+        {
+          id: "sess-recovery",
+          session_id: "sess-recovery",
+          title: "Recovery",
+          source: "cli",
+          started_at: 1795510000,
+          message_count: 1,
+        },
+      ],
+    });
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume") {
+          ctx.replyResult({
+            session_id: params.session_id,
+            messages: [],
+            active_turn_id: null,
+            execution_generation: 8,
+            pending,
+          });
+          return true;
+        }
+        if (method === "prompt.resolve_unknown") {
+          resolveParams.push({ ...params });
+          if ("profile" in params || "profile_id" in params) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: Object.keys(params),
+            });
+            return true;
+          }
+          const item = pending.find((row) => row.admission_id === params.admission_id);
+          if (!item) {
+            ctx.replyError(4001, "not_found", { reason: "not_found" });
+            return true;
+          }
+          ctx.replyResult({
+            admission_id: item.admission_id,
+            ref: item.ref,
+            sequence: item.sequence,
+            status: resolveStatus,
+            outcome: resolveStatus === "terminal" ? "interrupted" : null,
+            authority_epoch: 1,
+            execution_generation: item.execution_generation,
+          });
+          return true;
+        }
+        return strict(method, params, ctx);
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+      const scope = {
+        connectionId: "local",
+        profileId: profileIdentity,
+        sessionId: "sess-recovery",
+      };
+      const recoveryEvents: TurnRecoveryTopicSnapshot[] = [];
+      const unsub = supervisor.subscribe("turn.recovery", null, (event) => {
+        recoveryEvents.push(event.payload as TurnRecoveryTopicSnapshot);
+      });
+      const latest = () =>
+        recoveryEvents[recoveryEvents.length - 1]?.sessions.find(
+          (item) => item.sessionId === "sess-recovery",
+        ) ?? null;
+
+      await supervisor.handlers["sessions.select"]({ sessionId: "sess-recovery" }, scope);
+      const resumed = latest();
+      expect(resumed?.unknownTurns.map((item) => item.admissionId)).toEqual([
+        "adm-unknown-1",
+        "adm-unknown-2",
+      ]);
+      expect(resumed?.unknownTurns[0]).toMatchObject({
+        executionGeneration: 7,
+        originalInput: "lost one",
+      });
+      expect(
+        resumed?.queuedAdmissions.map((item) => [
+          item.admissionId,
+          item.submissionId,
+          item.state,
+        ]),
+      ).toEqual([
+        ["adm-queued", "sub-queued", "queued"],
+        ["adm-started", "sub-started", "already_started"],
+      ]);
+      expect(resumed?.queuePaused).toBe(true);
+
+      const resolved = (await supervisor.handlers["prompts.resolveUnknown"](
+        {
+          sessionId: "sess-recovery",
+          admissionId: "adm-unknown-1",
+          executionGeneration: 7,
+        },
+        scope,
+      )) as { resolved: boolean; status: string };
+      expect(resolved).toMatchObject({ resolved: true, status: "interrupted" });
+      expect(resolveParams[0]).toEqual({
+        session_id: "sess-recovery",
+        admission_id: "adm-unknown-1",
+        execution_generation: 7,
+      });
+      expect(latest()?.unknownTurns.map((item) => item.admissionId)).toEqual(["adm-unknown-2"]);
+
+      resolveStatus = "unknown";
+      await expect(
+        supervisor.handlers["prompts.resolveUnknown"](
+          {
+            sessionId: "sess-recovery",
+            admissionId: "adm-unknown-2",
+            executionGeneration: 8,
+          },
+          scope,
+        ),
+      ).rejects.toMatchObject({ code: "conflict" });
+      expect(resolveParams[1]).toEqual({
+        session_id: "sess-recovery",
+        admission_id: "adm-unknown-2",
+        execution_generation: 8,
+      });
+      expect(latest()?.unknownTurns.map((item) => item.admissionId)).toEqual(["adm-unknown-2"]);
+      expect(latest()?.unknownTurns[0]?.resolving).toBe(false);
+
+      unsub();
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("uses the non-default shared-host profile handle for resume and profile-free canonical receipt and resolve_unknown", async () => {
+    const sandbox = createTestSandbox("hermes-canonical-ops-profile-");
+    const defaultProfile = "/private/tmp/hermes-canonical-ops-default";
+    const opsProfile = "ops";
+    const validTickets = new Set<string>();
+    const pending: Array<Record<string, unknown>> = [
+      {
+        admission_id: "adm-ops-unknown",
+        input_id: "sub-ops-unknown",
+        ref: { profile_id: opsProfile, session_id: "sess-ops" },
+        sequence: 1,
+        status: "unknown",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 9,
+        text: "ops lost",
+      },
+      {
+        admission_id: "adm-ops-q",
+        input_id: "sub-ops",
+        ref: { profile_id: opsProfile, session_id: "sess-ops" },
+        sequence: 2,
+        status: "queued",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 9,
+        text: "ops queued",
+      },
+    ];
+    const receiptParams: Array<Record<string, unknown>> = [];
+    const resolveParams: Array<Record<string, unknown>> = [];
+    const strict = makeStrictOnRpc({
+      profileIdentity: defaultProfile,
+      storedSessions: [
+        {
+          id: "sess-ops",
+          session_id: "sess-ops",
+          profile_id: opsProfile,
+          title: "Ops",
+          source: "cli",
+          started_at: 1795510000,
+          message_count: 1,
+        },
+      ],
+    });
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: defaultProfile,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+        {
+          profile_id: opsProfile,
+          display_name: "Ops",
+          handle: "ops",
+          is_default: false,
+        },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume") {
+          if (params.profile !== "ops") {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: ["profile"],
+            });
+            return true;
+          }
+          ctx.replyResult({
+            session_id: params.session_id,
+            messages: [],
+            active_turn_id: null,
+            execution_generation: 9,
+            pending,
+          });
+          return true;
+        }
+        if (method === "prompt.submit") {
+          ctx.replyResult({ admitted: true, status: "queued" });
+          return true;
+        }
+        if (method === "prompt.receipt") {
+          receiptParams.push({ ...params });
+          if ("profile" in params || "profile_id" in params || "submission_id" in params) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: Object.keys(params),
+            });
+            return true;
+          }
+          ctx.replyResult({
+            admission_id: params.admission_id,
+            ref: { profile_id: opsProfile, session_id: "sess-ops" },
+            sequence: 2,
+            status: "queued",
+            outcome: null,
+            authority_epoch: 1,
+            execution_generation: 9,
+          });
+          return true;
+        }
+        if (method === "prompt.resolve_unknown") {
+          resolveParams.push({ ...params });
+          if ("profile" in params || "profile_id" in params) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: Object.keys(params),
+            });
+            return true;
+          }
+          ctx.replyResult({
+            admission_id: params.admission_id,
+            ref: { profile_id: opsProfile, session_id: "sess-ops" },
+            sequence: 1,
+            status: "terminal",
+            outcome: "interrupted",
+            authority_epoch: 1,
+            execution_generation: 9,
+          });
+          return true;
+        }
+        return strict(method, params, ctx);
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity: defaultProfile,
+      });
+      const internal = supervisor as unknown as {
+        transports: Map<
+          string,
+          { key: string; transportMode: "shared-host-scope" | "per-profile" }
+        >;
+      };
+      const perProfileEntry = internal.transports.get(`local::profile:${defaultProfile}`);
+      expect(perProfileEntry).toBeDefined();
+      internal.transports.delete(`local::profile:${defaultProfile}`);
+      perProfileEntry!.key = "local::shared";
+      perProfileEntry!.transportMode = "shared-host-scope";
+      internal.transports.set("local::shared", perProfileEntry!);
+
+      const scope = {
+        connectionId: "local",
+        profileId: opsProfile,
+        sessionId: "sess-ops",
+      };
+      const recoveryEvents: TurnRecoveryTopicSnapshot[] = [];
+      const unsub = supervisor.subscribe("turn.recovery", null, (event) => {
+        recoveryEvents.push(event.payload as TurnRecoveryTopicSnapshot);
+      });
+      const latest = () =>
+        recoveryEvents[recoveryEvents.length - 1]?.sessions.find(
+          (item) => item.sessionId === "sess-ops",
+        ) ?? null;
+
+      await supervisor.handlers["sessions.select"]({ sessionId: "sess-ops" }, scope);
+      const resumeCalls = gw.rpcCalls.filter((call) => call.method === "session.resume");
+      expect(resumeCalls.length).toBeGreaterThan(0);
+      for (const call of resumeCalls) {
+        expect(call.params).toMatchObject({ profile: "ops", session_id: "sess-ops" });
+        expect(call.params).not.toHaveProperty("profile_id");
+      }
+      expect(latest()?.unknownTurns.map((item) => item.admissionId)).toEqual(["adm-ops-unknown"]);
+      expect(latest()?.queuedAdmissions.map((item) => item.submissionId)).toEqual(["sub-ops"]);
+
+      const resolved = (await supervisor.handlers["prompts.resolveUnknown"](
+        {
+          sessionId: "sess-ops",
+          admissionId: "adm-ops-unknown",
+          executionGeneration: 9,
+        },
+        scope,
+      )) as { resolved: boolean };
+      expect(resolved.resolved).toBe(true);
+      expect(resolveParams[0]).toEqual({
+        session_id: "sess-ops",
+        admission_id: "adm-ops-unknown",
+        execution_generation: 9,
+      });
+      expect(resolveParams[0]).not.toHaveProperty("profile");
+
+      const lost = (await supervisor.handlers["prompts.queue"](
+        { sessionId: "sess-ops", text: "ops lost ack", submissionId: "sub-ops-acklost" },
+        scope,
+      )) as { status: string };
+      expect(lost.status).toBe("delivery_unknown");
+      const submitCall = gw.rpcCalls.filter((call) => call.method === "prompt.submit").at(-1);
+      expect(submitCall?.params).toMatchObject({
+        profile: "ops",
+        session_id: "sess-ops",
+        submission_id: "sub-ops-acklost",
+      });
+      expect(submitCall?.params).not.toHaveProperty("profile_id");
+
+      pending.push({
+        admission_id: "adm-ops-acklost",
+        input_id: "sub-ops-acklost",
+        ref: { profile_id: opsProfile, session_id: "sess-ops" },
+        sequence: 3,
+        status: "queued",
+        outcome: null,
+        authority_epoch: 1,
+        execution_generation: 9,
+        text: "ops lost ack",
+      });
+      const receipt = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "sess-ops", submissionId: "sub-ops-acklost" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(receipt).toMatchObject({ found: true, canRetrySameSubmission: false });
+      expect(receiptParams[0]).toEqual({
+        session_id: "sess-ops",
+        admission_id: "adm-ops-acklost",
+      });
+      expect(receiptParams[0]).not.toHaveProperty("profile");
+      expect(latest()?.pendingDeliveryUnknown).toHaveLength(0);
+      expect(
+        latest()?.queuedAdmissions.find((item) => item.submissionId === "sub-ops-acklost"),
+      ).toMatchObject({
+        admissionId: "adm-ops-acklost",
+        state: "queued",
+      });
+
+      unsub();
       passed = true;
     } finally {
       await supervisor?.dispose();
