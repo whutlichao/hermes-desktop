@@ -56,6 +56,82 @@ describe("Terminal bounded scrollback & Git/Worktree deep links (Ticket #40)", (
     expect(buf.trimmedOldest).toBe(false);
   });
 
+  it("handles empty chunks, custom caps, printable controls, OSC ST, split CRLF, and half-cut edge cases", () => {
+    const initial = createTerminalScrollbackState();
+    expect(appendTerminalChunk(initial, "")).toBe(initial);
+
+    let buf = createTerminalScrollbackState();
+    buf = appendTerminalChunk(buf, "seed\nline\n", { maxLines: 1 });
+    expect(buf.lines).toEqual(["line"]);
+    expect(buf.trimmedOldest).toBe(true);
+    buf = appendTerminalChunk(createTerminalScrollbackState(), "a\r\nb\rc\n", { maxLines: 2 });
+    expect(projectTerminalScrollbackLines(buf)).toEqual(["a", "c"]);
+    expect(buf.trimmedOldest).toBe(false);
+
+    let customBytes = createTerminalScrollbackState();
+    customBytes = appendTerminalChunk(customBytes, "12345\n67890\nabc", { maxBytes: 8 });
+    expect(customBytes.totalBytes).toBeLessThanOrEqual(8);
+    expect(customBytes.trimmedOldest).toBe(true);
+    expect(projectTerminalScrollbackLines(customBytes)).toEqual(["abc"]);
+
+    let controls = createTerminalScrollbackState();
+    controls = appendTerminalChunk(controls, "x\u0001\u0007\u001b]0;title\u001b\\yz\b\b\u0000\t!\n");
+    expect(projectTerminalScrollbackLines(controls)).toEqual(["x\t!"]);
+
+    let backspaceEmpty = createTerminalScrollbackState();
+    backspaceEmpty = appendTerminalChunk(backspaceEmpty, "\b\b");
+    expect(projectTerminalScrollbackLines(backspaceEmpty)).toEqual([]);
+
+    let crlf = createTerminalScrollbackState();
+    crlf = appendTerminalChunk(crlf, "\r\n");
+    expect(projectTerminalScrollbackLines(crlf)).toEqual([""]);
+
+    let lineCapWithCurrentLine = createTerminalScrollbackState();
+    lineCapWithCurrentLine = appendTerminalChunk(lineCapWithCurrentLine, "one\ntwo\nthree", {
+      maxLines: 2,
+    });
+    expect(projectTerminalScrollbackLines(lineCapWithCurrentLine)).toEqual(["two", "three"]);
+
+    let byteCapAllComplete = createTerminalScrollbackState();
+    byteCapAllComplete = appendTerminalChunk(byteCapAllComplete, "12345678\n12345678\n", {
+      maxBytes: 4,
+    });
+    expect(projectTerminalScrollbackLines(byteCapAllComplete)).toEqual([]);
+    expect(byteCapAllComplete.trimmedOldest).toBe(true);
+
+    const inconsistentByteAccounting = {
+      lines: ["one", "two"],
+      lineBytes: [],
+      currentLine: "tail",
+      currentLineBytes: 4,
+      trimmedOldest: false,
+      totalBytes: 0,
+    };
+    const repaired = appendTerminalChunk(inconsistentByteAccounting, "!", {
+      maxLines: 1,
+      maxBytes: 0,
+    });
+    expect(repaired.lines).toEqual([]);
+    expect(repaired.currentLine).toBe("tail!");
+    expect(repaired.trimmedOldest).toBe(true);
+
+    const byteOnlyTrim = appendTerminalChunk(
+      {
+        lines: ["one", "two"],
+        lineBytes: [],
+        currentLine: "tail",
+        currentLineBytes: 4,
+        trimmedOldest: false,
+        totalBytes: 0,
+      },
+      "!",
+      { maxLines: 10, maxBytes: 0 },
+    );
+    expect(byteOnlyTrim.lines).toEqual([]);
+    expect(byteOnlyTrim.currentLine).toBe("tail!");
+    expect(byteOnlyTrim.trimmedOldest).toBe(true);
+  });
+
   it("creates idle empty snapshot with scope binding and null opaque terminalId", () => {
     const snap = createEmptyTerminalSnapshot({ connectionId: "local", profileId: "default" });
     expect(snap.scope).toEqual({ connectionId: "local", profileId: "default" });
@@ -65,6 +141,18 @@ describe("Terminal bounded scrollback & Git/Worktree deep links (Ticket #40)", (
     expect(snap.lines).toEqual([]);
     expect(snap.trimmedOldest).toBe(false);
     expect(snap.attribution.origin).toBe("builtin");
+
+    const defaults = createEmptyTerminalSnapshot();
+    expect(defaults.scope).toEqual({ connectionId: "local", profileId: "default" });
+    const overridden = createEmptyTerminalSnapshot(
+      { connectionId: "remote-1", profileId: "ops" },
+      { status: "running", cols: 120, rows: 40, terminalId: "term-1" },
+    );
+    expect(overridden.scope).toEqual({ connectionId: "remote-1", profileId: "ops" });
+    expect(overridden.status).toBe("running");
+    expect(overridden.cols).toBe(120);
+    expect(overridden.rows).toBe(40);
+    expect(overridden.terminalId).toBe("term-1");
   });
 
   it("provides exact Git/Worktree CLI deep links and https docs without git.* RPC or hermes:// scheme", () => {

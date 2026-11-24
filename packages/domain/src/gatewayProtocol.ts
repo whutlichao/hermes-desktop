@@ -376,6 +376,14 @@ export function filterProfilesForConnection(
 }
 
 export function reduceTranscriptEvent(
+  current: SessionTranscriptSnapshot,
+  event: BridgeEvent,
+): SessionTranscriptSnapshot;
+export function reduceTranscriptEvent(
+  current: SessionTranscriptSnapshot | null,
+  event: BridgeEvent,
+): SessionTranscriptSnapshot | null;
+export function reduceTranscriptEvent(
   current: SessionTranscriptSnapshot | null,
   event: BridgeEvent,
 ): SessionTranscriptSnapshot | null {
@@ -574,9 +582,6 @@ export function createTranscriptSyncController() {
       revision: 0,
       payload: patch,
     });
-    if (!next) {
-      return { status: "ignored" };
-    }
     current = next;
     lastSeq = seq;
     return { status: "applied", snapshot: current };

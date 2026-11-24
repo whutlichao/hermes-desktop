@@ -17,7 +17,7 @@
     "package:mac:dist": "node scripts/package-mac.mjs --dist",
     "smoke:packaged": "node scripts/smoke-packaged.mjs",
     "typecheck": "tsc -b --pretty false",
-    "test": "vitest run",
+    "test": "vitest run --coverage",
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test --project=e2e",
     "test:a11y": "playwright test --project=a11y",

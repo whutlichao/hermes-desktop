@@ -65,7 +65,7 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Unit & Contract Tests
+      - name: Unit, Contract & Coverage Tests
         run: pnpm test
 
       - name: Guard - No Official Desktop

@@ -338,4 +338,152 @@ describe("ActiveChatResolver (S0 table-driven fallback matrix)", () => {
     expect(startup.routeBanner).toBeNull();
     expect(startup.shouldAutoCreateSession).toBe(false);
   });
+
+  it("covers missing timestamps, empty-session fallbacks, transient profile-less scopes, and sessionless scopes", () => {
+    const current: ActiveChatRef = {
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "sess-removed",
+    };
+
+    const sortWithMissingTimestamps = resolveActiveChat({
+      current,
+      connections: [makeConn("local", "ready")],
+      profiles: [makeProfile("local", "default")],
+      sessions: [
+        {
+          ...makeSession("local", "default", "sess-no-time-a"),
+          updatedAt: undefined as unknown as string,
+        },
+        {
+          ...makeSession("local", "default", "sess-no-time-b"),
+          updatedAt: undefined as unknown as string,
+        },
+        makeSession("local", "default", "sess-with-time", "2026-11-23T05:00:00.000Z"),
+      ],
+      lastValidProfileByConnection: { local: "default" },
+      lastSessionByScope: {},
+      lastValidScopes: [],
+      hasDraftForCurrentSession: false,
+    });
+    expect(sortWithMissingTimestamps.activeSessionId).toBe("sess-with-time");
+
+    const fallbackToEmptyScope = resolveActiveChat({
+      current: { connectionId: "removed", profileId: "ops", sessionId: "sess-ops" },
+      connections: [makeConn("staging", "ready")],
+      profiles: [makeProfile("staging", "qa")],
+      sessions: [],
+      lastValidProfileByConnection: {},
+      lastSessionByScope: {},
+      lastValidScopes: [{ connectionId: "staging", profileId: "qa" }],
+      hasDraftForCurrentSession: false,
+    });
+    expect(fallbackToEmptyScope).toMatchObject({
+      activeChat: { connectionId: "staging", profileId: "qa" },
+      activeScope: { connectionId: "staging", profileId: "qa" },
+      activeSessionId: null,
+      status: "ready",
+      lastKnownUnverified: false,
+    });
+
+    const profilelessTransientLastValidScope = resolveActiveChat({
+      current: { connectionId: "removed", profileId: "ops", sessionId: "sess-ops" },
+      connections: [makeConn("staging", "connecting")],
+      profiles: [],
+      sessions: [],
+      lastValidProfileByConnection: {},
+      lastSessionByScope: {},
+      lastValidScopes: [{ connectionId: "staging", profileId: "default" }],
+      hasDraftForCurrentSession: false,
+    });
+    expect(profilelessTransientLastValidScope).toMatchObject({
+      activeChat: { connectionId: "staging", profileId: "default" },
+      status: "unverified",
+      lastKnownUnverified: true,
+    });
+
+    const profilelessTransientLocal = resolveActiveChat({
+      current: { connectionId: "removed", profileId: "ops", sessionId: "sess-ops" },
+      connections: [makeConn("local", "reconnecting")],
+      profiles: [],
+      sessions: [],
+      lastValidProfileByConnection: {},
+      lastSessionByScope: {},
+      lastValidScopes: [],
+      hasDraftForCurrentSession: false,
+    });
+    expect(profilelessTransientLocal).toMatchObject({
+      activeChat: { connectionId: "local", profileId: "default" },
+      status: "unverified",
+    });
+
+    const profilelessTransientOther = resolveActiveChat({
+      current: { connectionId: "removed", profileId: "ops", sessionId: "sess-ops" },
+      connections: [makeConn("vps", "connecting")],
+      profiles: [],
+      sessions: [],
+      lastValidProfileByConnection: {},
+      lastSessionByScope: {},
+      lastValidScopes: [],
+      hasDraftForCurrentSession: false,
+    });
+    expect(profilelessTransientOther).toMatchObject({
+      activeChat: { connectionId: "vps", profileId: "default" },
+      status: "unverified",
+    });
+
+    const profilelessReadyLocalBecomesEmpty = resolveActiveChat({
+      current: { connectionId: "removed", profileId: "ops", sessionId: "sess-ops" },
+      connections: [makeConn("local", "ready")],
+      profiles: [],
+      sessions: [],
+      lastValidProfileByConnection: {},
+      lastSessionByScope: {},
+      lastValidScopes: [],
+      hasDraftForCurrentSession: false,
+    });
+    expect(profilelessReadyLocalBecomesEmpty).toMatchObject({
+      activeChat: null,
+      activeScope: null,
+      status: "empty",
+    });
+
+    const transientWithoutSession = resolveActiveChat({
+      current: { connectionId: "prod", profileId: "work" },
+      connections: [makeConn("prod", "blocked")],
+      profiles: [makeProfile("prod", "work")],
+      sessions: [],
+      lastValidProfileByConnection: { prod: "work" },
+      lastSessionByScope: {},
+      lastValidScopes: [],
+      hasDraftForCurrentSession: false,
+    });
+    expect(transientWithoutSession).toMatchObject({
+      activeChat: { connectionId: "prod", profileId: "work" },
+      activeScope: { connectionId: "prod", profileId: "work" },
+      activeSessionId: null,
+      status: "unverified",
+    });
+    expect(transientWithoutSession.activeScope).not.toHaveProperty("sessionId");
+
+    const sessionlessReadyScope = resolveActiveChat({
+      current: { connectionId: "local", profileId: "default" },
+      connections: [makeConn("local", "ready")],
+      profiles: [makeProfile("local", "default")],
+      sessions: [makeSession("local", "default", "sess-unused")],
+      lastValidProfileByConnection: {},
+      lastSessionByScope: {},
+      lastValidScopes: [],
+      hasDraftForCurrentSession: false,
+    });
+    expect(sessionlessReadyScope).toEqual({
+      activeChat: { connectionId: "local", profileId: "default" },
+      activeScope: { connectionId: "local", profileId: "default" },
+      activeSessionId: null,
+      status: "ready",
+      lastKnownUnverified: false,
+      routeBanner: null,
+      shouldAutoCreateSession: false,
+    });
+  });
 });

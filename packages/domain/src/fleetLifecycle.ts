@@ -124,7 +124,7 @@ export function aggregateConnectionHealth(
   }
 
   const enabledLinks = activeLinks.filter((l) => l.desired === "enabled");
-  const candidateLinks = enabledLinks.length > 0 ? enabledLinks : activeLinks;
+  const candidateLinks = enabledLinks;
   const readyLinks = candidateLinks.filter((l) => l.actual === "ready");
 
   let actual: ConnectionActualState = "idle";
@@ -149,7 +149,7 @@ export function aggregateConnectionHealth(
       (a, b) => ACTUAL_SEVERITY_PRIORITY[b.actual] - ACTUAL_SEVERITY_PRIORITY[a.actual],
     );
     const highest = sorted[0];
-    actual = highest ? highest.actual : "idle";
+    actual = highest.actual;
     if (actual === "stopping") {
       aggregateState = "idle";
     } else {

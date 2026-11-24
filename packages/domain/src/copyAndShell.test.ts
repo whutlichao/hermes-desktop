@@ -98,6 +98,11 @@ describe("zh-CN copy catalog & terminology lint", () => {
     expect(validateTerminology("搜索 Session...")).not.toEqual([]);
     expect(validateTerminology("输入命令或文本后发送至 PTY（例如 pwd）...")).not.toEqual([]);
     expect(validateTerminology("已连接到 Gateway,正在同步")).not.toEqual([]);
+    expect(validateTerminology("已连接，等待数据")).toEqual([]);
+    expect(validateTerminology("已连接（等待）")).toEqual([]);
+    expect(validateTerminology("session 已连接")).not.toEqual([]);
+    expect(validateTerminology("SESSION 已连接")).toEqual([]);
+    expect(validateTerminology("Gateway Session 已连接")).toEqual([]);
     expect(validateTerminology("确定")).not.toEqual([]);
     expect(validateTerminology("取消")).not.toEqual([]);
     expect(validateTerminology("在当前 Scope 新建 Session")).toEqual([]);
@@ -346,5 +351,214 @@ describe("Quiet Relay shell state & layout invariants", () => {
     });
     expect(state.assertiveAnnouncement).toContain("投递状态未知");
     expect(state.liveAnnouncement).toBe("已切换到当前 Scope");
+  });
+
+  it("handles every remaining ShellAction branch and generation/stack guards (Ticket #45 coverage)", () => {
+    let state = createInitialShellState();
+    const appInfo = {
+      bridgeVersion: 1,
+      appName: "Hermes Desktop",
+      appVersion: "0.1.0",
+      gitSha: "abc123",
+      gitDirty: false,
+      buildMode: "dev",
+      distribution: "local-unsigned",
+      electronVersion: "45.4.1",
+      chromiumVersion: "134.0.0.0",
+      nodeVersion: "22.13.0",
+      arch: "arm64",
+      macOSVersion: "15.3.1",
+      source: "git",
+      mode: "electron",
+      platform: "darwin",
+      capabilitiesReady: false,
+    } as const;
+    state = shellReducer(state, { type: "HYDRATE_HELLO", appInfo });
+    expect(state.appInfo?.gitSha).toBe("abc123");
+
+    state = shellReducer(state, {
+      type: "APPLY_FLEET_SNAPSHOT",
+      connections: [],
+      profiles: [],
+      sessions: [],
+      activeScope: { connectionId: "local", profileId: "default" },
+      activeSessionId: "sess-1",
+    });
+    expect(state.activeScope).toEqual({ connectionId: "local", profileId: "default" });
+    expect(state.activeSessionId).toBe("sess-1");
+
+    const transcript: SessionTranscriptSnapshot = {
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "sess-1",
+      messages: [
+        {
+          messageId: "m-1",
+          sessionId: "sess-1",
+          role: "user",
+          text: "你好",
+          createdAt: "2026-11-23T06:00:00.000Z",
+        },
+      ],
+      activeTurnId: "t-1",
+      turnStopping: false,
+      chatAvailable: true,
+      supportedActions: {
+        promptSubmit: true,
+        promptCancel: true,
+        promptSteer: true,
+        sessionCreate: true,
+        sessionResume: true,
+      },
+      snapshotSeq: 2,
+    };
+    state = shellReducer(state, { type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: transcript });
+    expect(state.transcript?.messages).toHaveLength(1);
+    expect(state.transcript?.messages).not.toBe(transcript.messages);
+    expect(state.transcript?.snapshotSeq).toBe(2);
+
+    state = shellReducer(state, {
+      type: "APPLY_TRANSCRIPT_EVENT",
+      event: {
+        topic: "session.transcript",
+        scope: { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+        kind: "patch",
+        seq: 3,
+        revision: 3,
+        payload: {
+          type: "token_delta",
+          sessionId: "sess-1",
+          turnId: "t-1",
+          messageId: "m-2",
+          delta: "回复",
+        },
+      },
+    });
+    expect(state.transcript?.messages).toHaveLength(2);
+    expect(state.transcript?.messages[1].text).toBe("回复");
+
+    state = shellReducer(state, { type: "CLEAR_TRANSCRIPT" });
+    expect(state.transcript).toBeNull();
+
+    state = shellReducer(state, {
+      type: "APPLY_CHAT_STATE",
+      chatState: {
+        windowId: "primary",
+        paneId: "main",
+        lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+        lastSessionByScope: { "local::default": "sess-1" },
+        lastValidProfileByConnection: { local: "default" },
+        lastValidScopes: [{ connectionId: "local", profileId: "default" }],
+        sessionSummaries: {},
+        activeStatus: "ready",
+        lastKnownUnverified: false,
+        missingSession: null,
+        routeBanner: null,
+      },
+    });
+    expect(state.chatState?.activeStatus).toBe("ready");
+
+    state = shellReducer(state, { type: "SET_STOP_ERROR", message: "停止失败" });
+    expect(state.stopError).toBe("停止失败");
+    state = shellReducer(state, { type: "SET_STOP_ERROR", message: null });
+    expect(state.stopError).toBeNull();
+    state = shellReducer(state, { type: "SET_CHAT_BUSY", busy: true });
+    expect(state.chatBusy).toBe(true);
+    state = shellReducer(state, { type: "SET_CHAT_BUSY", busy: false });
+    expect(state.chatBusy).toBe(false);
+
+    const capabilities: CapabilitySnapshot = {
+      ...state.capabilities,
+      generation: 5,
+    };
+    state = shellReducer(state, { type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: capabilities });
+    expect(state.capabilities.generation).toBe(5);
+    const staleCapabilities = { ...state.capabilities, generation: 4 };
+    expect(
+      shellReducer(state, { type: "APPLY_CAPABILITIES_SNAPSHOT", snapshot: staleCapabilities }),
+    ).toBe(state);
+
+    state = shellReducer(state, {
+      type: "APPLY_TURN_RECOVERY_SNAPSHOT",
+      snapshot: {
+        sessions: [
+          {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-1",
+            queuePaused: false,
+            activeTurnId: null,
+            stopState: "idle",
+            executionGeneration: 1,
+            ownerGeneration: 1,
+            unknownTurns: [],
+            unknownTurn: null,
+            queuedAdmissions: [],
+            pendingDeliveryUnknown: [],
+            pendingSteerFallback: null,
+            lastKnownUnverified: false,
+            updatedAt: "2026-11-23T08:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect(state.turnRecovery.sessions).toHaveLength(1);
+
+    state = shellReducer(state, { type: "OPEN_DOMAIN_INSPECT", tab: "memory" });
+    state = shellReducer(state, { type: "OPEN_SURFACE", surface: "settings" });
+    state = shellReducer(state, { type: "SET_DOMAIN_INSPECT_TAB", tab: "cron" });
+    expect(state.domainInspectTab).toBe("cron");
+    expect(getTopmostSurface(state)).toBe("settings");
+
+    state = shellReducer(state, { type: "CLOSE_SURFACE", surface: "settings" });
+    expect(getTopmostSurface(state)).toBe("domainInspect");
+    state = shellReducer(state, { type: "CLOSE_SURFACE", surface: "domainInspect" });
+    expect(state.surfaceStack).toEqual([]);
+    expect(shellReducer(state, { type: "CLOSE_TOPMOST_SURFACE" })).toBe(state);
+
+    state = shellReducer(state, { type: "OPEN_APPROVAL_INSPECT", approvalKey: "apr-1" });
+    expect(state.inspectedApprovalKey).toBe("apr-1");
+    state = shellReducer(state, { type: "OPEN_APPROVAL_INSPECT", approvalKey: "apr-2" });
+    expect(state.surfaceStack).toEqual(["approvalInspect"]);
+    expect(state.inspectedApprovalKey).toBe("apr-2");
+    state = shellReducer(state, { type: "CLOSE_APPROVAL_INSPECT" });
+    expect(state.inspectedApprovalKey).toBeNull();
+    state = shellReducer(state, { type: "OPEN_APPROVAL_INSPECT", approvalKey: "apr-3" });
+    state = shellReducer(state, { type: "CLOSE_SURFACE", surface: "approvalInspect" });
+    expect(state.inspectedApprovalKey).toBeNull();
+    state = shellReducer(state, { type: "OPEN_APPROVAL_INSPECT", approvalKey: "apr-4" });
+    state = shellReducer(state, { type: "CLOSE_TOPMOST_SURFACE" });
+    expect(state.inspectedApprovalKey).toBeNull();
+
+    state = shellReducer(state, { type: "SET_WORKSPACE_MODE", mode: "open" });
+    expect(state.workspace.mode).toBe("open");
+    state = shellReducer(state, { type: "SET_WORKSPACE_TAB", tab: "terminal" });
+    expect(state.workspace.activeTab).toBe("terminal");
+
+    const beforeUnidentifiedPolite = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "无事件 ID 的提示",
+    });
+    expect(beforeUnidentifiedPolite.liveAnnouncementEventId).toBeNull();
+    expect(beforeUnidentifiedPolite.liveAnnouncementSeq).toBe(1);
+    const afterUnidentifiedPolite = shellReducer(beforeUnidentifiedPolite, {
+      type: "ANNOUNCE",
+      message: "另一条无事件 ID 的提示",
+    });
+    expect(afterUnidentifiedPolite.liveAnnouncementSeq).toBe(2);
+    const firstAssertive = shellReducer(state, {
+      type: "ANNOUNCE",
+      message: "无事件 ID 的紧急提示",
+      priority: "assertive",
+    });
+    expect(firstAssertive.assertiveAnnouncementEventId).toBeNull();
+    expect(firstAssertive.assertiveAnnouncementSeq).toBe(1);
+    expect(
+      shellReducer(firstAssertive, {
+        type: "ANNOUNCE",
+        message: "第二条无事件 ID 的紧急提示",
+        priority: "assertive",
+      }).assertiveAnnouncementSeq,
+    ).toBe(2);
   });
 });

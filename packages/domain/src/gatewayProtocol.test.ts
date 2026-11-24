@@ -13,6 +13,7 @@ import {
   createInitialShellState,
   createTranscriptSyncController,
   evaluateCodeShaMismatch,
+  filterProfilesForConnection,
   filterSessionsForScope,
   isJsonRpcMethodNotFound,
   parseEnsureOrAttachOutput,
@@ -451,5 +452,769 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
     expect(sync.getSnapshot()?.messages).toHaveLength(1);
     expect(sync.getSnapshot()?.messages[0].text).toBe("Clean authoritative reply");
     expect(sync.getSnapshot()?.resynced).toBe(true);
+  });
+
+  it("covers protocol failure mapping, capability fallbacks, filters, and transcript reducer edges", () => {
+    expect(parseEnsureOrAttachOutput("", 5)).toEqual({
+      kind: "starting",
+      reasonCode: "deadline",
+    });
+    expect(parseEnsureOrAttachOutput("", 3)).toEqual({
+      kind: "failure",
+      code: "protocol_unsupported",
+    });
+    expect(parseEnsureOrAttachOutput("", 4)).toEqual({
+      kind: "failure",
+      code: "profile_unavailable",
+    });
+    expect(parseEnsureOrAttachOutput("", 5)).toEqual({
+      kind: "starting",
+      reasonCode: "deadline",
+    });
+    expect(parseEnsureOrAttachOutput("", 6)).toEqual({
+      kind: "failure",
+      code: "update_paused",
+    });
+    expect(parseEnsureOrAttachOutput("", 7)).toEqual({
+      kind: "failure",
+      code: "gateway_start_failed",
+    });
+    expect(parseEnsureOrAttachOutput("", 99)).toEqual({
+      kind: "failure",
+      code: "gateway_start_failed",
+    });
+    expect(parseEnsureOrAttachOutput("{not json", 5)).toEqual({
+      kind: "failure",
+      code: "gateway_starting_timeout",
+    });
+    expect(parseEnsureOrAttachOutput("{not json", 0)).toEqual({
+      kind: "failure",
+      code: "invalid_control_state",
+    });
+    const startingByExit = parseEnsureOrAttachOutput(JSON.stringify({ state: "stopped" }), 5);
+    expect(startingByExit).toEqual({ kind: "starting", reasonCode: "deadline" });
+    const startingByReason = parseEnsureOrAttachOutput(
+      JSON.stringify({ state: "ready", reason_code: "deadline" }),
+      0,
+    );
+    expect(startingByReason).toEqual({ kind: "starting", reasonCode: "deadline" });
+    const withReasonCode = parseEnsureOrAttachOutput(
+      JSON.stringify({ state: "starting" }),
+      0,
+    );
+    expect(withReasonCode).toEqual({ kind: "starting", reasonCode: "deadline" });
+
+    const failureStates = ["error", "blocked", "stopped"];
+    for (const state of failureStates) {
+      const parsed = parseEnsureOrAttachOutput(
+        JSON.stringify({
+          state,
+          reason_code: "gateway_other_session",
+          profile_id: "work",
+        }),
+        0,
+      );
+      expect(parsed).toEqual({
+        kind: "failure",
+        code: "gateway_other_session",
+        reasonCode: "gateway_other_session",
+        profileId: "work",
+      });
+    }
+    expect(
+      parseEnsureOrAttachOutput(
+        JSON.stringify({ state: "blocked", reason_code: "profile_not_served" }),
+        0,
+      ),
+    ).toMatchObject({ kind: "failure", code: "profile_unavailable" });
+    expect(
+      parseEnsureOrAttachOutput(JSON.stringify({ state: "blocked", reason_code: "elevated" }), 0),
+    ).toMatchObject({ kind: "failure", code: "gateway_elevated" });
+    expect(
+      parseEnsureOrAttachOutput(JSON.stringify({ state: "blocked", reason_code: "unauthorized" }), 0),
+    ).toMatchObject({ kind: "failure", code: "authorization" });
+    expect(
+      parseEnsureOrAttachOutput(JSON.stringify({ state: "blocked", reason_code: "draining" }), 0),
+    ).toMatchObject({ kind: "failure", code: "update_paused" });
+    expect(
+      parseEnsureOrAttachOutput(JSON.stringify({ state: "blocked", reason_code: "service_unhealthy" }), 0),
+    ).toMatchObject({ kind: "failure", code: "service_unhealthy" });
+    expect(
+      parseEnsureOrAttachOutput(JSON.stringify({ state: "blocked", reason_code: "incompatible" }), 0),
+    ).toMatchObject({ kind: "failure", code: "protocol_unsupported" });
+    expect(
+      parseEnsureOrAttachOutput(JSON.stringify({ state: "blocked", reason_code: "code_sha_mismatch" }), 0),
+    ).toMatchObject({ kind: "failure", code: "code_sha_mismatch" });
+    expect(
+      parseEnsureOrAttachOutput(
+        JSON.stringify({
+          state: "ready",
+          reason_code: "unknown_reason",
+          endpoint: { profile_id: "default" },
+        }),
+        0,
+      ),
+    ).toEqual({
+      kind: "failure",
+      code: "gateway_start_failed",
+      reasonCode: "unknown_reason",
+    });
+
+    // Invalid types are ignored for optional fields; defaults are applied.
+    const defaults = parseEnsureOrAttachOutput(
+      JSON.stringify({
+        endpoint: {
+          ws_url: "ws://127.0.0.1:1/api/ws",
+          runtime_protocol: 1,
+          capabilities: ["session-authority-v1", 42],
+          profile_id: "   ",
+          instance_id: 3,
+          authority_epoch: Number.NaN,
+          ws_protocol: "",
+          ticket_protocol_prefix: "",
+          code_sha: "  ",
+        },
+        protocols: ["hermes-gateway-ticket.tkt_from_protocol"],
+        attachable: false,
+        expires_in_seconds: Number.POSITIVE_INFINITY,
+      }),
+      0,
+    );
+    expect(defaults.kind).toBe("ready");
+    if (defaults.kind === "ready") {
+      expect(defaults.endpoint.profileId).toBe("default");
+      expect(defaults.endpoint.instanceId).toBe("local-instance");
+      expect(defaults.endpoint.authorityEpoch).toBe(1);
+      expect(defaults.endpoint.wsProtocol).toBe("hermes-gateway-v1");
+      expect(defaults.endpoint.ticketProtocolPrefix).toBe("hermes-gateway-ticket.");
+      expect(defaults.endpoint.codeSha).toBeUndefined();
+      expect(defaults.ticket).toBe("tkt_from_protocol");
+      expect(defaults.expiresInSeconds).toBe(30);
+      expect(defaults.attachable).toBe(false);
+    }
+    const defaultAttachable = parseEnsureOrAttachOutput(
+      JSON.stringify({
+        endpoint: {
+          ws_url: "ws://127.0.0.1:1/api/ws",
+          runtime_protocol: 1,
+          capabilities: ["session-authority-v1"],
+        },
+      }),
+      0,
+    );
+    expect(defaultAttachable.kind).toBe("ready");
+    if (defaultAttachable.kind === "ready") {
+      expect(defaultAttachable.attachable).toBe(true);
+    }
+    expect(validateEndpointProtocol({ capabilities: [], wsUrl: "ws://x" })).toEqual({
+      valid: false,
+      code: "protocol_unsupported",
+    });
+    expect(
+      validateEndpointProtocol({ runtimeProtocol: 1, capabilities: ["session-authority-v1"] }),
+    ).toEqual({ valid: false, code: "invalid_control_state" });
+  });
+
+  it("classifies capability-map and capability-list fallbacks including refusals", () => {
+    const empty = classifyRuntimeCapabilities(undefined);
+    expect(empty.chatAvailable).toBe(false);
+    expect(empty.profilesList).toBe(false);
+
+    const capMap = classifyRuntimeCapabilities({
+      capabilities: {
+        chat: false,
+        "prompt.cancel": false,
+        "session.steer": false,
+        "session.create": false,
+        "session.resume": false,
+        "session.list": false,
+        "session.transcript": false,
+        "profiles.list": false,
+      },
+    });
+    expect(capMap).toMatchObject({
+      chatAvailable: false,
+      promptSubmit: false,
+      promptCancel: false,
+      promptSteer: false,
+      sessionCreate: false,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: false,
+      profilesList: false,
+    });
+
+    const defaultCapMap = classifyRuntimeCapabilities({ capabilities: {} });
+    expect(defaultCapMap.chatAvailable).toBe(true);
+    expect(defaultCapMap.profilesList).toBe(true);
+    const refusedMap = classifyRuntimeCapabilities({
+      capabilities: {},
+      refused_methods: ["prompt.submit", "session.create", "profiles.list"],
+    });
+    expect(refusedMap.promptSubmit).toBe(false);
+    expect(refusedMap.sessionCreate).toBe(false);
+    expect(refusedMap.profilesList).toBe(false);
+    expect(refusedMap.promptCancel).toBe(true);
+
+    const capList = classifyRuntimeCapabilities({ capabilities: ["chat-v1"] });
+    expect(capList).toMatchObject({
+      chatAvailable: true,
+      promptSubmit: true,
+      promptCancel: true,
+      promptSteer: true,
+      sessionCreate: false,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: false,
+      profilesList: false,
+    });
+    const authorityList = classifyRuntimeCapabilities({
+      capabilities: ["session-authority-v1"],
+      refused_methods: ["profile.list"],
+    });
+    expect(authorityList).toMatchObject({
+      chatAvailable: false,
+      sessionCreate: true,
+      sessionResume: true,
+      sessionList: true,
+      sessionTranscript: true,
+      profilesList: true,
+    });
+    expect(
+      classifyRuntimeCapabilities({ served_methods: ["prompt.submit", "session.steer"] }),
+    ).toMatchObject({ promptSubmit: true, promptSteer: true, promptCancel: false });
+    expect(isJsonRpcMethodNotFound(null)).toBe(false);
+    expect(isJsonRpcMethodNotFound("nope")).toBe(false);
+    expect(isJsonRpcMethodNotFound({ rpcCode: -32601 })).toBe(true);
+
+    expect(filterSessionsForScope([], null)).toEqual([]);
+    expect(filterProfilesForConnection([], null)).toEqual([]);
+    expect(filterProfilesForConnection([], "")).toEqual([]);
+  });
+
+  it("reduces transcript snapshots, unknown scopes, upserts, turn state, and sync-controller resets", () => {
+    const makeSnap = (): SessionTranscriptSnapshot => ({
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-1",
+      messages: [
+        {
+          messageId: "m-1",
+          sessionId: "s-1",
+          role: "assistant",
+          text: "hi",
+          createdAt: "2026-11-23T06:00:00Z",
+          streaming: true,
+        },
+      ],
+      activeTurnId: "t-1",
+      turnStopping: false,
+      chatAvailable: true,
+      supportedActions: {
+        promptSubmit: true,
+        promptCancel: true,
+        promptSteer: true,
+        sessionCreate: true,
+        sessionResume: true,
+      },
+    });
+    expect(reduceTranscriptEvent(null, { topic: "fleet" } as never)).toBeNull();
+    expect(
+      reduceTranscriptEvent(makeSnap(), {
+        topic: "session.transcript",
+        scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+        kind: "resync_required",
+        seq: 1,
+        revision: 1,
+        payload: {},
+      }),
+    ).not.toBeNull();
+    expect(
+      reduceTranscriptEvent(makeSnap(), {
+        topic: "session.transcript",
+        scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+        kind: "patch",
+        seq: 1,
+        revision: 1,
+        payload: { type: "token_delta", sessionId: "other", messageId: "m-1", delta: "x" },
+      })?.messages[0].text,
+    ).toBe("hi");
+    const upserted = reduceTranscriptEvent(makeSnap(), {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 2,
+      revision: 2,
+      payload: {
+        type: "message_upsert",
+        sessionId: "s-1",
+        message: {
+          messageId: "m-1",
+          sessionId: "s-1",
+          role: "assistant",
+          text: "updated",
+          createdAt: "2026-11-23T06:00:00Z",
+        },
+      },
+    });
+    expect(upserted?.messages[0].text).toBe("updated");
+    const appended = reduceTranscriptEvent(upserted, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 3,
+      revision: 3,
+      payload: {
+        type: "message_upsert",
+        sessionId: "s-1",
+        message: {
+          messageId: "m-2",
+          sessionId: "s-1",
+          role: "user",
+          text: "new",
+          createdAt: "2026-11-23T06:01:00Z",
+        },
+      },
+    });
+    expect(appended?.messages).toHaveLength(2);
+    const toolByTurn = reduceTranscriptEvent(appended, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 4,
+      revision: 4,
+      payload: {
+        type: "tool_row",
+        sessionId: "s-1",
+        turnId: "t-1",
+        toolRow: { toolCallId: "tc-1", name: "read", status: "running" },
+      },
+    });
+    expect(
+      toolByTurn?.messages.some((m) => m.toolRows?.some((r) => r.name === "read")),
+    ).toBe(true);
+    const toolNoTarget = reduceTranscriptEvent(toolByTurn, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 5,
+      revision: 5,
+      payload: {
+        type: "tool_row",
+        sessionId: "s-1",
+        turnId: "t-unknown",
+        toolRow: { toolCallId: "tc-2", name: "write", status: "completed" },
+      },
+    });
+    expect(toolNoTarget?.messages.at(-1)?.toolRows?.[0].toolCallId).toBe("tc-2");
+    const toolReplaced = reduceTranscriptEvent(toolByTurn, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 6,
+      revision: 6,
+      payload: {
+        type: "tool_row",
+        sessionId: "s-1",
+        messageId: "m-1",
+        toolRow: { toolCallId: "tc-1", name: "read", status: "completed" },
+      },
+    });
+    expect(toolReplaced?.messages[0].toolRows?.[0].status).toBe("completed");
+    const turnTargeted = reduceTranscriptEvent(toolReplaced, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 7,
+      revision: 7,
+      payload: {
+        type: "turn_state",
+        sessionId: "s-1",
+        messageId: "m-1",
+        activeTurnId: null,
+        status: "complete",
+      },
+    });
+    expect(turnTargeted?.messages[0].streaming).toBe(false);
+    const turnAll = reduceTranscriptEvent(turnTargeted, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 8,
+      revision: 8,
+      payload: {
+        type: "turn_state",
+        sessionId: "s-1",
+        activeTurnId: null,
+        turnStopping: true,
+        executionGeneration: 3,
+        stopState: "stopping",
+      },
+    });
+    expect(turnAll).toMatchObject({
+      activeTurnId: null,
+      turnStopping: true,
+      executionGeneration: 3,
+      stopState: "stopping",
+    });
+    const capsUpdate = reduceTranscriptEvent(turnAll, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 9,
+      revision: 9,
+      payload: {
+        type: "capabilities_update",
+        sessionId: "s-1",
+        chatAvailable: false,
+        supportedActions: {
+          promptSubmit: false,
+          promptCancel: false,
+          promptSteer: false,
+          sessionCreate: false,
+          sessionResume: false,
+        },
+        chatUnavailableReason: "missing",
+      },
+    });
+    expect(capsUpdate?.chatAvailable).toBe(false);
+    expect(capsUpdate?.chatUnavailableReason).toBe("missing");
+
+    const sync = createTranscriptSyncController();
+    expect(sync.applyPatch(1, { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: "x" })).toEqual({
+      status: "resync_required",
+      expectedSeq: 0,
+      receivedSeq: 1,
+    });
+    expect(sync.acceptEvent({ topic: "fleet" } as never)).toEqual({ status: "ignored" });
+    sync.applySnapshot(makeSnap(), 0);
+    expect(sync.applyPatch(0, { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: "x" }).status).toBe(
+      "discarded_duplicate",
+    );
+    const loss = sync.acceptEvent({
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 1,
+      revision: 1,
+      payload: { possible_event_loss: true },
+    });
+    expect(loss.status).toBe("resync_required");
+    expect(sync.isResyncRequired()).toBe(true);
+    expect(sync.acceptEvent({
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "resync_required",
+      seq: 2,
+      revision: 2,
+      payload: {},
+    }).status).toBe("resync_required");
+    sync.reset();
+    expect(sync.getSnapshot()).toBeNull();
+    expect(sync.isResyncRequired()).toBe(false);
+    expect(sync.acceptEvent({
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "snapshot",
+      seq: 4,
+      revision: 4,
+      payload: makeSnap(),
+    })).toEqual({ status: "applied", snapshot: expect.objectContaining({ snapshotSeq: 4 }) });
+    expect(sync.applyPatch(5, { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: "y" }).status).toBe(
+      "applied",
+    );
+  });
+
+  it("covers every failure reason, camelCase endpoints, and remaining transcript reducer arms", () => {
+    const failureReasonCases = [
+      ["profile_parked", "profile_unavailable"],
+      ["profile_mismatch", "profile_unavailable"],
+      ["gateway_elevated", "gateway_elevated"],
+      ["authorization", "authorization"],
+      ["update_paused", "update_paused"],
+      ["protocol_unsupported", "protocol_unsupported"],
+    ] as const;
+    for (const [reasonCode, expectedCode] of failureReasonCases) {
+      expect(
+        parseEnsureOrAttachOutput(
+          JSON.stringify({ state: "blocked", reason_code: reasonCode }),
+          0,
+        ),
+      ).toMatchObject({ kind: "failure", code: expectedCode, reasonCode });
+    }
+
+    const camelEndpoint = parseEnsureOrAttachOutput(
+      JSON.stringify({
+        endpoint: {
+          wsUrl: "ws://127.0.0.1:9000/api/ws",
+          runtimeProtocol: 1,
+          capabilities: ["session-authority-v1"],
+        },
+      }),
+      0,
+    );
+    expect(camelEndpoint.kind).toBe("ready");
+    if (camelEndpoint.kind === "ready") {
+      expect(camelEndpoint.endpoint.runtimeProtocol).toBe(1);
+    }
+
+    expect(parseEnsureOrAttachOutput(JSON.stringify({ state: "ready" }), 5)).toEqual({
+      kind: "failure",
+      code: "gateway_starting_timeout",
+      reasonCode: undefined,
+    });
+
+    const sessions = [
+      {
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "s-1",
+        title: "One",
+        preview: "",
+        updatedAt: "2026-11-23T06:00:00.000Z",
+        pinned: false,
+        unreadCount: 0,
+        needsInput: false,
+      },
+      {
+        connectionId: "local",
+        profileId: "work",
+        sessionId: "s-2",
+        title: "Two",
+        preview: "",
+        updatedAt: "2026-11-23T06:00:00.000Z",
+        pinned: false,
+        unreadCount: 0,
+        needsInput: false,
+      },
+    ];
+    expect(filterSessionsForScope(sessions, { connectionId: "local" }).map((s) => s.sessionId)).toEqual([
+      "s-1",
+    ]);
+    expect(
+      filterProfilesForConnection(
+        [
+          { connectionId: "local", profileId: "default", displayName: "Default", handle: "default", isDefault: true },
+          { connectionId: "vps", profileId: "ops", displayName: "Ops", handle: "ops", isDefault: true },
+        ],
+        "local",
+      ).map((p) => p.profileId),
+    ).toEqual(["default"]);
+
+    const snapshot: SessionTranscriptSnapshot = {
+      connectionId: "local",
+      profileId: "default",
+      sessionId: "s-1",
+      messages: [
+        {
+          messageId: "m-1",
+          sessionId: "s-1",
+          role: "assistant",
+          text: "one",
+          createdAt: "2026-11-23T06:00:00Z",
+          streaming: true,
+          status: "streaming",
+          turnId: "t-1",
+        },
+        {
+          messageId: "m-2",
+          sessionId: "s-1",
+          role: "assistant",
+          text: "two",
+          createdAt: "2026-11-23T06:00:00Z",
+          streaming: true,
+          status: "streaming",
+        },
+      ],
+      activeTurnId: "t-1",
+      turnStopping: false,
+      chatAvailable: true,
+      supportedActions: {
+        promptSubmit: true,
+        promptCancel: true,
+        promptSteer: true,
+        sessionCreate: true,
+        sessionResume: true,
+      },
+    };
+
+    const snapshotEvent = (payload: SessionTranscriptSnapshot): BridgeEvent => ({
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "snapshot",
+      seq: 1,
+      revision: 1,
+      payload,
+    });
+    expect(reduceTranscriptEvent(snapshot, snapshotEvent(snapshot))).toBe(snapshot);
+
+    const upsertSecond = reduceTranscriptEvent(snapshot, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 2,
+      revision: 2,
+      payload: {
+        type: "message_upsert",
+        sessionId: "s-1",
+        message: {
+          messageId: "m-2",
+          sessionId: "s-1",
+          role: "assistant",
+          text: "two updated",
+          createdAt: "2026-11-23T06:00:00Z",
+        },
+      },
+    });
+    expect(upsertSecond?.messages.map((m) => m.text)).toEqual(["one", "two updated"]);
+
+    const toolThenReplace = reduceTranscriptEvent(snapshot, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 3,
+      revision: 3,
+      payload: {
+        type: "tool_row",
+        sessionId: "s-1",
+        messageId: "m-1",
+        toolRow: { toolCallId: "tc-1", name: "read", status: "running" },
+      },
+    });
+    const toolUpdated = reduceTranscriptEvent(toolThenReplace!, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 4,
+      revision: 4,
+      payload: {
+        type: "tool_row",
+        sessionId: "s-1",
+        messageId: "m-1",
+        toolRow: { toolCallId: "tc-1", name: "read", status: "completed" },
+      },
+    });
+    expect(toolUpdated?.messages[0].toolRows).toEqual([
+      { toolCallId: "tc-1", name: "read", status: "completed" },
+    ]);
+    const toolSecond = reduceTranscriptEvent(toolUpdated!, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 5,
+      revision: 5,
+      payload: {
+        type: "tool_row",
+        sessionId: "s-1",
+        messageId: "m-1",
+        toolRow: { toolCallId: "tc-2", name: "write", status: "running" },
+      },
+    });
+    const toolSecondUpdated = reduceTranscriptEvent(toolSecond!, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 6,
+      revision: 6,
+      payload: {
+        type: "tool_row",
+        sessionId: "s-1",
+        messageId: "m-1",
+        toolRow: { toolCallId: "tc-2", name: "write", status: "completed" },
+      },
+    });
+    expect(toolSecondUpdated?.messages[0].toolRows?.map((row) => row.status)).toEqual([
+      "completed",
+      "completed",
+    ]);
+
+    const tokenWithoutTurn = reduceTranscriptEvent(snapshot, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 8,
+      revision: 8,
+      payload: {
+        type: "token_delta",
+        sessionId: "s-1",
+        messageId: "m-no-turn",
+        delta: "orphan delta",
+      },
+    });
+    expect(tokenWithoutTurn?.messages.at(-1)).toMatchObject({
+      messageId: "m-no-turn",
+      text: "orphan delta",
+    });
+    expect(tokenWithoutTurn?.messages.at(-1)?.turnId).toBeUndefined();
+
+    const tokenExistingWithTurn = reduceTranscriptEvent(snapshot, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 11,
+      revision: 11,
+      payload: {
+        type: "token_delta",
+        sessionId: "s-1",
+        messageId: "m-1",
+        turnId: "t-2",
+        delta: "!",
+      },
+    });
+    expect(tokenExistingWithTurn?.messages[0].turnId).toBe("t-2");
+
+    const turnWithoutStatus = reduceTranscriptEvent(snapshot, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 9,
+      revision: 9,
+      payload: {
+        type: "turn_state",
+        sessionId: "s-1",
+        messageId: "m-2",
+        activeTurnId: "t-1",
+      },
+    });
+    expect(turnWithoutStatus?.messages[1].status).toBe("streaming");
+
+    const turnWithoutStatusEnded = reduceTranscriptEvent(snapshot, {
+      topic: "session.transcript",
+      scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+      kind: "patch",
+      seq: 10,
+      revision: 10,
+      payload: {
+        type: "turn_state",
+        sessionId: "s-1",
+        messageId: "m-2",
+        activeTurnId: null,
+      },
+    });
+    expect(turnWithoutStatusEnded?.messages[1].status).toBe("complete");
+
+    const sync = createTranscriptSyncController();
+    sync.applySnapshot(snapshot);
+    expect(sync.getSnapshot()?.snapshotSeq).toBe(0);
+    expect(
+      sync.acceptEvent({
+        topic: "session.transcript",
+        scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+        kind: "patch",
+        seq: 1,
+        revision: 1,
+        payload: { type: "token_delta", sessionId: "s-1", messageId: "m-1", delta: "!" },
+      }),
+    ).toEqual({ status: "applied", snapshot: expect.objectContaining({ snapshotSeq: 0 }) });
+    expect(
+      sync.acceptEvent({
+        topic: "session.transcript",
+        scope: { connectionId: "local", profileId: "default", sessionId: "s-1" },
+        kind: "unknown" as never,
+        seq: 1,
+        revision: 1,
+        payload: {},
+      }),
+    ).toEqual({ status: "ignored" });
   });
 });

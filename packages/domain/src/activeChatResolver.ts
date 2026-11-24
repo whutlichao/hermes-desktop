@@ -105,7 +105,7 @@ function resolveProfileForConnection(
     connProfiles.find((p) => p.isDefault) ??
     connProfiles.find((p) => p.profileId === "default") ??
     connProfiles[0];
-  return defaultProf?.profileId ?? null;
+  return defaultProf.profileId;
 }
 
 function buildCrossScopeFallback(

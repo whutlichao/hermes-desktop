@@ -328,7 +328,7 @@ export function extractRemotePortFromWsUrl(wsUrl: string): number | null {
 export function rewriteForwardedWsUrl(remoteWsUrl: string, localPort: number): string {
   const parsed = new URL(remoteWsUrl);
   const scheme = parsed.protocol === "wss:" ? "wss:" : "ws:";
-  return `${scheme}//127.0.0.1:${localPort}${parsed.pathname || "/api/ws"}${parsed.search || ""}`;
+  return `${scheme}//127.0.0.1:${localPort}${parsed.pathname}${parsed.search}`;
 }
 
 export function parseKeygenFingerprintOutput(
