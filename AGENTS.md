@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and specs for this repo live in GitHub Issues at `whutlichao/hermes-destop`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues and specs for this repo live in GitHub Issues at `whutlichao/hermes-desktop`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

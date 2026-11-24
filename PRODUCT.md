@@ -76,7 +76,7 @@ One calm conversation surface over a fleet of Hermes gateways. The interface kee
 - Default canvas must be genuinely minimalist: generous whitespace, quiet chrome, crisp typography, and clear focus. Never a cluttered admin dashboard.
 - Secondary capabilities live behind `⌘K`, compact switchers, focused slide-over drawers, and hideable rails.
 - No real network calls, daemon connectivity, SSH tunneling, or credential storage. All sample gateways, sessions, jobs, bots, tools, and files are explicitly labeled prototype simulation.
-- PR-only delivery against `whutlichao/hermes-destop` `main`. Do not merge. Do not add unrelated repository governance files.
+- PR-only delivery against `whutlichao/hermes-desktop` `main`. Do not merge. Do not add unrelated repository governance files.
 
 ## Brand Commitments
 
