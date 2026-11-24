@@ -5160,14 +5160,14 @@ export class ConnectionSupervisor {
       if (health?.actual === "auth_required") {
         throw makeBridgeError("auth_required", getCopy("remote.authRequiredBody"));
       }
-      throw makeBridgeError("unreachable", "Gateway 尚未就绪");
+      throw makeBridgeError("unreachable", getCopy("connection.gatewayNotReadyError"));
     }
     return entry;
   }
 
   private assertNotShuttingDown(): void {
     if (this.disposed || this.shuttingDown) {
-      throw makeBridgeError("cancelled", "应用正在退出");
+      throw makeBridgeError("cancelled", getCopy("connection.shuttingDownError"));
     }
   }
 
@@ -5207,7 +5207,10 @@ export class ConnectionSupervisor {
         });
         this.emitCapabilities();
       }
-      throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供此能力");
+      throw makeBridgeError(
+        "capability_unavailable",
+        getCopy("connection.capabilityUnavailableError"),
+      );
     }
     if (isRpcAuthError(err)) {
       this.markConnectionAuthRequired(entry.connectionId);
@@ -5218,12 +5221,12 @@ export class ConnectionSupervisor {
         this.markConnectionAuthRequired(entry.connectionId);
         throw makeBridgeError("auth_required", getCopy("remote.authRequiredBody"));
       }
-      throw makeBridgeError(err.code, "Gateway 连接中断或超时");
+      throw makeBridgeError(err.code, getCopy("connection.disconnectedOrTimeoutError"));
     }
     if (err instanceof GatewayRpcError) {
-      throw makeBridgeError("internal", "Gateway 执行请求失败");
+      throw makeBridgeError("internal", getCopy("connection.requestExecutionFailedError"));
     }
-    throw makeBridgeError("internal", "请求失败");
+    throw makeBridgeError("internal", getCopy("connection.requestFailedError"));
   }
 
   subscribe(
@@ -5468,11 +5471,11 @@ export class ConnectionSupervisor {
       const schedule = typeof payload.schedule === "string" ? payload.schedule.trim() : "";
       const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
       if (!name || !schedule || !prompt) {
-        throw makeBridgeError("invalid_request", "请填写任务名称、Cron 表达式与执行提示词");
+        throw makeBridgeError("invalid_request", getCopy("cron.submitFieldsRequiredError"));
       }
       await this.probeCronDomain(entry, profileId);
       if (!this.capabilityRegistry.getSnapshot().cron.supportedActions.canSubmit) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持新建 Cron 任务");
+        throw makeBridgeError("capability_unavailable", getCopy("cron.submitUnsupportedError"));
       }
       try {
         const res = await entry.client.call<Record<string, unknown>>(
@@ -5501,11 +5504,11 @@ export class ConnectionSupervisor {
       const entry = this.requireTransport(connectionId, profileId);
       const jobId = typeof payload.jobId === "string" ? payload.jobId.trim() : "";
       if (!jobId) {
-        throw makeBridgeError("invalid_request", "缺少 Cron 任务 ID");
+        throw makeBridgeError("invalid_request", getCopy("cron.jobIdRequiredError"));
       }
       await this.probeCronDomain(entry, profileId);
       if (!this.capabilityRegistry.getSnapshot().cron.supportedActions.canCancel) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持取消 Cron 任务");
+        throw makeBridgeError("capability_unavailable", getCopy("cron.cancelUnsupportedError"));
       }
       try {
         await entry.client.call(
@@ -5528,11 +5531,11 @@ export class ConnectionSupervisor {
       const entry = this.requireTransport(connectionId, profileId);
       const jobId = typeof payload.jobId === "string" ? payload.jobId.trim() : "";
       if (!jobId) {
-        throw makeBridgeError("invalid_request", "缺少 Cron 任务 ID");
+        throw makeBridgeError("invalid_request", getCopy("cron.jobIdRequiredError"));
       }
       await this.probeCronDomain(entry, profileId);
       if (!this.capabilityRegistry.getSnapshot().cron.supportedActions.canRecover) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持恢复 Cron 任务");
+        throw makeBridgeError("capability_unavailable", getCopy("cron.recoverUnsupportedError"));
       }
       try {
         await entry.client.call(
@@ -5766,7 +5769,7 @@ export class ConnectionSupervisor {
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       if (!sessionId) {
-        throw makeBridgeError("invalid_request", "缺少目标 Session");
+        throw makeBridgeError("invalid_request", getCopy("session.targetRequiredError"));
       }
       const jKey = makeSessionJournalKey(connectionId, profileId, sessionId);
       this.backgroundJournal.markRead(jKey);
@@ -5797,7 +5800,7 @@ export class ConnectionSupervisor {
       await this.ensureTransport(connectionId, profileId);
       const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.sessionCreate) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持新建 Session");
+        throw makeBridgeError("capability_unavailable", getCopy("session.createUnsupportedError"));
       }
 
       const title =
@@ -5894,7 +5897,7 @@ export class ConnectionSupervisor {
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       if (!sessionId) {
-        throw makeBridgeError("invalid_request", "缺少目标 Session");
+        throw makeBridgeError("invalid_request", getCopy("session.targetRequiredError"));
       }
       const resync = Boolean(payload.resync || payload.replace);
       await this.ensureTransport(connectionId, profileId);
@@ -5916,7 +5919,7 @@ export class ConnectionSupervisor {
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
-        throw makeBridgeError("invalid_request", "请输入对话内容后再发送");
+        throw makeBridgeError("invalid_request", getCopy("chat.messageRequiredError"));
       }
 
       const existingRecovery = this.turnCoordinator.getSessionView({
@@ -5941,7 +5944,7 @@ export class ConnectionSupervisor {
 
       const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptSubmit) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
+        throw makeBridgeError("capability_unavailable", getCopy("chat.promptSubmitUnsupportedError"));
       }
 
       const draftRef = {
@@ -6114,12 +6117,12 @@ export class ConnectionSupervisor {
           : existing?.executionGeneration ?? currentRecovery?.executionGeneration;
 
       if (!sessionId || !turnId) {
-        throw makeBridgeError("unknown_turn", "当前没有可停止的 Turn");
+        throw makeBridgeError("unknown_turn", getCopy("turn.stop.noActiveTurnBridgeError"));
       }
 
       const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptCancel) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持停止当前 Turn");
+        throw makeBridgeError("capability_unavailable", getCopy("turn.stop.unsupportedError"));
       }
 
       this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
@@ -6305,7 +6308,7 @@ export class ConnectionSupervisor {
       const profileId = this.resolveTargetProfile(payload, scope, connectionId);
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       if (!sessionId) {
-        throw makeBridgeError("invalid_request", "缺少目标 Session");
+        throw makeBridgeError("invalid_request", getCopy("session.targetRequiredError"));
       }
       const entry = this.requireTransport(connectionId, profileId);
       const admissionId =
@@ -6363,7 +6366,7 @@ export class ConnectionSupervisor {
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
-        throw makeBridgeError("invalid_request", "请输入内容后再排队");
+        throw makeBridgeError("invalid_request", getCopy("turn.queue.textRequiredError"));
       }
       const existing = this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
       if (existing?.queuePaused || existing?.unknownTurn) {
@@ -6504,11 +6507,11 @@ export class ConnectionSupervisor {
       const admissionId =
         typeof payload.admissionId === "string" ? payload.admissionId.trim() : "";
       if (!sessionId || !admissionId) {
-        throw makeBridgeError("invalid_request", "缺少排队 admissionId");
+        throw makeBridgeError("invalid_request", getCopy("turn.queue.admissionIdRequiredError"));
       }
       const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptCancel) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持取消排队");
+        throw makeBridgeError("capability_unavailable", getCopy("turn.queue.cancelUnsupportedError"));
       }
       try {
         const res = await this.turnCoordinator.cancelQueued(
@@ -6546,11 +6549,11 @@ export class ConnectionSupervisor {
         typeof payload.executionGeneration === "number" ? payload.executionGeneration : undefined;
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !text) {
-        throw makeBridgeError("invalid_request", "缺少补充指令内容");
+        throw makeBridgeError("invalid_request", getCopy("turn.steer.textRequiredError"));
       }
       const entry = this.requireTransport(connectionId, profileId);
       if (!entry.supportedActions.promptSteer) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持中途纠偏");
+        throw makeBridgeError("capability_unavailable", getCopy("turn.steer.unsupportedError"));
       }
 
       const hasTurnHistory = this.turnCoordinator.hasTurnHistory({
@@ -6864,7 +6867,10 @@ export class ConnectionSupervisor {
         this.capabilityRegistry.isMethodRefused("subagents.list") ||
         this.capabilityRegistry.isMethodRefused(rpcMethod)
       ) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 已拒绝 Subagents 能力");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("workspace.agents.capabilityRejectedError"),
+        );
       }
 
       const steerAvailable =
@@ -6963,7 +6969,10 @@ export class ConnectionSupervisor {
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
       if (!sessionId || !agentId) {
-        throw makeBridgeError("invalid_request", "未选择要查看 Tail 的 Subagent");
+        throw makeBridgeError(
+          "invalid_request",
+          getCopy("workspace.agents.tailSelectionRequiredError"),
+        );
       }
 
       const entry = this.requireTransport(connectionId, profileId);
@@ -6976,7 +6985,10 @@ export class ConnectionSupervisor {
         this.capabilityRegistry.isMethodRefused(rpcMethod) ||
         this.capabilityRegistry.getMethodTier("subagents.tail") === "unknown"
       ) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 Subagent Tail 能力");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("workspace.agents.tailUnsupportedError"),
+        );
       }
 
       try {
@@ -7011,7 +7023,10 @@ export class ConnectionSupervisor {
       const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
       const text = typeof payload.text === "string" ? payload.text.trim() : "";
       if (!sessionId || !agentId || !text) {
-        throw makeBridgeError("invalid_request", "请输入针对该 Subagent 的补充指令");
+        throw makeBridgeError(
+          "invalid_request",
+          getCopy("workspace.agents.steerTextRequiredError"),
+        );
       }
 
       const entry = this.requireTransport(connectionId, profileId);
@@ -7024,7 +7039,10 @@ export class ConnectionSupervisor {
         this.capabilityRegistry.isMethodRefused(rpcMethod) ||
         this.capabilityRegistry.getMethodTier("subagents.steer") === "unknown"
       ) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持 Subagent 补充指令");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("workspace.agents.steerUnsupportedError"),
+        );
       }
 
       try {
@@ -7049,7 +7067,10 @@ export class ConnectionSupervisor {
       const sessionId = this.resolveTargetSessionId(payload, scope, connectionId);
       const agentId = typeof payload.agentId === "string" ? payload.agentId.trim() : "";
       if (!sessionId || !agentId) {
-        throw makeBridgeError("invalid_request", "未选择要停止的 Subagent");
+        throw makeBridgeError(
+          "invalid_request",
+          getCopy("workspace.agents.stopSelectionRequiredError"),
+        );
       }
 
       const entry = this.requireTransport(connectionId, profileId);
@@ -7062,7 +7083,10 @@ export class ConnectionSupervisor {
         this.capabilityRegistry.isMethodRefused(rpcMethod) ||
         this.capabilityRegistry.getMethodTier("subagents.interrupt") === "unknown"
       ) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持停止 Subagent");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("workspace.agents.stopUnsupportedError"),
+        );
       }
 
       try {
@@ -7076,7 +7100,10 @@ export class ConnectionSupervisor {
           res.stopped !== false &&
           res.ok !== false;
         if (!confirmed) {
-          throw makeBridgeError("conflict", "Gateway 未确认停止该 Subagent，当前运行状态保持不变");
+          throw makeBridgeError(
+            "conflict",
+            getCopy("workspace.agents.stopUnconfirmedError"),
+          );
         }
         const rawStatus = asString(res.status, "stopped");
         const nextStatus: WorkspaceAgentItem["status"] =
@@ -7127,7 +7154,10 @@ export class ConnectionSupervisor {
         this.capabilityRegistry.isMethodRefused(rpcMethod) ||
         this.capabilityRegistry.getMethodTier("checkpoint.list") === "unknown"
       ) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 Checkpoint 列表能力");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("workspace.checkpoints.listUnsupportedError"),
+        );
       }
 
       try {
@@ -7173,7 +7203,10 @@ export class ConnectionSupervisor {
       const checkpointId =
         typeof payload.checkpointId === "string" ? payload.checkpointId.trim() : "";
       if (!sessionId || !checkpointId) {
-        throw makeBridgeError("invalid_request", "未选择要对比的 Checkpoint");
+        throw makeBridgeError(
+          "invalid_request",
+          getCopy("workspace.checkpoints.diffSelectionRequiredError"),
+        );
       }
 
       const entry = this.requireTransport(connectionId, profileId);
@@ -7186,7 +7219,10 @@ export class ConnectionSupervisor {
         this.capabilityRegistry.isMethodRefused(rpcMethod) ||
         this.capabilityRegistry.getMethodTier("checkpoint.diff") === "unknown"
       ) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 Checkpoint Diff 能力");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("workspace.checkpoints.diffUnsupportedError"),
+        );
       }
 
       try {
@@ -7211,7 +7247,10 @@ export class ConnectionSupervisor {
 
     "checkpoints.restore": async (payload, scope) => {
       if (payload.confirmed !== true) {
-        throw makeBridgeError("invalid_request", "恢复 Checkpoint 需要显式确认");
+        throw makeBridgeError(
+          "invalid_request",
+          getCopy("workspace.checkpoints.restoreConfirmRequiredError"),
+        );
       }
 
       const checkpointId =
@@ -7250,7 +7289,7 @@ export class ConnectionSupervisor {
       ) {
         throw makeBridgeError(
           "capability_unavailable",
-          "当前 Gateway 未提供 rollback.restore 能力，仅支持只读浏览与 Diff 对比",
+          getCopy("workspace.checkpoints.readOnlyNotice"),
         );
       }
 
@@ -7281,7 +7320,10 @@ export class ConnectionSupervisor {
           checkpoint_id: checkpointId,
         });
         if (res.restored === false || res.ok === false) {
-          throw makeBridgeError("conflict", "Gateway 未能恢复到所选 Checkpoint");
+          throw makeBridgeError(
+            "conflict",
+            getCopy("workspace.checkpoints.restoreUnconfirmedError"),
+          );
         }
         return {
           restored: true,
@@ -7387,11 +7429,14 @@ export class ConnectionSupervisor {
       const key = typeof payload.key === "string" ? payload.key.trim() : "";
       const value = payload.value as GatewayConfigValue;
       if (!key || !isAllowedGatewayConfigKey(key)) {
-        throw makeBridgeError("invalid_request", "不支持更新该配置项");
+        throw makeBridgeError("invalid_request", getCopy("settings.config.keyUnsupportedError"));
       }
       const entry = this.requireTransport(connectionId, profileId);
       if (this.capabilityRegistry.isMethodRefused("config.update")) {
-        throw makeBridgeError("capability_unavailable", "当前 Gateway 拒绝更新配置");
+        throw makeBridgeError(
+          "capability_unavailable",
+          getCopy("settings.config.updateRefusedError"),
+        );
       }
       try {
         const res = await entry.client.call<Record<string, unknown>>("config.update", {
@@ -7411,9 +7456,12 @@ export class ConnectionSupervisor {
             expectedAuthorityEpoch: entry.authorityEpoch,
           });
           this.emitCapabilities();
-          throw makeBridgeError("capability_unavailable", "当前 Gateway 未提供 config.update 能力");
+          throw makeBridgeError(
+            "capability_unavailable",
+            getCopy("settings.config.updateUnsupportedError"),
+          );
         }
-        throw makeBridgeError("internal", "更新配置失败");
+        throw makeBridgeError("internal", getCopy("settings.config.updateFailedError"));
       }
     },
 
@@ -7579,7 +7627,10 @@ export class ConnectionSupervisor {
   }) {
     const entry = this.requireTransport(input.connectionId, input.profileId);
     if (!entry.supportedActions.promptSubmit) {
-      throw makeBridgeError("capability_unavailable", "当前 Gateway 不支持发送对话");
+      throw makeBridgeError(
+        "capability_unavailable",
+        getCopy("chat.promptSubmitUnsupportedError"),
+      );
     }
     try {
       const res = await this.turnCoordinator.submitQueued(
@@ -7753,7 +7804,10 @@ export class ConnectionSupervisor {
   ): Promise<ApprovalIngestInput[]> {
     const entry = this.getTransport(connectionId, profileId);
     if (!entry || entry.disposed || !entry.client.isOpen()) {
-      throw makeBridgeError("unreachable", "当前 Gateway 未连接，无法校验待处理 Approval");
+      throw makeBridgeError(
+        "unreachable",
+        getCopy("approval.connectionUnavailableError"),
+      );
     }
 
     let res: Record<string, unknown> | null = null;
@@ -7831,7 +7885,10 @@ export class ConnectionSupervisor {
   ): Promise<GatewayApprovalRespondOutcome> {
     const entry = this.requireTransport(payload.connectionId, payload.profileId);
     if (entry.ownerGeneration !== payload.ownerGeneration) {
-      throw makeBridgeError("approval_stale", "所属 Gateway 连接代次已变更，旧 Approval 已失效");
+      throw makeBridgeError(
+        "approval_stale",
+        getCopy("approval.ownerChangedError"),
+      );
     }
 
     try {

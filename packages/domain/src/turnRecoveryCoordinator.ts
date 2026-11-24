@@ -333,19 +333,28 @@ export class TurnRecoveryCoordinator {
       ? rec?.unknownTurns.find((item) => item.admissionId === scope.admissionId)
       : rec?.unknownTurns[0];
     if (!rec || !target) {
-      throw makeTurnError("unknown_turn", "当前 Session 没有待处理的丢失 Turn");
+      throw makeTurnError(
+        "unknown_turn",
+        getCopy("turn.recovery.unknownNotFoundError"),
+      );
     }
     if (scope.admissionId && scope.admissionId !== target.admissionId) {
-      throw makeTurnError("conflict", "丢失 Turn 的 admission_id 不匹配");
+      throw makeTurnError("conflict", getCopy("turn.recovery.admissionMismatchError"));
     }
     if (
       typeof scope.executionGeneration === "number" &&
       scope.executionGeneration !== target.executionGeneration
     ) {
-      throw makeTurnError("conflict", "丢失 Turn 的 execution_generation 不匹配");
+      throw makeTurnError(
+        "conflict",
+        getCopy("turn.recovery.generationMismatchError"),
+      );
     }
     if (target.resolving) {
-      throw makeTurnError("conflict", "正在放弃丢失的 Turn，请等待完成");
+      throw makeTurnError(
+        "conflict",
+        getCopy("turn.recovery.discardInProgressError"),
+      );
     }
 
     const nowIso = new Date(this.now()).toISOString();
@@ -369,7 +378,10 @@ export class TurnRecoveryCoordinator {
         );
         rec.updatedAt = afterIso;
         this.emitChange();
-        throw makeTurnError("conflict", "Gateway 未确认放弃丢失 Turn");
+        throw makeTurnError(
+          "conflict",
+          getCopy("turn.recovery.discardUnconfirmedError"),
+        );
       }
 
       rec.unknownTurns = rec.unknownTurns.filter(
@@ -431,14 +443,17 @@ export class TurnRecoveryCoordinator {
     const rec = this.ensureSession(scope.connectionId, scope.profileId, scope.sessionId, nowIso);
     const turnId = cleanString(scope.turnId) || rec.activeTurnId || "";
     if (!turnId) {
-      throw makeTurnError("invalid_request", "当前没有运行中的 Turn 可停止");
+      throw makeTurnError("invalid_request", getCopy("turn.stop.noActiveTurnError"));
     }
     if (
       typeof scope.executionGeneration === "number" &&
       rec.executionGeneration > 0 &&
       scope.executionGeneration !== rec.executionGeneration
     ) {
-      throw makeTurnError("conflict", "目标 Turn 的 Execution 代际已变更，无法跨代际停止");
+      throw makeTurnError(
+        "conflict",
+        getCopy("turn.stop.generationMismatchError"),
+      );
     }
 
     const capturedGen = rec.executionGeneration;
@@ -735,7 +750,7 @@ export class TurnRecoveryCoordinator {
     }
     const text = input.text.trim();
     if (!text) {
-      throw makeTurnError("invalid_request", "请输入内容后再排队");
+      throw makeTurnError("invalid_request", getCopy("turn.queue.textRequiredError"));
     }
 
     const nowIso = new Date(this.now()).toISOString();
@@ -952,7 +967,7 @@ export class TurnRecoveryCoordinator {
     const rec = this.sessions.get(makeKey(input.connectionId, input.profileId, input.sessionId));
     const pending = rec?.pendingDeliveryUnknown.find((u) => u.submissionId === input.submissionId);
     if (!pending) {
-      throw makeTurnError("not_found", "未找到待重试的排队记录");
+      throw makeTurnError("not_found", getCopy("turn.queue.retryRecordNotFoundError"));
     }
     if (!pending.canRetrySameSubmission) {
       throw makeTurnError("conflict", getCopy("turn.queue.deliveryUnknownBody"));
@@ -990,7 +1005,7 @@ export class TurnRecoveryCoordinator {
     const rec = this.sessions.get(makeKey(input.connectionId, input.profileId, input.sessionId));
     const target = rec?.queuedAdmissions.find((q) => q.admissionId === input.admissionId);
     if (!rec || !target) {
-      throw makeTurnError("not_found", "未找到目标排队条目");
+      throw makeTurnError("not_found", getCopy("turn.queue.targetNotFoundError"));
     }
 
     const nowIso = new Date(this.now()).toISOString();
@@ -1355,7 +1370,7 @@ export class TurnRecoveryCoordinator {
       return updatedItem;
     });
     if (!updatedItem) {
-      throw makeTurnError("not_found", "未找到目标排队条目");
+      throw makeTurnError("not_found", getCopy("turn.queue.targetNotFoundError"));
     }
     return updatedItem;
   }

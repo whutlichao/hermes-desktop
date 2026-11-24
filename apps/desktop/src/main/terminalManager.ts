@@ -22,6 +22,7 @@ import {
   makeScopeKey,
   projectTerminalScrollbackLines,
   resolveExternalAttribution,
+  getCopy,
   type HostCommandHandler,
   type TerminalScrollbackState,
 } from "@hermes/domain";
@@ -340,7 +341,7 @@ function createCodedError(code: ErrorCode, message: string): Error & { code: Err
 
 function normalizeScope(scope?: BridgeScope | null): BridgeScope {
   if (!scope?.connectionId || !scope.connectionId.trim()) {
-    throw createCodedError("invalid_request", "Terminal 操作必须提供有效 Scope。");
+    throw createCodedError("invalid_request", getCopy("terminal.scopeRequiredError"));
   }
   return {
     connectionId: scope.connectionId.trim(),
@@ -385,7 +386,7 @@ export class TerminalManager {
     if (this.getActiveScope) {
       const active = this.getActiveScope();
       if (!active || !isScopeMatch(active, normalized)) {
-        throw createCodedError("scope_mismatch", "Terminal 请求与当前活动 Scope 不匹配。");
+        throw createCodedError("scope_mismatch", getCopy("terminal.scopeMismatchError"));
       }
     }
     return normalized;
@@ -462,10 +463,10 @@ export class TerminalManager {
       const targetId = suppliedId.trim();
       const ownerScope = this.terminalIdToScopeKey.get(targetId);
       if (ownerScope && ownerScope !== rec.scopeKey) {
-        throw createCodedError("scope_mismatch", "Terminal ID 属于其他 Scope，已阻止跨 Scope 访问。");
+        throw createCodedError("scope_mismatch", getCopy("terminal.foreignBindingError"));
       }
       if (rec.terminalId && rec.terminalId !== targetId) {
-        throw createCodedError("not_found", "指定的 Terminal 会话已不存在。");
+        throw createCodedError("not_found", getCopy("terminal.bindingMissingError"));
       }
     }
   }
@@ -630,10 +631,10 @@ export class TerminalManager {
     this.assertTerminalBinding(rec, payload.terminalId);
 
     if (!rec.pty || (rec.status !== "running" && rec.status !== "detached")) {
-      throw createCodedError("not_found", "当前 Scope 没有运行中的 Terminal，无法发送输入。");
+      throw createCodedError("not_found", getCopy("terminal.notRunningInputError"));
     }
     if (typeof payload.data !== "string") {
-      throw createCodedError("invalid_request", "Terminal 输入内容必须为字符串。");
+      throw createCodedError("invalid_request", getCopy("terminal.inputTypeError"));
     }
     rec.pty.write(payload.data);
     return { ok: true };
@@ -648,7 +649,7 @@ export class TerminalManager {
     this.assertTerminalBinding(rec, payload.terminalId);
 
     if (!rec.pty || (rec.status !== "running" && rec.status !== "detached")) {
-      throw createCodedError("not_found", "当前 Scope 没有运行中的 Terminal，无法调整尺寸。");
+      throw createCodedError("not_found", getCopy("terminal.notRunningResizeError"));
     }
     const dims = clampDims(payload.cols, payload.rows);
     rec.cols = dims.cols;

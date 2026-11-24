@@ -27,6 +27,7 @@ import {
 import {
   buildOrphanedDraftExport,
   checkDraftCapacity,
+  getCopy,
   isDraftRecordEmpty,
   makeActiveChatDraftKey,
   makeNewChatDraftKey,
@@ -835,8 +836,8 @@ export class ChatSessionStateStore {
     if (!res.ok) {
       const err = new Error(
         res.reason === "over_single_limit"
-          ? "当前 Draft 体积超过 1 MiB 上限，请清理部分内容或导出后缩减。"
-          : "本地 Draft 总存储超过 50 MiB 上限，请先清理或导出既有 Draft。",
+          ? getCopy("draft.capacityExceededSingle")
+          : getCopy("draft.capacityExceededTotal"),
       );
       (err as { code?: string; reason?: string }).code =
         res.reason === "over_single_limit" ? "invalid_request" : "conflict";

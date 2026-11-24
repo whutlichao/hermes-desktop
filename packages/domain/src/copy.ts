@@ -159,6 +159,15 @@ export const COPY_CATALOG = {
   "registry.issue.invalidInput": "连接参数无效，请检查设备名称与目标地址。",
   "registry.issue.invalidPrimary": "无法将无效或重复连接设为 Primary。",
   "registry.issue.notFound": "未找到目标 Connection。",
+  "registry.oauthManagerUnavailableError": "OAuth 授权管理器不可用",
+  "connection.gatewayNotReadyError": "Gateway 尚未就绪",
+  "connection.shuttingDownError": "应用正在退出",
+  "connection.capabilityUnavailableError": "当前 Gateway 未提供此能力",
+  "connection.disconnectedOrTimeoutError": "Gateway 连接中断或超时",
+  "connection.requestExecutionFailedError": "Gateway 执行请求失败",
+  "connection.requestFailedError": "请求失败",
+  "session.targetRequiredError": "缺少目标 Session",
+  "session.createUnsupportedError": "当前 Gateway 不支持新建 Session",
   "capabilities.title": "能力目录",
   "capabilities.summary": "17 可达 / 4 延期",
   "capabilities.countsLine": "能力 17 可达 4 延期",
@@ -348,6 +357,8 @@ export const COPY_CATALOG = {
   "chat.emptyCronDefaultHint": "Routines 已折叠入 Cron 定时任务，可在能力目录查看或管理。",
   "chat.unavailableTitle": "当前 Gateway 暂不支持 Chat",
   "chat.unavailableBody": "服务端未声明 prompt.submit 能力，已隐藏对话输入，不会发送假消息。",
+  "chat.messageRequiredError": "请输入对话内容后再发送",
+  "chat.promptSubmitUnsupportedError": "当前 Gateway 不支持发送对话",
   "chat.composerPlaceholder": "向当前 Scope 发送消息（Enter 发送，Shift+Enter 换行）……",
   "chat.sendAction": "发送消息",
   "chat.sendAccepted": "消息已送达 Gateway。",
@@ -437,6 +448,14 @@ export const COPY_CATALOG = {
   "workspace.agents.tailInvalidatedNotice": "连接世代已变更，旧输出已失效，请重新拉取。",
   "workspace.agents.retryAction": "重试 Subagent 操作",
   "workspace.agents.detailsAction": "查看错误详情",
+  "workspace.agents.capabilityRejectedError": "当前 Gateway 已拒绝 Subagents 能力",
+  "workspace.agents.tailSelectionRequiredError": "未选择要查看 Tail 的 Subagent",
+  "workspace.agents.tailUnsupportedError": "当前 Gateway 未提供 Subagent Tail 能力",
+  "workspace.agents.steerTextRequiredError": "请输入针对该 Subagent 的补充指令",
+  "workspace.agents.steerUnsupportedError": "当前 Gateway 不支持 Subagent 补充指令",
+  "workspace.agents.stopSelectionRequiredError": "未选择要停止的 Subagent",
+  "workspace.agents.stopUnsupportedError": "当前 Gateway 不支持停止 Subagent",
+  "workspace.agents.stopUnconfirmedError": "Gateway 未确认停止该 Subagent，当前运行状态保持不变",
   "workspace.checkpoints.empty": "当前 Session 尚无可用 Checkpoint。",
   "workspace.checkpoints.readOnlyNotice": "当前 Gateway 未提供 rollback.restore 能力，仅支持只读浏览与 Diff 对比。",
   "workspace.checkpoints.diffAction": "查看 Diff",
@@ -450,6 +469,11 @@ export const COPY_CATALOG = {
   "workspace.checkpoints.restoredNotice": "已恢复到所选 Checkpoint",
   "workspace.checkpoints.retryAction": "重试 Checkpoint 操作",
   "workspace.checkpoints.detailsAction": "查看错误详情",
+  "workspace.checkpoints.listUnsupportedError": "当前 Gateway 未提供 Checkpoint 列表能力",
+  "workspace.checkpoints.diffSelectionRequiredError": "未选择要对比的 Checkpoint",
+  "workspace.checkpoints.diffUnsupportedError": "当前 Gateway 未提供 Checkpoint Diff 能力",
+  "workspace.checkpoints.restoreConfirmRequiredError": "恢复 Checkpoint 需要显式确认",
+  "workspace.checkpoints.restoreUnconfirmedError": "Gateway 未能恢复到所选 Checkpoint",
   "workspace.terminal.empty": "当前 Scope 尚无 Terminal 输出。",
   "workspace.terminal.title": "Scope Terminal（PTY 归 Main）",
   "workspace.terminal.statusIdle": "未开启（idle）",
@@ -515,6 +539,10 @@ export const COPY_CATALOG = {
   "settings.section.diagnostics": "Diagnostics",
   "settings.configUnsupportedNotice": "当前 Scope 的 Gateway 未暴露此分区可写配置键，已隐藏不支持项。",
   "settings.configSavedNotice": "已更新当前 Scope 配置",
+  "settings.config.keyUnsupportedError": "不支持更新该配置项",
+  "settings.config.updateRefusedError": "当前 Gateway 拒绝更新配置",
+  "settings.config.updateUnsupportedError": "当前 Gateway 未提供 config.update 能力",
+  "settings.config.updateFailedError": "更新配置失败",
   "settings.field.model.default": "默认模型",
   "settings.field.model.reasoning_effort": "推理强度",
   "settings.field.workspace.default_tab": "默认 Workspace 标签页",
@@ -654,6 +682,8 @@ export const COPY_CATALOG = {
   "approval.orphanedBody": "所属 Connection 或 Profile 已移除，此记录仅保留只读信息且不会转发。",
   "approval.deliveryUnknownBody": "未收到 Gateway ACK，正在向权威 pending 列表核对状态。",
   "approval.actionFailedNotice": "发生了什么：审批操作未完成。可能原因：连接中断或 Gateway 拒绝本次请求。下一步：查看卡片状态后重试。",
+  "approval.connectionUnavailableError": "当前 Gateway 未连接，无法校验待处理 Approval",
+  "approval.ownerChangedError": "所属 Gateway 连接代次已变更，旧 Approval 已失效",
   "approval.smartDeniedBadge": "Smart Denied 提示",
   "approval.inspectTitle": "Approval 只读详情",
   "approval.inspectDescription": "核对不可变来源上下文；查看详情不会解决该请求，也不会修改目标。",
@@ -753,6 +783,11 @@ export const COPY_CATALOG = {
   "cron.submittedNotice": "已提交新建 Cron 任务",
   "cron.cancelledNotice": "已取消 Cron 任务",
   "cron.recoveredNotice": "已恢复 Cron 任务",
+  "cron.submitFieldsRequiredError": "请填写任务名称、Cron 表达式与执行提示词",
+  "cron.submitUnsupportedError": "当前 Gateway 不支持新建 Cron 任务",
+  "cron.jobIdRequiredError": "缺少 Cron 任务 ID",
+  "cron.cancelUnsupportedError": "当前 Gateway 不支持取消 Cron 任务",
+  "cron.recoverUnsupportedError": "当前 Gateway 不支持恢复 Cron 任务",
   "memory.noSession": "当前没有活动 Session，无法读取 Memory 上下文。",
   "domainInspect.refreshAction": "刷新只读状态",
   "domainInspect.copyCliAction": "复制 CLI 命令",
@@ -779,6 +814,11 @@ export const COPY_CATALOG = {
   "turn.unknown.detailsAction": "查看详情",
   "turn.unknown.hideDetailsAction": "收起详情",
   "turn.unknown.protocolUnsupportedBody": "Gateway 返回了无法解析的丢失 Turn 记录。Session 与排队已暂停，请检查 Gateway 版本或查看诊断；不会自动放弃或重发。",
+  "turn.recovery.unknownNotFoundError": "当前 Session 没有待处理的丢失 Turn",
+  "turn.recovery.admissionMismatchError": "丢失 Turn 的 admission_id 不匹配",
+  "turn.recovery.generationMismatchError": "丢失 Turn 的 execution_generation 不匹配",
+  "turn.recovery.discardInProgressError": "正在放弃丢失的 Turn，请等待完成",
+  "turn.recovery.discardUnconfirmedError": "Gateway 未确认放弃丢失 Turn",
   "turn.unknown.pausedBadge": "Session 已暂停",
   "turn.unknown.admissionLabel": "Admission ID",
   "turn.unknown.generationLabel": "Execution 代际",
@@ -795,6 +835,10 @@ export const COPY_CATALOG = {
   "turn.stop.cancelOutcomeUnknownBody": "发送停止请求后未收到确认或连接发生变更，将在 Session 恢复对账后确认实际终态，不会跨代际自动重发。",
   "turn.stop.notConfirmedBody": "Gateway 未确认停止当前 Turn，停止请求保持待确认；不会跨代际自动重发，请在 Session 恢复后对账。",
   "turn.stop.notConfirmedError": "发生了什么：Gateway 未确认停止当前 Turn。可能原因：Turn 已结束或连接中断。下一步：检查 Session 状态后再重试。",
+  "turn.stop.noActiveTurnError": "当前没有运行中的 Turn 可停止",
+  "turn.stop.noActiveTurnBridgeError": "当前没有可停止的 Turn",
+  "turn.stop.generationMismatchError": "目标 Turn 的 Execution 代际已变更，无法跨代际停止",
+  "turn.stop.unsupportedError": "当前 Gateway 不支持停止当前 Turn",
   "turn.queue.sectionTitle": "Gateway 排队队列",
   "turn.queue.pausedNotice": "当前队列已暂停，需先处理丢失的 Turn",
   "turn.queue.queueAction": "加入排队",
@@ -820,6 +864,18 @@ export const COPY_CATALOG = {
   "turn.queue.rejectedError": "发生了什么：Gateway 拒绝了本次排队请求。可能原因：队列已满或当前 Scope 不允许排队。下一步：稍后重试，或发送为普通 Turn。",
   "turn.queue.submissionIdRequiredError": "发生了什么：缺少 submissionId。可能原因：排队恢复请求不完整。下一步：重新检查回执后再重试。",
   "turn.queue.promptSubmitUnavailableError": "发生了什么：当前 Gateway 不支持发送对话。可能原因：Gateway 版本过旧或 prompt.submit 未开放。下一步：升级 Gateway 或改用受支持的入口。",
+  "turn.queue.textRequiredError": "请输入内容后再排队",
+  "turn.queue.admissionIdRequiredError": "缺少排队 admissionId",
+  "turn.queue.cancelUnsupportedError": "当前 Gateway 不支持取消排队",
+  "turn.queue.retryRecordNotFoundError": "未找到待重试的排队记录",
+  "turn.queue.targetNotFoundError": "未找到目标排队条目",
+  "terminal.scopeRequiredError": "Terminal 操作必须提供有效 Scope。",
+  "terminal.scopeMismatchError": "Terminal 请求与当前活动 Scope 不匹配。",
+  "terminal.foreignBindingError": "Terminal ID 属于其他 Scope，已阻止跨 Scope 访问。",
+  "terminal.bindingMissingError": "指定的 Terminal 会话已不存在。",
+  "terminal.notRunningInputError": "当前 Scope 没有运行中的 Terminal，无法发送输入。",
+  "terminal.inputTypeError": "Terminal 输入内容必须为字符串。",
+  "terminal.notRunningResizeError": "当前 Scope 没有运行中的 Terminal，无法调整尺寸。",
   "turn.queue.cancelOutcome.cancelled": "排队条目已取消。",
   "turn.queue.cancelOutcome.stopped": "该排队条目已停止。",
   "turn.queue.cancelOutcome.already_started": "该排队条目已开始执行，无法再取消。",
@@ -842,6 +898,8 @@ export const COPY_CATALOG = {
   "turn.steer.reason.rejected": "Gateway 拒绝纠偏",
   "turn.steer.reason.unreachable": "连接已中断",
   "turn.steer.reason.timeout": "Gateway 响应超时",
+  "turn.steer.textRequiredError": "缺少补充指令内容",
+  "turn.steer.unsupportedError": "当前 Gateway 不支持中途纠偏",
   "attribution.surfaceBadgeLabel": "组件来源标记",
 } as const;
 
@@ -979,14 +1037,24 @@ export function validateTerminology(text: string, key?: string): TerminologyViol
   return violations;
 }
 
-export function lintCopyCatalog(catalog: Record<string, string>): TerminologyViolation[] {
+export function lintCopyCatalog(
+  catalog: Record<string, string | undefined>,
+): TerminologyViolation[] {
   const violations: TerminologyViolation[] = [];
   for (const [key, value] of Object.entries(catalog)) {
-    if (!value || value.trim() === "" || value === key) {
+    if (!value) {
       violations.push({
         key,
         reason: "文案缺失或为原始 key",
-        text: value ?? "",
+        text: "",
+      });
+      continue;
+    }
+    if (value.trim() === "" || value === key) {
+      violations.push({
+        key,
+        reason: "文案缺失或为原始 key",
+        text: value,
       });
       continue;
     }
@@ -1011,8 +1079,38 @@ export interface CopyLintSourceFile {
   content: string;
 }
 
-const VISIBLE_ERROR_LITERAL =
-  /(?:makeTurnError|makeBridgeError|new Error)\s*\([\s\S]{0,240}?(["'`])((?:\\.|(?!\1)[^\\])*?[\u4e00-\u9fff](?:\\.|(?!\1)[^\\])*?)\1/g;
+const ERROR_FACTORY_CALL = /\b(?:makeTurnError|makeBridgeError|createCodedError|new Error)\s*\(/g;
+const STRING_LITERAL = /(["'`])((?:\\.|(?!\1)[^\\])*?)\1/g;
+
+function collectVisibleLiteralsInCall(content: string, start: number): string[] {
+  let depth = 1;
+  let quote: string | null = null;
+  let cursor = start;
+  while (cursor < content.length && depth > 0) {
+    const char = content[cursor];
+    if (quote) {
+      if (char === "\\") {
+        cursor += 2;
+        continue;
+      }
+      if (char === quote) quote = null;
+      cursor += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      quote = char;
+    } else if (char === "(") {
+      depth += 1;
+    } else if (char === ")") {
+      depth -= 1;
+    }
+    cursor += 1;
+  }
+
+  const argumentsText = content.slice(start, Math.max(start, cursor - 1));
+  return Array.from(argumentsText.matchAll(STRING_LITERAL), (match) => match[2])
+    .filter((literal) => !literal.includes("\n") && /[\u4e00-\u9fff]/.test(literal));
+}
 
 export function lintVisibleErrorLiterals(
   files: readonly CopyLintSourceFile[],
@@ -1021,10 +1119,13 @@ export function lintVisibleErrorLiterals(
   const violations: TerminologyViolation[] = [];
   for (const file of files) {
     const counts = new Map<string, number>();
-    for (const match of file.content.matchAll(VISIBLE_ERROR_LITERAL)) {
-      const literal = match[2] ?? "";
-      if (!literal || literal.includes("\n")) continue;
-      counts.set(literal, (counts.get(literal) ?? 0) + 1);
+    for (const call of file.content.matchAll(ERROR_FACTORY_CALL)) {
+      for (const literal of collectVisibleLiteralsInCall(
+        file.content,
+        call.index! + call[0].length,
+      )) {
+        counts.set(literal, (counts.get(literal) ?? 0) + 1);
+      }
     }
     for (const [literal, count] of counts) {
       const allowed = allowedCounts[file.path]?.[literal] ?? 0;

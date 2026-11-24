@@ -8,7 +8,7 @@ import type {
   RegistryIssue,
   RegistrySnapshotView,
 } from "@hermes/contracts";
-import type { HostCommandHandler } from "@hermes/domain";
+import { getCopy, type HostCommandHandler } from "@hermes/domain";
 import type { GatewayClientTlsOptions } from "./gatewayClient";
 import type { RegistryMutationResult, RegistryStore } from "./registryStore";
 import { type RemoteAuthManager, testRemoteConnection } from "./remoteGateway";
@@ -222,7 +222,7 @@ export function createRegistryBridgeHandlers(
     },
     "auth.start": async (payload) => {
       if (!deps?.authManager) {
-        const err = new Error("OAuth 授权管理器不可用");
+        const err = new Error(getCopy("registry.oauthManagerUnavailableError"));
         (err as { code?: string }).code = "capability_unavailable";
         throw err;
       }
