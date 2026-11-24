@@ -88,6 +88,7 @@ export type ControlSocketProtocol1Response =
 export interface LocalDialMaterial {
   connectionId: "local";
   profileId: string;
+  cliProfileId: string;
   instanceId: string;
   authorityEpoch: number;
   wsUrl: string;
@@ -1106,7 +1107,7 @@ export class LocalBackendManager {
       expiresInSeconds = parsed.expiresInSeconds;
       transportMode = "per-profile";
     } else if (inspection.cli.supportsAttachJson) {
-      const attached = await this.runPerProfileAttach(cliPath, parsed.endpoint.profileId);
+      const attached = await this.runPerProfileAttach(cliPath, profileId);
       if (attached.kind === "failure") {
         const failure = mapLocalFailure(attached.code, "ensure_gateway", { profileId });
         return { ok: false, failure, inspection };
@@ -1132,6 +1133,7 @@ export class LocalBackendManager {
     const dial: LocalDialMaterial = {
       connectionId: "local",
       profileId: finalEndpoint.profileId,
+      cliProfileId: profileId,
       instanceId: finalEndpoint.instanceId,
       authorityEpoch: finalEndpoint.authorityEpoch,
       wsUrl: finalEndpoint.wsUrl,
@@ -1153,7 +1155,9 @@ export class LocalBackendManager {
     return { ok: true, dial, inspection: readyInspection };
   }
 
-  async mintReconnectTicket(dial: Pick<LocalDialMaterial, "profileId" | "instanceId" | "transportMode">): Promise<LocalMintTicketResult> {
+  async mintReconnectTicket(
+    dial: Pick<LocalDialMaterial, "profileId" | "cliProfileId" | "instanceId" | "transportMode">,
+  ): Promise<LocalMintTicketResult> {
     if (dial.transportMode === "shared-host-scope") {
       const sockRes = await this.tryControlSocketTicket(dial.profileId, dial.instanceId);
       if (sockRes.kind === "ok") {
@@ -1169,7 +1173,7 @@ export class LocalBackendManager {
     if (!cliPath) {
       return { ok: false, failure: mapLocalFailure("hermes_not_found", "locate_cli") };
     }
-    const attached = await this.runPerProfileAttach(cliPath, dial.profileId);
+    const attached = await this.runPerProfileAttach(cliPath, dial.cliProfileId);
     if (attached.kind === "ready" && attached.ticket) {
       const handle = this.createSingleUseTicketHandle(attached.ticket, attached.expiresInSeconds);
       return { ok: true, ...handle };
@@ -1425,6 +1429,13 @@ export function createNodeLocalBackendPorts(options: NodeLocalPortsOptions): Loc
               rawStatus === "update_paused"
             ) {
               finish({ status: rawStatus });
+              return;
+            }
+            if (
+              parsed.ok === false &&
+              (errStr.includes("unknown verb") || Array.isArray(parsed.supported_verbs))
+            ) {
+              finish({ status: "unsupported" });
               return;
             }
             const ep =

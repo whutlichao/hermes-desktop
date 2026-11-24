@@ -55,6 +55,92 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
     }
   });
 
+  it("parses the installed Hermes 0.23.3 wire shape from ensure and attach", () => {
+    const verdict = {
+      client_code_sha: "sha_live_1",
+      detail: null,
+      endpoint: {
+        api_origin: "http://127.0.0.1:63942",
+        authority_epoch: 26,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "session-authority-v1",
+        ],
+        code_sha: "sha_live_1",
+        control_home: null,
+        instance_id: "inst-live-1",
+        profile_id: "/Users/example/.hermes",
+        runtime_protocol: 1,
+        supervisor: "launchd",
+      },
+      reason_code: null,
+      state: "ready",
+    };
+
+    const ensured = parseEnsureOrAttachOutput(JSON.stringify(verdict), 0);
+    expect(ensured.kind).toBe("ready");
+    if (ensured.kind === "ready") {
+      expect(ensured.endpoint.wsUrl).toBe("ws://127.0.0.1:63942/api/ws");
+      expect(ensured.endpoint.profileId).toBe("/Users/example/.hermes");
+      expect(ensured.ticket).toBeUndefined();
+    }
+
+    const attached = parseEnsureOrAttachOutput(
+      JSON.stringify({
+        ...verdict,
+        protocol: "hermes-gateway-v1",
+        protocols: ["hermes-gateway-v1", "hermes-gateway-ticket.tkt_capture_1"],
+        ticket: "tkt_capture_1",
+        url: "ws://127.0.0.1:63942/api/ws",
+      }),
+      0,
+    );
+    expect(attached.kind).toBe("ready");
+    if (attached.kind === "ready") {
+      expect(attached.endpoint.wsUrl).toBe("ws://127.0.0.1:63942/api/ws");
+      expect(attached.endpoint.wsProtocol).toBe("hermes-gateway-v1");
+      expect(attached.ticket).toBe("tkt_capture_1");
+    }
+  });
+
+  it("derives a ws url from api_origin only for a bare http(s) origin", () => {
+    const makeOutput = (apiOrigin: string) =>
+      JSON.stringify({
+        state: "ready",
+        endpoint: {
+          api_origin: apiOrigin,
+          profile_id: "default",
+          instance_id: "inst-origin",
+          authority_epoch: 1,
+          runtime_protocol: 1,
+          capabilities: ["session-authority-v1"],
+        },
+      });
+
+    const loopback = parseEnsureOrAttachOutput(makeOutput("http://127.0.0.1:8642"), 0);
+    expect(loopback.kind).toBe("ready");
+    if (loopback.kind === "ready") {
+      expect(loopback.endpoint.wsUrl).toBe("ws://127.0.0.1:8642/api/ws");
+    }
+
+    const secure = parseEnsureOrAttachOutput(makeOutput("https://127.0.0.1:8642"), 0);
+    expect(secure.kind).toBe("ready");
+    if (secure.kind === "ready") {
+      expect(secure.endpoint.wsUrl).toBe("wss://127.0.0.1:8642/api/ws");
+    }
+
+    for (const unsafe of [
+      "http://user:pass@127.0.0.1:8642",
+      "http://127.0.0.1:8642/other",
+      "http://127.0.0.1:8642?token=x",
+      "file:///tmp/gateway.sock",
+      "not a url",
+    ]) {
+      expect(parseEnsureOrAttachOutput(makeOutput(unsafe), 0).kind).toBe("failure");
+    }
+  });
+
   it("rejects endpoints whose runtime_protocol !== 1 or missing session-authority-v1", () => {
     const wrongProtocol = parseEnsureOrAttachOutput(
       JSON.stringify({
