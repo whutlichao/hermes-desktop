@@ -107,7 +107,7 @@ async function collectFocusReachabilityIssues(page: import("@playwright/test").P
 }
 
 test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
-  test("E2E-A11Y-01: passes axe-core serious/critical = 0 on shell, palette, settings, capabilities, workspace, and 1280 popover", async ({
+  test("E2E-A11Y-01: passes axe-core serious/critical = 0 on shell, palette, settings, capabilities, workspace, and 1120 popover", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -169,11 +169,11 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await checkAxe("workspace drawer");
     await page.keyboard.press("Control+b");
 
-    // 1280x800 Sessions popover
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // 1120x700 Sessions popover
+    await page.setViewportSize({ width: 1120, height: 700 });
     await page.getByRole("button", { name: /Sessions\s+0/ }).click();
     await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
-    await checkAxe("1280 sessions popover");
+    await checkAxe("1120 sessions popover");
     await page.keyboard.press("Escape");
 
     // Onboarding empty state: add a Remote/SSH connection through Settings
@@ -185,7 +185,7 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await expect(settingsDialog).toBeHidden();
   });
 
-  test("E2E-A11Y-02: passes axe-core serious/critical = 0 on populated session rail, route banner, 1280 popover, and session_missing recovery card", async ({
+  test("E2E-A11Y-02: passes axe-core serious/critical = 0 on populated session rail, route banner, 1120 popover, and session_missing recovery card", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {
@@ -276,10 +276,10 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await expect(page.locator(".route-fallback-banner")).toBeVisible();
     await checkAxe("populated 1440 rail + route banner");
 
-    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.setViewportSize({ width: 1120, height: 700 });
     await page.getByRole("button", { name: /Sessions\s+2/ }).click();
     await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
-    await checkAxe("populated 1280 sessions popover");
+    await checkAxe("populated 1120 sessions popover");
     await page.keyboard.press("Escape");
 
     // session_missing recovery card a11y
@@ -671,7 +671,7 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
   });
 
 
-  test("E2E-A11Y-02 & E2E-A11Y-04: passes axe-core serious/critical = 0 on background attention badges, mark-read action, route attention chips, and 1280 popover (Ticket #37)", async ({
+  test("E2E-A11Y-02 & E2E-A11Y-04: passes axe-core serious/critical = 0 on background attention badges, mark-read action, route attention chips, and 1120 popover (Ticket #37)", async ({
     page,
   }) => {
     const checkAxe = async (label: string) => {
@@ -781,10 +781,10 @@ test.describe("E2E-A11Y-01 Quiet Relay accessibility baseline", () => {
     await expect(page.getByTestId("route-strip-attention-unread")).toBeVisible();
     await checkAxe("1440 rail + route strip attention badges");
 
-    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.setViewportSize({ width: 1120, height: 700 });
     await page.getByRole("button", { name: /Sessions\s+2/ }).click();
     await expect(page.getByRole("dialog", { name: "Sessions" })).toBeVisible();
-    await checkAxe("1280 popover with attention badges");
+    await checkAxe("1120 popover with attention badges");
     await page.keyboard.press("Escape");
 
     // Workspace Git deep links & Terminal running + busy inline confirmation a11y
@@ -1420,7 +1420,7 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
           pageOverflow: false,
           columnReady: true,
           headingReady: true,
-          railVisible: viewport.width > 1340,
+          railVisible: viewport.width > 1120,
         });
 
       const metrics = await page.evaluate(() => {
@@ -1442,7 +1442,7 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
       expect(metrics.columnWidth, `column at ${viewport.width}`).toBeLessThanOrEqual(721);
       expect(metrics.columnWidth, `column at ${viewport.width}`).toBeGreaterThan(680);
       expect(metrics.headingFont).toBeGreaterThanOrEqual(24);
-      expect(metrics.railVisible).toBe(viewport.width > 1340);
+      expect(metrics.railVisible).toBe(viewport.width > 1120);
 
       const messageOverflow = await page.evaluate(() =>
         Array.from(document.querySelectorAll<HTMLElement>(".transcript-message")).map(
