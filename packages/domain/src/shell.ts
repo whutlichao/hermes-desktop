@@ -99,7 +99,7 @@ export type ShellAction =
   | { type: "ANNOUNCE"; message: string; eventId?: string; priority?: "polite" | "assertive" };
 
 export function deriveViewportMode(width: number): ViewportMode {
-  return width <= 1340 ? "popover" : "rail";
+  return width <= 1120 ? "popover" : "rail";
 }
 
 export function createInitialShellState(): ShellState {

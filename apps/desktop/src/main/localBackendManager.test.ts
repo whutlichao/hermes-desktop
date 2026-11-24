@@ -513,6 +513,61 @@ describe("LocalBackendManager (S2 fake CLI/process/control-socket/fs/clock)", ()
     }
   });
 
+  it("createNodeLocalBackendPorts classifies Hermes 0.23.3 unknown-verb control replies as unsupported", async () => {
+    const sandbox = createTestSandbox("hermes-s2-control-verb-");
+    let passed = false;
+    const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+    const requestsSeen: Array<Record<string, unknown>> = [];
+    const server = net.createServer((socket) => {
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        const newline = buffer.indexOf("\n");
+        if (newline === -1) return;
+        requestsSeen.push(JSON.parse(buffer.slice(0, newline)));
+        socket.write(
+          JSON.stringify({
+            ok: false,
+            error: "unknown verb: None",
+            protocol: 1,
+            supported_verbs: [
+              "status",
+              "serve-profile",
+              "unserve-profile",
+              "rescan-profiles",
+            ],
+          }) + "\n",
+        );
+      });
+    });
+
+    await new Promise<void>((resolve) => server.listen(sockPath, resolve));
+    fs.chmodSync(sockPath, 0o600);
+
+    try {
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+
+      const result = await ports.controlSocketRequest?.(sockPath, {
+        op: "resolve-profile",
+        profile_id: "default",
+      });
+      expect(result).toEqual({ status: "unsupported" });
+      expect(requestsSeen).toEqual([{ op: "resolve-profile", profile_id: "default" }]);
+
+      passed = true;
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      sandbox.cleanup(passed);
+    }
+  });
+
   it("prepareDial runs modern ensure --json, enforces protocol-1 + session-authority-v1, and mints single-use 30s interactive ticket over real UDS", async () => {
     const sandbox = createTestSandbox("hermes-s2-uds-dial-");
     let passed = false;
@@ -628,6 +683,139 @@ describe("LocalBackendManager (S2 fake CLI/process/control-socket/fs/clock)", ()
       passed = true;
     } finally {
       server.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("prepareDial accepts Hermes 0.23.3 attach output and keeps profile identity separate from the CLI selector", async () => {
+    const sandbox = createTestSandbox("hermes-s2-real-cli-shape-");
+    let passed = false;
+    try {
+      const cliBin = path.join(sandbox.rootDir, "hermes");
+      const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+      const profileIdentity = sandbox.hermesHomeDir;
+      let attachCount = 0;
+      const endpoint = {
+        api_origin: "http://127.0.0.1:63942",
+        authority_epoch: 26,
+        capabilities: ["durable-admission-v1", "event-replay-v1", "session-authority-v1"],
+        code_sha: "sha_live_1",
+        control_home: null,
+        instance_id: "inst-live-1",
+        profile_id: profileIdentity,
+        runtime_protocol: 1,
+        supervisor: "launchd",
+      };
+
+      const ports = createFakePorts({
+        sandboxRoot: sandbox.rootDir,
+        userDataDir: sandbox.userDataDir,
+        overridePath: cliBin,
+        files: {
+          [cliBin]: { executable: true },
+          [sockPath]: { executable: false },
+        },
+        processes: (req) => {
+          if (req.args.includes("--version")) {
+            return { exitCode: 0, stdout: "Hermes Agent v0.23.3", stderr: "", timedOut: false };
+          }
+          if (
+            req.args.includes("gateway") &&
+            req.args.includes("--help") &&
+            !req.args.includes("ensure") &&
+            !req.args.includes("attach")
+          ) {
+            return { exitCode: 0, stdout: "{run,ensure,attach,tickets,restart}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--help")) {
+            return { exitCode: 0, stdout: "--json --timeout", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("attach") && req.args.includes("--help")) {
+            return { exitCode: 0, stdout: "--json --recover", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("tickets") && req.args.includes("--probe")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                protocol: 1,
+                purposes: ["interactive", "native-http"],
+                windows_service_session: false,
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                client_code_sha: "sha_live_1",
+                detail: null,
+                endpoint,
+                reason_code: null,
+                state: "ready",
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("attach") && req.args.includes("--json")) {
+            attachCount += 1;
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                client_code_sha: "sha_live_1",
+                detail: null,
+                endpoint,
+                protocol: "hermes-gateway-v1",
+                protocols: [
+                  "hermes-gateway-v1",
+                  `hermes-gateway-ticket.tkt_real_shape_${attachCount}`,
+                ],
+                reason_code: null,
+                state: "ready",
+                ticket: `tkt_real_shape_${attachCount}`,
+                url: "ws://127.0.0.1:63942/api/ws",
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+        },
+      });
+      ports.ports.getControlSocketCandidates = () => [sockPath];
+      ports.ports.controlSocketRequest = async () => ({ status: "unsupported" });
+
+      const mgr = new LocalBackendManager(ports.ports);
+      const res = await mgr.prepareDial({ profileId: "default" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+
+      expect(res.dial.wsUrl).toBe("ws://127.0.0.1:63942/api/ws");
+      expect(res.dial.profileId).toBe(profileIdentity);
+      expect(res.dial.cliProfileId).toBe("default");
+      expect(res.dial.consumeTicket()).toBe("tkt_real_shape_1");
+      expect(res.dial.consumeTicket()).toBeNull();
+
+      const attachCalls = ports.invokedCommands.filter(
+        (call) => call.args.includes("attach") && call.args.includes("--json"),
+      );
+      expect(attachCalls.length).toBe(1);
+      expect(attachCalls[0]?.args).toEqual(["gateway", "attach", "--json"]);
+
+      const fresh = await mgr.mintReconnectTicket(res.dial);
+      expect(fresh.ok).toBe(true);
+      if (fresh.ok) {
+        expect(fresh.consumeTicket()).toBe("tkt_real_shape_2");
+      }
+      const reconnectAttach = ports.invokedCommands
+        .filter((call) => call.args.includes("attach") && call.args.includes("--json"))
+        .at(-1);
+      expect(reconnectAttach?.args).toEqual(["gateway", "attach", "--json"]);
+
+      passed = true;
+    } finally {
       sandbox.cleanup(passed);
     }
   });

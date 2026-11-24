@@ -109,10 +109,31 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     expect(overflow).toBe(false);
   });
 
-  test("E2E-SHELL-01: 1280x800 collapses rail into Sessions popover without overflow", async ({
+  test("E2E-SHELL-01: 1280x800 keeps the 232px session rail visible without page overflow", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+
+    const rail = page.locator("nav.sidebar");
+    await expect(rail).toBeVisible();
+    const railBox = await rail.boundingBox();
+    expect(railBox?.width).toBe(232);
+
+    const documentOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(documentOverflow).toBe(false);
+    const bodyOverflow = await page.evaluate(
+      () => document.body.scrollWidth > document.body.clientWidth,
+    );
+    expect(bodyOverflow).toBe(false);
+  });
+
+  test("E2E-SHELL-01: 1120x700 collapses rail into Sessions popover without overflow", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1120, height: 700 });
     await page.goto("/");
 
     await expect(page.locator("nav.sidebar")).toBeHidden();
@@ -194,7 +215,7 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     expect(Number.parseFloat(transitionDuration)).toBeLessThanOrEqual(0.001);
   });
 
-  test("E2E-KB-01 & E2E-FAKE-01: Onboarding empty state exposes at most three reachable actions and zero fake buttons", async ({
+  test("E2E-KB-01 & E2E-FAKE-01: Onboarding empty state exposes three setup actions plus the mock sample action and zero fake buttons", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -208,12 +229,14 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     await expect(onboarding).toContainText("下一步");
     await expect(onboarding).toContainText("Cron");
 
-    // E2E-KB-01: onboarding is limited to three actions and all are keyboard reachable
+    // E2E-KB-01: onboarding keeps three setup actions plus one mock-only sample entry
     const onboardingActions = onboarding.locator(".empty-relay-actions button");
-    await expect(onboardingActions).toHaveCount(3);
+    await expect(onboardingActions).toHaveCount(4);
+    const sampleBtn = onboarding.getByRole("button", { name: "查看示例对话" });
     const repairBtn = onboarding.getByRole("button", { name: "修复 Local" });
     const remoteBtn = onboarding.getByRole("button", { name: "添加 Remote" });
     const sshBtn = onboarding.getByRole("button", { name: "添加 SSH" });
+    await expect(sampleBtn).toBeVisible();
     await expect(repairBtn).toBeVisible();
     await expect(remoteBtn).toBeVisible();
     await expect(sshBtn).toBeVisible();
@@ -255,6 +278,57 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     }
     await expect(page.locator("#composer-input")).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByRole("button", { name: "发送消息" })).toBeDisabled();
+  });
+
+  test("E2E-SAMPLE-01: one-click mock sample conversation shows tools, approval, simulated label, and a realistic reply", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const onboarding = page.locator("section.onboarding-empty-card");
+    await expect(onboarding).toBeVisible();
+    const sampleButton = page.getByTestId("view-sample-conversation");
+    await expect(sampleButton).toBeVisible();
+    await expect(sampleButton).toHaveText("查看示例对话");
+    await sampleButton.click();
+
+    const transcript = page.locator(".transcript-list");
+    await expect(transcript).toBeVisible();
+    await expect(transcript).toContainText("帮我检查一下这周的发布准备");
+    await expect(transcript).toContainText("pnpm typecheck");
+
+    const badge = page.getByTestId("sample-conversation-badge");
+    await expect(badge).toContainText("示例对话 · 模拟数据");
+    await expect(page.locator("nav.sidebar")).toContainText("示例对话 · 模拟数据");
+
+    const toolRows = page.locator(".tool-execution-row");
+    expect(await toolRows.count()).toBeGreaterThanOrEqual(2);
+    await expect(page.locator(".tool-execution-row", { hasText: "shell.exec" })).toHaveCount(1);
+    await expect(page.locator(".tool-execution-row", { hasText: "files.list" })).toHaveCount(1);
+    await expect(page.locator(".tool-execution-row", { hasText: "2.4s" })).toHaveCount(1);
+    await expect(page.locator(".tool-execution-row", { hasText: "180ms" })).toHaveCount(1);
+
+    const approval = page.locator(".approval-card");
+    await expect(approval).toHaveCount(1);
+    await expect(approval).toContainText("shell.exec");
+    await expect(approval).toContainText("pnpm test");
+    await expect(approval).toContainText("待审批");
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(overflow).toBe(false);
+
+    await page.locator("#composer-input").fill("继续跑测试并给我一份摘要");
+    await page.getByRole("button", { name: "发送消息" }).click();
+    await expect(transcript).toContainText("（模拟数据）");
+    await expect(transcript).not.toContainText("Mock Gateway (demo-lab) received");
+
+    const overflowAfterReply = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(overflowAfterReply).toBe(false);
   });
 
   test("Settings -> Gateways supports Local row, rename, Remote/SSH add, Primary/launchMode/NEXT LAUNCH, duplicate conflict preserving draft, and zero fake Test/Update buttons", async ({
@@ -557,7 +631,7 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
 });
 
 test.describe("Ticket #31 Session rail, recovery, route banner, and transcript resync", () => {
-  test("E2E-KB-03: 1440 session rail & 1280 Sessions popover support search, keyboard nav, IME composition, aria-current, mouse focus retention, New Chat, and Session Details", async ({
+  test("E2E-KB-03: 1440 session rail & 1120 Sessions popover support search, keyboard nav, IME composition, aria-current, mouse focus retention, New Chat, and Session Details", async ({
     page,
   }) => {
     await page.addInitScript(() => {
@@ -724,8 +798,8 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await expect(sidebar).toContainText("没有匹配的 Session。");
     await searchInput.fill("");
 
-    // 1280x800 Sessions popover (~378x456) with search, New Chat (Cmd+N), and Session Details
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // 1120x700 Sessions popover (~378x456) with search, New Chat (Cmd+N), and Session Details
+    await page.setViewportSize({ width: 1120, height: 700 });
     const popTrigger = page.getByRole("button", { name: /Sessions\s+3/ });
     await popTrigger.click();
     const popDialog = page.getByRole("dialog", { name: "Sessions" });
@@ -1155,6 +1229,7 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await page.getByRole("button", { name: "发送消息" }).click();
     await expect(page.locator(".transcript-list")).toContainText("ping remote gateway");
     await expect(page.locator(".transcript-list")).toContainText("Mock Gateway (gpu-node)");
+    await expect(page.getByTestId("sample-conversation-badge")).toHaveCount(0);
   });
 
   test("Ticket #35: Workspace shell bindings, 448/408 overlay geometry, Artifacts/Files preview & stale, annotations version, Hide vs Close, and FocusReturnController", async ({
@@ -1756,8 +1831,8 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await expect(settingsDialog).toBeHidden();
     await expect(composer).toBeFocused();
 
-    // 4. 1280x800 adaptive check: Scope popover, Settings modal, and Sessions popover CLI deep links
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // 4. 1120x700 adaptive check: Scope popover, Settings modal, and Sessions popover CLI deep links
+    await page.setViewportSize({ width: 1120, height: 700 });
     await scopeChip.click();
     await expect(scopeDialog).toBeVisible();
     await page.keyboard.press("Escape");
@@ -3749,8 +3824,8 @@ test.describe("Ticket #37 Background journal, attention badges, unread mark-read
     await expect(needsInputBadge).toBeVisible();
     await expect(needsInputBadge).toContainText("1");
 
-    // 1280x800 popover still exposes session badges cleanly without global approval inbox
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // 1120x700 popover still exposes session badges cleanly without global approval inbox
+    await page.setViewportSize({ width: 1120, height: 700 });
     await routeStrip.getByRole("button", { name: /Sessions\s+3/ }).click();
     const popover = page.getByRole("dialog", { name: "Sessions" });
     await expect(popover).toBeVisible();
