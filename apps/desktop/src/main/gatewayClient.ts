@@ -91,6 +91,8 @@ export class GatewayClient {
   private closed = false;
   private rpcSeq = 0;
   private rxBuffer = Buffer.alloc(0);
+  private readonly pendingTextFrames: string[] = [];
+  private textFrameDispatchScheduled = false;
   private fragmentedOpcode: number | null = null;
   private fragmentedChunks: Buffer[] = [];
   private readonly pending = new Map<
@@ -244,6 +246,7 @@ export class GatewayClient {
   private handleDisconnect(reason: string): void {
     if (this.closed) return;
     this.closed = true;
+    this.pendingTextFrames.length = 0;
     for (const [id, entry] of this.pending.entries()) {
       clearTimeout(entry.timer);
       entry.reject(new GatewayTransportError("unreachable", "Gateway connection closed"));
@@ -316,7 +319,7 @@ export class GatewayClient {
             this.fragmentedOpcode = null;
             this.fragmentedChunks = [];
             if (origOpcode === 0x1) {
-              this.handleTextFrame(full.toString("utf8"));
+              this.enqueueTextFrame(full.toString("utf8"));
             }
           }
         }
@@ -330,8 +333,38 @@ export class GatewayClient {
       }
 
       if (opcode === 0x1) {
-        this.handleTextFrame(payload.toString("utf8"));
+        this.enqueueTextFrame(payload.toString("utf8"));
       }
+    }
+  }
+
+  private enqueueTextFrame(text: string): void {
+    this.pendingTextFrames.push(text);
+    if (!this.textFrameDispatchScheduled) {
+      this.dispatchNextTextFrame();
+    }
+  }
+
+  private dispatchNextTextFrame(): void {
+    if (this.closed) {
+      this.pendingTextFrames.length = 0;
+      this.textFrameDispatchScheduled = false;
+      return;
+    }
+    const next = this.pendingTextFrames.shift();
+    if (next === undefined) {
+      this.textFrameDispatchScheduled = false;
+      return;
+    }
+    this.textFrameDispatchScheduled = true;
+    try {
+      this.handleTextFrame(next);
+    } finally {
+      // A socket read can coalesce an RPC reply with notifications that follow it.
+      // Yield to the event loop between frames so the full async continuation of a
+      // reply (which applies admission state) runs before deltas or terminal events
+      // that arrived in the same socket read.
+      setImmediate(() => this.dispatchNextTextFrame());
     }
   }
 

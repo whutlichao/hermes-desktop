@@ -322,6 +322,12 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
         { connectionId: "local", profileId: "default", sessionId: "sess-def-1" },
       )) as { transcript: SessionTranscriptSnapshot };
       expect(transcriptSnap.transcript.activeTurnId).toBe("turn-stream-1");
+      const assistantMessage = transcriptSnap.transcript.messages.find(
+        (message) => message.messageId === "msg-a-1",
+      );
+      expect(assistantMessage?.text).toContain("const x = 1;");
+      const roles = transcriptSnap.transcript.messages.map((message) => message.role);
+      expect(roles.indexOf("user")).toBeLessThan(roles.indexOf("assistant"));
 
       // Stop failure must NOT pretend the turn stopped!
       await expect(

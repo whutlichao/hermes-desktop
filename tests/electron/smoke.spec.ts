@@ -328,23 +328,21 @@ test.describe("Electron hardened smoke", () => {
             user_message_id: "msg-elec-u1",
             assistant_message_id: assistantMsgId,
           });
-          setTimeout(() => {
-            ctx.sendNotification("prompt.delta", {
-              session_id: sid,
-              turn_id: turnId,
-              message_id: assistantMsgId,
-              delta: "好的，核心片段如下：\n```ts\nconst answer = 42;\n```",
-            });
-            ctx.sendNotification("activity", {
-              session_id: sid,
-              turn_id: turnId,
-              message_id: assistantMsgId,
-              tool_call_id: "tc-elec-1",
-              name: "read_file",
-              status: "completed",
-              summary: "README.md",
-            });
-          }, 25);
+          ctx.sendNotification("prompt.delta", {
+            session_id: sid,
+            turn_id: turnId,
+            message_id: assistantMsgId,
+            delta: "好的，核心片段如下：\n```ts\nconst answer = 42;\n```",
+          });
+          ctx.sendNotification("activity", {
+            session_id: sid,
+            turn_id: turnId,
+            message_id: assistantMsgId,
+            tool_call_id: "tc-elec-1",
+            name: "read_file",
+            status: "completed",
+            summary: "README.md",
+          });
           return true;
         }
         if (method === "prompt.cancel") {

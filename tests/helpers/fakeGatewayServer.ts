@@ -38,7 +38,7 @@ export interface FakeGatewayServerOptions {
   ) => boolean | void | Promise<boolean | void>;
 }
 
-function encodeServerTextFrame(text: string): Buffer {
+export function encodeServerTextFrame(text: string): Buffer {
   const payload = Buffer.from(text, "utf8");
   const len = payload.length;
   if (len < 126) {
