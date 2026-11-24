@@ -746,8 +746,8 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
     expect(capList).toMatchObject({
       chatAvailable: true,
       promptSubmit: true,
-      promptCancel: true,
-      promptSteer: true,
+      promptCancel: false,
+      promptSteer: false,
       sessionCreate: false,
       sessionResume: false,
       sessionList: false,
@@ -810,6 +810,76 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
       sessionList: true,
       sessionTranscript: true,
       profilesList: true,
+    });
+  });
+
+  it("derives only the capability each runtime tag actually asserts, and does not over-claim from a partial tag set", () => {
+    const localCreateOnly = classifyRuntimeCapabilities({
+      capabilities: ["local-cli-create-v1"],
+    });
+    expect(localCreateOnly).toEqual({
+      chatAvailable: false,
+      promptSubmit: false,
+      promptCancel: false,
+      promptSteer: false,
+      sessionCreate: true,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: false,
+      profilesList: false,
+    });
+
+    const durableAdmissionOnly = classifyRuntimeCapabilities({
+      capabilities: ["durable-admission-v1"],
+    });
+    expect(durableAdmissionOnly).toEqual({
+      chatAvailable: true,
+      promptSubmit: true,
+      promptCancel: false,
+      promptSteer: false,
+      sessionCreate: false,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: false,
+      profilesList: false,
+    });
+
+    expect(
+      classifyRuntimeCapabilities({ capabilities: ["session-transcript-v1"] }).sessionTranscript,
+    ).toBe(true);
+    expect(
+      classifyRuntimeCapabilities({ capabilities: ["session-list-picker-v1"] }).sessionList,
+    ).toBe(true);
+    expect(
+      classifyRuntimeCapabilities({ capabilities: ["session-list-cursor-v1"] }).sessionList,
+    ).toBe(true);
+
+    // session-client-v1 is attribution only (session.create "client"), never a chat/session surface.
+    const sessionClientOnly = classifyRuntimeCapabilities({
+      capabilities: ["session-client-v1"],
+    });
+    expect(Object.values(sessionClientOnly).every((value) => value === false)).toBe(true);
+
+    // A partial canonical set must not unlock cancel/steer/resume/profiles just because it has
+    // admission + local create + transcript.
+    const partialCanonical = classifyRuntimeCapabilities({
+      capabilities: [
+        "durable-admission-v1",
+        "local-cli-create-v1",
+        "session-client-v1",
+        "session-transcript-v1",
+      ],
+    });
+    expect(partialCanonical).toEqual({
+      chatAvailable: true,
+      promptSubmit: true,
+      promptCancel: false,
+      promptSteer: false,
+      sessionCreate: true,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: true,
+      profilesList: false,
     });
   });
 

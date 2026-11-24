@@ -232,4 +232,122 @@ describe("ConnectionSupervisor multi-gateway Local + Remote HTTP(S)/WS (S1)", ()
       sandbox.cleanup(passed);
     }
   });
+
+  it("routes a non-default Remote profile over the legacy profile_id path for list/create/resume and submit/cancel", async () => {
+    const sandbox = createTestSandbox("hermes-remote-non-default-profile-");
+    let passed = false;
+    const remoteGw = await startFakeRemoteGatewayServer({
+      protocol: "http",
+      validTokens: new Set(["remote-ops-token"]),
+      useTicketEndpoint: true,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "remote-default-sess", title: "Default Chat" },
+        { profile_id: "ops", session_id: "remote-ops-sess", title: "Ops Chat" },
+      ],
+    });
+    const store = new RegistryStore({ rootDir: sandbox.hermesHomeDir });
+    const ports = createNodeLocalBackendPorts({
+      userDataDir: sandbox.userDataDir,
+      hermesHomeDir: sandbox.hermesHomeDir,
+      hermesHomeKind: "temp",
+      appVersion: "0.1.0",
+      buildMode: "dev",
+      pickCliFile: async () => ({ cancelled: true }),
+    });
+    const supervisor = new ConnectionSupervisor(
+      new LocalBackendManager(ports),
+      { registryStore: store },
+    );
+
+    try {
+      const addRes = store.add({
+        kind: "remote",
+        label: "Ops Remote",
+        url: remoteGw.baseUrl,
+        authMode: "token",
+        token: "remote-ops-token",
+      });
+      expect(addRes.ok).toBe(true);
+      const remoteId = addRes.snapshot.connections.find((c) => c.kind === "remote")!.id;
+
+      const connected = await supervisor.connectRemote(remoteId, {
+        profileId: "ops",
+        activate: true,
+      });
+      expect(connected.ok).toBe(true);
+      expect(connected.fleet.activeScope).toMatchObject({
+        connectionId: remoteId,
+        profileId: "ops",
+      });
+      expect(connected.fleet.sessions.map((s) => s.sessionId)).toContain("remote-ops-sess");
+      expect(connected.fleet.sessions.map((s) => s.sessionId)).not.toContain("remote-default-sess");
+
+      const listCalls = remoteGw.rpcCalls.filter((c) => c.method === "session.list");
+      expect(listCalls.length).toBeGreaterThan(0);
+      for (const call of listCalls) {
+        expect(call.params.profile_id).toBe("ops");
+        expect(call.params).not.toHaveProperty("profile");
+      }
+
+      await supervisor.handlers["sessions.select"](
+        { sessionId: "remote-ops-sess" },
+        { connectionId: remoteId, profileId: "ops", sessionId: "remote-ops-sess" },
+      );
+      const resumeCalls = remoteGw.rpcCalls.filter((c) => c.method === "session.resume");
+      expect(resumeCalls.length).toBeGreaterThan(0);
+      for (const call of resumeCalls) {
+        expect(call.params.profile_id).toBe("ops");
+        expect(call.params).not.toHaveProperty("profile");
+      }
+
+      const created = (await supervisor.handlers["sessions.create"](
+        { title: "Ops New Chat" },
+        { connectionId: remoteId, profileId: "ops" },
+      )) as { session: { sessionId: string; profileId: string } };
+      expect(created.session.profileId).toBe("ops");
+      const createCall = remoteGw.rpcCalls.find((c) => c.method === "session.create");
+      expect(createCall?.params.profile_id).toBe("ops");
+      expect(createCall?.params).not.toHaveProperty("profile");
+
+      const send = (await supervisor.handlers["prompts.send"](
+        { sessionId: created.session.sessionId, text: "hello ops" },
+        { connectionId: remoteId, profileId: "ops", sessionId: created.session.sessionId },
+      )) as { accepted: boolean; turnId: string };
+      expect(send.accepted).toBe(true);
+      const submitCall = remoteGw.rpcCalls.find((c) => c.method === "prompt.submit");
+      expect(submitCall?.params.profile_id).toBe("ops");
+      expect(submitCall?.params).not.toHaveProperty("profile");
+      expect(typeof submitCall?.params.submission_id).toBe("string");
+
+      await supervisor.handlers["prompts.stop"](
+        { sessionId: created.session.sessionId, turnId: send.turnId },
+        { connectionId: remoteId, profileId: "ops", sessionId: created.session.sessionId },
+      );
+      const cancelCall = remoteGw.rpcCalls.find((c) => c.method === "prompt.cancel");
+      expect(cancelCall?.params.profile_id).toBe("ops");
+      expect(cancelCall?.params).not.toHaveProperty("profile");
+
+      for (const method of [
+        "session.list",
+        "session.resume",
+        "session.create",
+        "prompt.submit",
+        "prompt.cancel",
+      ]) {
+        for (const call of remoteGw.rpcCalls.filter((c) => c.method === method)) {
+          expect(call.params.profile_id).toBe("ops");
+        }
+      }
+      passed = true;
+    } finally {
+      await supervisor.dispose();
+      store.close();
+      await remoteGw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

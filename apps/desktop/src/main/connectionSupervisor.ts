@@ -250,6 +250,80 @@ function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+type PromptSubmitReceiptClass =
+  | { kind: "accepted"; receipt: "accepted" }
+  | { kind: "admitted"; receipt: "admitted" }
+  | { kind: "delivery_unknown"; receipt: "delivery_unknown" }
+  | { kind: "unconfirmed"; receipt: string };
+
+const PROMPT_SUBMIT_NEGATIVE_RECEIPTS = new Set([
+  "error",
+  "rejected",
+  "failed",
+  "denied",
+  "cancelled",
+  "canceled",
+  "invalid",
+  "invalid_params",
+]);
+
+function classifyPromptSubmitReceipt(res: Record<string, unknown>): PromptSubmitReceiptClass {
+  const receiptRaw = asString(res.receipt).trim().toLowerCase();
+  const statusRaw = asString(res.status).trim().toLowerCase();
+  const admissionId = asString(res.admission_id ?? res.admissionId).trim();
+  const hasAdmissionReference =
+    Boolean(admissionId) ||
+    (res.admission !== undefined && res.admission !== null) ||
+    (res.ref !== undefined && res.ref !== null && typeof res.ref === "object");
+  if (
+    res.delivery_unknown === true ||
+    res.deliveryUnknown === true ||
+    receiptRaw === "delivery_unknown" ||
+    receiptRaw === "unknown" ||
+    statusRaw === "unknown"
+  ) {
+    return { kind: "delivery_unknown", receipt: "delivery_unknown" };
+  }
+  if (
+    PROMPT_SUBMIT_NEGATIVE_RECEIPTS.has(receiptRaw) ||
+    PROMPT_SUBMIT_NEGATIVE_RECEIPTS.has(statusRaw)
+  ) {
+    return { kind: "unconfirmed", receipt: receiptRaw || statusRaw || "unconfirmed" };
+  }
+  if (res.accepted === false || res.admitted === false) {
+    return { kind: "unconfirmed", receipt: receiptRaw || statusRaw || "rejected" };
+  }
+  if (
+    res.admitted === true ||
+    receiptRaw === "admitted" ||
+    statusRaw === "admitted"
+  ) {
+    return { kind: "admitted", receipt: "admitted" };
+  }
+  if (res.accepted === true || receiptRaw === "accepted" || statusRaw === "accepted") {
+    return { kind: "accepted", receipt: "accepted" };
+  }
+  if (
+    (statusRaw === "queued" || statusRaw === "started" || statusRaw === "terminal") &&
+    hasAdmissionReference
+  ) {
+    return { kind: "admitted", receipt: "admitted" };
+  }
+  // Legacy prompt.submit returns a concrete turn id on success and carries no receipt envelope.
+  // An empty or malformed response stays unconfirmed so the draft is never cleared speculatively.
+  const legacyTurnId = asString(res.turn_id ?? res.turnId).trim();
+  if (
+    legacyTurnId &&
+    res.receipt === undefined &&
+    res.status === undefined &&
+    res.accepted === undefined &&
+    res.admitted === undefined
+  ) {
+    return { kind: "accepted", receipt: "accepted" };
+  }
+  return { kind: "unconfirmed", receipt: receiptRaw || statusRaw || "unconfirmed" };
+}
+
 function mergeSessionListFeeds(
   stored: Array<Record<string, unknown>>,
   live: Array<Record<string, unknown>>,
@@ -3305,14 +3379,36 @@ export class ConnectionSupervisor {
 
     if (entry.capabilities.sessionList) {
       try {
-        const stored = await callList("session.list", { scope: "stored" });
-        let live: Array<Record<string, unknown>> = [];
+        const runtimeCapabilities = Array.isArray(entry.describeResult?.capabilities)
+          ? entry.describeResult.capabilities.filter(
+              (capability): capability is string => typeof capability === "string",
+            )
+          : [];
+        const supportsScopedLiveFeed =
+          runtimeCapabilities.includes("session-list-picker-v1") ||
+          runtimeCapabilities.includes("session-list-cursor-v1");
+
         try {
-          live = await callList("session.list", { scope: "live" });
-        } catch {
-          // The stored picker feed is authoritative; a live-feed refusal must not hide it.
+          const stored = await callList("session.list", { scope: "stored" });
+          let live: Array<Record<string, unknown>> = [];
+          if (supportsScopedLiveFeed) {
+            try {
+              live = await callList("session.list", { scope: "live" });
+            } catch (err) {
+              if (!isJsonRpcMethodNotFound(err) && !isInvalidParamsRpcError(err)) {
+                throw err;
+              }
+              // The stored picker feed is authoritative; an unsupported live feed must not hide it.
+            }
+          }
+          rawList = mergeSessionListFeeds(stored, live);
+        } catch (err) {
+          if (!isInvalidParamsRpcError(err) || supportsScopedLiveFeed) {
+            throw err;
+          }
+          // Older owners serve a singular session.list with no scope parameter.
+          rawList = await callList("session.list");
         }
-        rawList = mergeSessionListFeeds(stored, live);
       } catch (err) {
         if (isProfileUnavailableRpcError(err)) {
           this.markProfileUnavailable(connectionId, profileId, err);
@@ -3320,7 +3416,7 @@ export class ConnectionSupervisor {
         }
         if (isRpcAuthError(err) && connectionId !== "local") {
           this.markConnectionAuthRequired(connectionId);
-        } else {
+        } else if (isJsonRpcMethodNotFound(err)) {
           try {
             rawList = await callList("sessions.list");
           } catch (err2) {
@@ -3330,8 +3426,12 @@ export class ConnectionSupervisor {
             }
             if (isJsonRpcMethodNotFound(err2)) {
               entry.capabilities.sessionList = false;
+            } else {
+              throw err2;
             }
           }
+        } else {
+          throw err;
         }
       }
     }
@@ -5243,12 +5343,17 @@ export class ConnectionSupervisor {
   private gatewayProfileParams(
     entry: GatewayTransportEntry,
     profileId: string,
-  ): { profile?: string } {
-    if (
-      entry.transportMode === "shared-host-scope" &&
-      profileId &&
-      profileId !== entry.defaultProfileId
-    ) {
+  ): { profile?: string; profile_id?: string } {
+    if (entry.transportMode === "per-profile") {
+      // Local per-Profile sockets are already bound to their Profile. Remote and legacy SSH
+      // transports predate the host-scoped `profile` handle and keep their explicit `profile_id`
+      // routing key; the profile-scoped SSH ticket is proven separately by its `--profile` attach.
+      if (entry.kind === "local") {
+        return {};
+      }
+      return profileId ? { profile_id: profileId } : {};
+    }
+    if (profileId && profileId !== entry.defaultProfileId) {
       const handle = this.profilesByConnection
         .get(entry.connectionId)
         ?.find((profile) => profile.profileId === profileId)
@@ -5256,6 +5361,43 @@ export class ConnectionSupervisor {
       return { profile: handle || profileId };
     }
     return {};
+  }
+
+  private async callPromptSubmit(
+    entry: GatewayTransportEntry,
+    profileId: string,
+    params: Record<string, unknown>,
+  ): Promise<{
+    res: Record<string, unknown>;
+    classification: PromptSubmitReceiptClass;
+  }> {
+    const res = await entry.client.call<Record<string, unknown>>("prompt.submit", {
+      ...this.gatewayProfileParams(entry, profileId),
+      ...params,
+    });
+    return { res, classification: classifyPromptSubmitReceipt(res) };
+  }
+
+  private normalizeQueuedPromptSubmit(
+    submitted: Awaited<ReturnType<ConnectionSupervisor["callPromptSubmit"]>>,
+  ): Record<string, unknown> {
+    if (submitted.classification.kind === "delivery_unknown") {
+      return {
+        ...submitted.res,
+        accepted: false,
+        delivery_unknown: true,
+        receipt: "delivery_unknown",
+      };
+    }
+    if (submitted.classification.kind === "unconfirmed") {
+      return {
+        ...submitted.res,
+        accepted: false,
+        admitted: false,
+        status: submitted.classification.receipt,
+      };
+    }
+    return submitted.res;
   }
 
   private translateRpcFailure(
@@ -6050,7 +6192,7 @@ export class ConnectionSupervisor {
         this.emitChatState();
       }
 
-      let res: Record<string, unknown>;
+      let submitted: Awaited<ReturnType<ConnectionSupervisor["callPromptSubmit"]>>;
       try {
         const submissionId =
           typeof payload.submissionId === "string" && payload.submissionId.trim()
@@ -6058,8 +6200,7 @@ export class ConnectionSupervisor {
             : typeof payload.draftId === "string" && payload.draftId.trim()
               ? payload.draftId.trim()
               : crypto.randomUUID();
-        res = await entry.client.call<Record<string, unknown>>("prompt.submit", {
-          ...this.gatewayProfileParams(entry, profileId),
+        submitted = await this.callPromptSubmit(entry, profileId, {
           session_id: sessionId,
           text,
           submission_id: submissionId,
@@ -6082,12 +6223,8 @@ export class ConnectionSupervisor {
         this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit", profileId);
       }
 
-      const rawReceipt = asString(res.receipt ?? res.status).toLowerCase();
-      if (
-        rawReceipt === "delivery_unknown" ||
-        rawReceipt === "unknown" ||
-        res.delivery_unknown === true
-      ) {
+      const { res, classification } = submitted;
+      if (classification.kind === "delivery_unknown") {
         if (this.chatSessionStateStore) {
           this.chatSessionStateStore.markDraftDeliveryStatus(draftRef, "delivery_unknown");
           this.emitChatState();
@@ -6100,8 +6237,19 @@ export class ConnectionSupervisor {
         };
       }
 
-      const receipt =
-        rawReceipt === "admitted" || res.admitted === true ? "admitted" : "accepted";
+      if (classification.kind === "unconfirmed") {
+        if (this.chatSessionStateStore) {
+          this.chatSessionStateStore.markDraftDeliveryStatus(draftRef, "idle");
+          this.emitChatState();
+        }
+        return {
+          accepted: false,
+          receipt: classification.receipt,
+          sessionId,
+        };
+      }
+
+      const receipt = classification.receipt;
       if (this.chatSessionStateStore) {
         this.chatSessionStateStore.clearDraftOnReceipt(draftRef, receipt);
         this.emitChatState();
@@ -6576,11 +6724,12 @@ export class ConnectionSupervisor {
         const res = await this.turnCoordinator.retryQueued(
           { connectionId, profileId, sessionId, submissionId, online: true },
           async (rpcPayload) =>
-            entry.client.call<Record<string, unknown>>("prompt.submit", {
-              ...this.gatewayProfileParams(entry, profileId),
-              session_id: sessionId,
-              ...rpcPayload,
-            }),
+            this.normalizeQueuedPromptSubmit(
+              await this.callPromptSubmit(entry, profileId, {
+                session_id: sessionId,
+                ...rpcPayload,
+              }),
+            ),
         );
         if (res.status === "admitted" && res.admission) {
           this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
@@ -7743,12 +7892,14 @@ export class ConnectionSupervisor {
           online: true,
           ...(input.submissionId ? { submissionId: input.submissionId } : {}),
         },
-        async (rpcPayload) =>
-          entry.client.call<Record<string, unknown>>("prompt.submit", {
-            ...this.gatewayProfileParams(entry, input.profileId),
-            session_id: input.sessionId,
-            ...rpcPayload,
-          }),
+        async (rpcPayload) => {
+          return this.normalizeQueuedPromptSubmit(
+            await this.callPromptSubmit(entry, input.profileId, {
+              session_id: input.sessionId,
+              ...rpcPayload,
+            }),
+          );
+        },
       );
       if (res.status === "admitted" && res.admission) {
         this.emitTopic(

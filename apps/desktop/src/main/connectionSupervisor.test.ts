@@ -4799,6 +4799,8 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
     liveSessions?: Array<Record<string, unknown>>;
     promptFailure?: { reason: string } | null;
     promptStatus?: string;
+    promptResult?: Record<string, unknown>;
+    legacySessionListNoScope?: boolean;
   };
 
   const strictMethods = new Set([
@@ -4837,6 +4839,21 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
       switch (method) {
         case "session.list":
         case "sessions.list": {
+          if (
+            method === "session.list" &&
+            options.legacySessionListNoScope &&
+            "scope" in params
+          ) {
+            ctx.replyError(4001, "invalid_params", {
+              reason: "invalid_params",
+              fields: ["scope"],
+            });
+            return true;
+          }
+          if (method === "session.list" && options.legacySessionListNoScope) {
+            ctx.replyResult({ sessions: options.storedSessions ?? [] });
+            return true;
+          }
           if (method === "session.list" && params.scope !== "stored") {
             ctx.replyResult({ sessions: options.liveSessions ?? [], scope: "live" });
             return true;
@@ -4897,6 +4914,10 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
               authority_epoch: 1,
               execution_generation: null,
             });
+            return true;
+          }
+          if (options.promptResult !== undefined) {
+            ctx.replyResult(options.promptResult);
             return true;
           }
           ctx.replyResult({
@@ -5289,6 +5310,345 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
     }
   });
 
+  it("clears the draft only for accepted/admitted receipts and keeps it for rejected, error, missing, or unknown statuses", async () => {
+    const sandbox = createTestSandbox("hermes-receipt-classification-");
+    const profileIdentity = "/private/tmp/hermes-receipt-classification-home";
+    const validTickets = new Set<string>();
+    const strictOptions: StrictGatewayOptions = {
+      profileIdentity,
+      storedSessions: [
+        {
+          id: "sess-receipt-1",
+          session_id: "sess-receipt-1",
+          title: "Receipt Chat",
+          source: "cli",
+          started_at: 1795510000,
+          message_count: 0,
+          running: false,
+        },
+      ],
+    };
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [{ name: "default", path: profileIdentity, is_default: true }],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "acp-editor-policy-v1",
+          "acp-session-mcp-v1",
+          "clarify-batch-v1",
+          "plugin-rpc-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: makeStrictOnRpc(strictOptions),
+    });
+    const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+        chatSessionStateStore: store,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+      const sessionScope = { ...scope, sessionId: "sess-receipt-1" };
+      const draftKey = makeActiveChatDraftKey("local", profileIdentity, "sess-receipt-1");
+
+      const cases: Array<{
+        name: string;
+        result: Record<string, unknown>;
+        accepted: boolean;
+        receipt: string;
+        cleared: boolean;
+        deliveryStatus?: string;
+        deliveryUnknown?: boolean;
+      }> = [
+        {
+          name: "rejected",
+          result: { status: "rejected" },
+          accepted: false,
+          receipt: "rejected",
+          cleared: false,
+          deliveryStatus: "idle",
+        },
+        {
+          name: "error",
+          result: { status: "error" },
+          accepted: false,
+          receipt: "error",
+          cleared: false,
+          deliveryStatus: "idle",
+        },
+        {
+          name: "missing status",
+          result: {},
+          accepted: false,
+          receipt: "unconfirmed",
+          cleared: false,
+          deliveryStatus: "idle",
+        },
+        {
+          name: "unknown",
+          result: { status: "unknown" },
+          accepted: false,
+          receipt: "delivery_unknown",
+          cleared: false,
+          deliveryStatus: "delivery_unknown",
+          deliveryUnknown: true,
+        },
+        {
+          name: "accepted",
+          result: {
+            accepted: true,
+            turn_id: "turn-accepted",
+            user_message_id: "u-accepted",
+            assistant_message_id: "a-accepted",
+          },
+          accepted: true,
+          receipt: "accepted",
+          cleared: true,
+        },
+        {
+          name: "admitted",
+          result: {
+            admitted: true,
+            turn_id: "turn-admitted",
+            user_message_id: "u-admitted",
+            assistant_message_id: "a-admitted",
+          },
+          accepted: true,
+          receipt: "admitted",
+          cleared: true,
+        },
+        {
+          name: "legacy turn_id",
+          result: { turn_id: "turn-legacy" },
+          accepted: true,
+          receipt: "accepted",
+          cleared: true,
+        },
+        {
+          name: "canonical queued",
+          result: {
+            admission_id: "adm-queued",
+            ref: { profile_id: profileIdentity, session_id: "sess-receipt-1" },
+            sequence: 1,
+            status: "queued",
+            outcome: null,
+            authority_epoch: 1,
+            execution_generation: null,
+          },
+          accepted: true,
+          receipt: "admitted",
+          cleared: true,
+        },
+        {
+          name: "canonical started",
+          result: {
+            admission_id: "adm-started",
+            ref: { profile_id: profileIdentity, session_id: "sess-receipt-1" },
+            sequence: 2,
+            status: "started",
+            outcome: null,
+            authority_epoch: 1,
+            execution_generation: 1,
+          },
+          accepted: true,
+          receipt: "admitted",
+          cleared: true,
+        },
+      ];
+
+      for (const testCase of cases) {
+        strictOptions.promptResult = testCase.result;
+        await supervisor.handlers["chatState.saveDraft"](
+          {
+            connectionId: "local",
+            profileId: profileIdentity,
+            sessionId: "sess-receipt-1",
+            text: `receipt ${testCase.name}`,
+          },
+          sessionScope,
+        );
+
+        const send = (await supervisor.handlers["prompts.send"](
+          { sessionId: "sess-receipt-1", text: `receipt ${testCase.name}` },
+          sessionScope,
+        )) as { accepted?: boolean; receipt?: string; deliveryUnknown?: boolean };
+        expect(send.accepted, testCase.name).toBe(testCase.accepted);
+        expect(send.receipt, testCase.name).toBe(testCase.receipt);
+        if (testCase.deliveryUnknown !== undefined) {
+          expect(send.deliveryUnknown, testCase.name).toBe(testCase.deliveryUnknown);
+        }
+
+        const draft = store.getProjection().draftsByKey?.[draftKey];
+        if (testCase.cleared) {
+          expect(draft, testCase.name).toBeUndefined();
+        } else {
+          expect(draft?.text, testCase.name).toBe(`receipt ${testCase.name}`);
+          expect(draft?.deliveryStatus, testCase.name).toBe(testCase.deliveryStatus);
+        }
+      }
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("falls back to an unscoped singular session.list when an old Gateway rejects the stored scope, without probing the plural method", async () => {
+    const sandbox = createTestSandbox("hermes-legacy-singular-session-list-");
+    const profileIdentity = "/private/tmp/hermes-legacy-singular-session-list-home";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+      ],
+      profiles: [{ name: "default", path: profileIdentity, is_default: true }],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: ["session-authority-v1"],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: makeStrictOnRpc({
+        profileIdentity,
+        legacySessionListNoScope: true,
+        storedSessions: [
+          {
+            id: "sess-legacy-singular-1",
+            session_id: "sess-legacy-singular-1",
+            title: "Legacy Singular",
+            source: "cli",
+            started_at: 1795510000,
+            message_count: 0,
+            running: false,
+          },
+        ],
+      }),
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+      expect(
+        supervisor
+          .getFleetSnapshot()
+          .sessions.map((session) => session.sessionId),
+      ).toContain("sess-legacy-singular-1");
+
+      const listCalls = gw.rpcCalls.filter((call) => call.method === "session.list");
+      expect(listCalls.some((call) => call.params.scope === "stored")).toBe(true);
+      const unscoped = listCalls.filter((call) => !("scope" in call.params));
+      expect(unscoped.length).toBeGreaterThan(0);
+      expect(listCalls.some((call) => call.params.scope === "live")).toBe(false);
+      expect(gw.rpcCalls.some((call) => call.method === "sessions.list")).toBe(false);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("surfaces scoped session.list invalid_params for a 0.23.3 runtime instead of downgrading to the legacy unscoped call", async () => {
+    const sandbox = createTestSandbox("hermes-scoped-list-invalid-");
+    const profileIdentity = "/private/tmp/hermes-scoped-list-invalid-home";
+    const validTickets = new Set<string>();
+    let rejectScopedList = false;
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+      ],
+      profiles: [{ name: "default", path: profileIdentity, is_default: true }],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "session-authority-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: (method, params, ctx) => {
+        if (method === "session.list" && rejectScopedList) {
+          ctx.replyError(4001, "invalid_params", { reason: "invalid_params" });
+          return true;
+        }
+        return makeStrictOnRpc({ profileIdentity })(method, params, ctx);
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+      const callStart = gw.rpcCalls.length;
+      rejectScopedList = true;
+
+      await expect(
+        supervisor.handlers["sessions.list"]({}, scope),
+      ).rejects.toMatchObject({
+        name: "GatewayRpcError",
+        rpcCode: 4001,
+        reason: "invalid_params",
+      });
+
+      const callsAfterFailure = gw.rpcCalls.slice(callStart);
+      expect(
+        callsAfterFailure.some(
+          (call) => call.method === "session.list" && !("scope" in call.params),
+        ),
+      ).toBe(false);
+      expect(callsAfterFailure.some((call) => call.method === "sessions.list")).toBe(false);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
   it("uses the Hermes 0.23.3 runtime capability tags and profiles.list shape for a new-session send", async () => {
     const sandbox = createTestSandbox("hermes-real-caps-new-");
     const profileIdentity = "/private/tmp/hermes-real-caps-new-home";
@@ -5517,6 +5877,7 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
           "local-cli-create-v1",
           "session-transcript-v1",
           "session-list-picker-v1",
+          "session-list-cursor-v1",
         ],
         session_create: { sources: ["gui"], parameters: ["title", "source"] },
       },
@@ -5592,6 +5953,7 @@ describe("Hermes 0.23.3 strict canonical send path", () => {
           "local-cli-create-v1",
           "session-transcript-v1",
           "session-list-picker-v1",
+          "session-list-cursor-v1",
         ],
         session_create: { sources: ["gui"], parameters: ["title", "source"] },
       },
