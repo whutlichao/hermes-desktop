@@ -256,6 +256,13 @@ export default function App() {
     [effectiveScope, hasReadyConnection, state.sessions],
   );
 
+  const activeSession = useMemo(
+    () => scopedSessions.find((session) => session.sessionId === state.activeSessionId) ?? null,
+    [scopedSessions, state.activeSessionId],
+  );
+  const isSampleConversation =
+    isMockMode && activeSession?.title === getCopy("chat.sampleBadge");
+
   const attentionSummary = useMemo(
     () => aggregateAttentionState(state.sessions, effectiveScope, state.activeSessionId),
     [effectiveScope, state.activeSessionId, state.sessions],
@@ -3507,6 +3514,7 @@ export default function App() {
               <ChatThread
                 hasReadyConnection={hasReadyConnection}
                 isMockMode={isMockMode}
+                isSampleConversation={isSampleConversation}
                 activeConnection={activeConnection}
                 activeScope={state.activeScope}
                 activeSessionId={state.activeSessionId}

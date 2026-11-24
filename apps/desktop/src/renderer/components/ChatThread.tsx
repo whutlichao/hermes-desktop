@@ -28,6 +28,7 @@ import { TurnRecoveryCards } from "./TurnRecoveryCards";
 interface ChatThreadProps {
   hasReadyConnection: boolean;
   isMockMode: boolean;
+  isSampleConversation: boolean;
   activeConnection?: ConnectionHealthSummary | null;
   activeScope: BridgeScope | null;
   activeSessionId: string | null;
@@ -132,6 +133,7 @@ function getApprovalStatusLabel(status: TranscriptPendingApprovalView["status"])
 export function ChatThread({
   hasReadyConnection,
   isMockMode,
+  isSampleConversation,
   activeConnection,
   activeScope,
   activeSessionId,
@@ -737,7 +739,7 @@ export function ChatThread({
         </div>
       )}
 
-      {isMockMode && transcript && transcript.messages.length > 0 && (
+      {isSampleConversation && transcript && transcript.messages.length > 0 && (
         <div
           role="status"
           data-testid="sample-conversation-badge"

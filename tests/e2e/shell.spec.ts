@@ -109,57 +109,6 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     expect(overflow).toBe(false);
   });
 
-  test("E2E-SAMPLE-01: one-click mock sample conversation shows tools, approval, simulated label, and a realistic reply", async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width: 1440, height: 900 });
-    await page.goto("/");
-
-    const onboarding = page.locator("section.onboarding-empty-card");
-    await expect(onboarding).toBeVisible();
-    const sampleButton = page.getByTestId("view-sample-conversation");
-    await expect(sampleButton).toBeVisible();
-    await expect(sampleButton).toHaveText("查看示例对话");
-    await sampleButton.click();
-
-    const transcript = page.locator(".transcript-list");
-    await expect(transcript).toBeVisible();
-    await expect(transcript).toContainText("帮我检查一下这周的发布准备");
-    await expect(transcript).toContainText("pnpm typecheck");
-
-    const badge = page.getByTestId("sample-conversation-badge");
-    await expect(badge).toContainText("示例对话 · 模拟数据");
-    await expect(page.locator("nav.sidebar")).toContainText("示例对话 · 模拟数据");
-
-    const toolRows = page.locator(".tool-execution-row");
-    expect(await toolRows.count()).toBeGreaterThanOrEqual(2);
-    await expect(page.locator(".tool-execution-row", { hasText: "shell.exec" })).toHaveCount(1);
-    await expect(page.locator(".tool-execution-row", { hasText: "files.list" })).toHaveCount(1);
-    await expect(page.locator(".tool-execution-row", { hasText: "2.4s" })).toHaveCount(1);
-    await expect(page.locator(".tool-execution-row", { hasText: "180ms" })).toHaveCount(1);
-
-    const approval = page.locator(".approval-card");
-    await expect(approval).toHaveCount(1);
-    await expect(approval).toContainText("shell.exec");
-    await expect(approval).toContainText("pnpm test");
-    await expect(approval).toContainText("待审批");
-
-    const overflow = await page.evaluate(
-      () => document.documentElement.scrollWidth > window.innerWidth,
-    );
-    expect(overflow).toBe(false);
-
-    await page.locator("#composer-input").fill("继续跑测试并给我一份摘要");
-    await page.getByRole("button", { name: "发送消息" }).click();
-    await expect(transcript).toContainText("（模拟数据）");
-    await expect(transcript).not.toContainText("Mock Gateway (demo-lab) received");
-
-    const overflowAfterReply = await page.evaluate(
-      () => document.documentElement.scrollWidth > window.innerWidth,
-    );
-    expect(overflowAfterReply).toBe(false);
-  });
-
   test("E2E-SHELL-01: 1280x800 collapses rail into Sessions popover without overflow", async ({
     page,
   }) => {
@@ -308,6 +257,57 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     }
     await expect(page.locator("#composer-input")).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByRole("button", { name: "发送消息" })).toBeDisabled();
+  });
+
+  test("E2E-SAMPLE-01: one-click mock sample conversation shows tools, approval, simulated label, and a realistic reply", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    const onboarding = page.locator("section.onboarding-empty-card");
+    await expect(onboarding).toBeVisible();
+    const sampleButton = page.getByTestId("view-sample-conversation");
+    await expect(sampleButton).toBeVisible();
+    await expect(sampleButton).toHaveText("查看示例对话");
+    await sampleButton.click();
+
+    const transcript = page.locator(".transcript-list");
+    await expect(transcript).toBeVisible();
+    await expect(transcript).toContainText("帮我检查一下这周的发布准备");
+    await expect(transcript).toContainText("pnpm typecheck");
+
+    const badge = page.getByTestId("sample-conversation-badge");
+    await expect(badge).toContainText("示例对话 · 模拟数据");
+    await expect(page.locator("nav.sidebar")).toContainText("示例对话 · 模拟数据");
+
+    const toolRows = page.locator(".tool-execution-row");
+    expect(await toolRows.count()).toBeGreaterThanOrEqual(2);
+    await expect(page.locator(".tool-execution-row", { hasText: "shell.exec" })).toHaveCount(1);
+    await expect(page.locator(".tool-execution-row", { hasText: "files.list" })).toHaveCount(1);
+    await expect(page.locator(".tool-execution-row", { hasText: "2.4s" })).toHaveCount(1);
+    await expect(page.locator(".tool-execution-row", { hasText: "180ms" })).toHaveCount(1);
+
+    const approval = page.locator(".approval-card");
+    await expect(approval).toHaveCount(1);
+    await expect(approval).toContainText("shell.exec");
+    await expect(approval).toContainText("pnpm test");
+    await expect(approval).toContainText("待审批");
+
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(overflow).toBe(false);
+
+    await page.locator("#composer-input").fill("继续跑测试并给我一份摘要");
+    await page.getByRole("button", { name: "发送消息" }).click();
+    await expect(transcript).toContainText("（模拟数据）");
+    await expect(transcript).not.toContainText("Mock Gateway (demo-lab) received");
+
+    const overflowAfterReply = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(overflowAfterReply).toBe(false);
   });
 
   test("Settings -> Gateways supports Local row, rename, Remote/SSH add, Primary/launchMode/NEXT LAUNCH, duplicate conflict preserving draft, and zero fake Test/Update buttons", async ({
@@ -1207,8 +1207,8 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await page.locator("#composer-input").fill("ping remote gateway");
     await page.getByRole("button", { name: "发送消息" }).click();
     await expect(page.locator(".transcript-list")).toContainText("ping remote gateway");
-    await expect(page.locator(".transcript-list")).toContainText("（模拟数据）");
-    await expect(page.locator(".transcript-list")).not.toContainText("Mock Gateway (gpu-node)");
+    await expect(page.locator(".transcript-list")).toContainText("Mock Gateway (gpu-node)");
+    await expect(page.getByTestId("sample-conversation-badge")).toHaveCount(0);
   });
 
   test("Ticket #35: Workspace shell bindings, 448/408 overlay geometry, Artifacts/Files preview & stale, annotations version, Hide vs Close, and FocusReturnController", async ({

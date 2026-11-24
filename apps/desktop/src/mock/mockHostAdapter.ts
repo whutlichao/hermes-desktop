@@ -644,6 +644,7 @@ export function createMockHostBridge(): HermesHost {
   const mockProfiles: ProfileSummary[] = [];
   const mockSessions: SessionSummary[] = [];
   const mockTranscripts = new Map<string, SessionTranscriptSnapshot>();
+  const sampleSessionIds = new Set<string>();
   let mockActiveScope: BridgeScope | null = null;
   let mockActiveSessionId: string | null = null;
   const mockCronJobsByScope = new Map<string, Array<Record<string, unknown>>>();
@@ -1595,7 +1596,7 @@ export function createMockHostBridge(): HermesHost {
         updatedAt: new Date().toISOString(),
         pinned: false,
         unreadCount: 0,
-        needsInput: seedSample,
+        needsInput: false,
         activeTurnId: null,
         status: "idle",
       };
@@ -1636,6 +1637,7 @@ export function createMockHostBridge(): HermesHost {
         mockTranscripts.set(transcriptKey(connectionId, s.profileId, s.sessionId), transcript);
       }
       if (seedSample) {
+        sampleSessionIds.add(sess1.sessionId);
         mockActiveScope = {
           connectionId,
           profileId: defaultProfile,
@@ -2231,7 +2233,10 @@ export function createMockHostBridge(): HermesHost {
           if (mockProfiles[i].connectionId === connectionId) mockProfiles.splice(i, 1);
         }
         for (let i = mockSessions.length - 1; i >= 0; i -= 1) {
-          if (mockSessions[i].connectionId === connectionId) mockSessions.splice(i, 1);
+          if (mockSessions[i].connectionId === connectionId) {
+            sampleSessionIds.delete(mockSessions[i].sessionId);
+            mockSessions.splice(i, 1);
+          }
         }
         if (mockActiveScope?.connectionId === connectionId) {
           mockActiveScope = null;
@@ -4042,7 +4047,9 @@ export function createMockHostBridge(): HermesHost {
       const userMsgId = `mock-u-${Date.now()}-${mockTurnSeq}`;
       const assistantMsgId = `mock-a-${Date.now()}-${mockTurnSeq}`;
       const keepRunning = Boolean(liveFix?.turnRecovery?.keepSendRunning);
-      const cannedReply = buildCannedMockReply(text, mockTurnSeq);
+      const cannedReply = sampleSessionIds.has(sid)
+        ? buildCannedMockReply(text, mockTurnSeq)
+        : null;
       const userMsg = {
         messageId: userMsgId,
         sessionId: sid,
@@ -4056,12 +4063,14 @@ export function createMockHostBridge(): HermesHost {
         messageId: assistantMsgId,
         sessionId: sid,
         role: "assistant" as const,
-        text: keepRunning ? "" : cannedReply.text,
+        text: keepRunning
+          ? ""
+          : cannedReply?.text ?? `Mock Gateway (${cid}) received: ${text}`,
         createdAt: now,
         turnId,
         streaming: keepRunning,
         status: keepRunning ? ("streaming" as const) : ("complete" as const),
-        ...(!keepRunning && cannedReply.toolRows ? { toolRows: cannedReply.toolRows } : {}),
+        ...(!keepRunning && cannedReply?.toolRows ? { toolRows: cannedReply.toolRows } : {}),
       };
       if (tx) {
         const nextTx: SessionTranscriptSnapshot = {

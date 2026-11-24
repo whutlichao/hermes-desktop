@@ -1010,6 +1010,30 @@ describe("MockHostBridge sample conversation (bot item 12)", () => {
     return selectRes.value;
   }
 
+  async function seedDefaultSshConversation(mock: ReturnType<typeof createMockHostBridge>) {
+    const addRes = await mock.request<ConnectionMutationResponse>("connections.add", {
+      kind: "ssh",
+      label: "GPU Node",
+      host: "lab.local",
+      user: "ops",
+    });
+    expect(addRes.ok && addRes.value.committed).toBe(true);
+    const connectionId = addRes.ok
+      ? addRes.value.snapshot.connections.find((connection) => connection.label === "GPU Node")?.id
+      : undefined;
+    if (!connectionId) throw new Error("default ssh connection seed failed");
+    const selectRes = await mock.request<{
+      fleet: FleetSnapshot;
+      transcript: SessionTranscriptSnapshot;
+    }>(
+      "sessions.select",
+      { connectionId, profileId: "default" },
+      { connectionId, profileId: "default" },
+    );
+    if (!selectRes.ok) throw new Error("default ssh conversation seed failed");
+    return { connectionId, ...selectRes.value };
+  }
+
   it("seeds a labeled multi-turn transcript with completed tool rows and a pending approval", async () => {
     const mock = createMockHostBridge();
     const { fleet, transcript } = await seedSampleConversation(mock);
@@ -1018,6 +1042,7 @@ describe("MockHostBridge sample conversation (bot item 12)", () => {
       (session) => session.sessionId === "demo-lab-sess-1",
     );
     expect(sampleSession?.title).toBe("示例对话 · 模拟数据");
+    expect(sampleSession?.needsInput).toBe(false);
     expect(fleet.activeSessionId).toBe("demo-lab-sess-1");
 
     expect(transcript.messages.filter((message) => message.role === "user").length).toBeGreaterThanOrEqual(2);
@@ -1177,6 +1202,28 @@ describe("MockHostBridge sample conversation (bot item 12)", () => {
     } finally {
       (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
     }
+  });
+
+  it("keeps non-sample default-mock prompts on the echo path", async () => {
+    const mock = createMockHostBridge();
+    const { connectionId, transcript } = await seedDefaultSshConversation(mock);
+    const scope = { connectionId, profileId: "default", sessionId: transcript.sessionId };
+
+    const sendRes = await mock.request("prompts.send", {
+      sessionId: transcript.sessionId,
+      text: "ping remote gateway",
+    });
+    expect(sendRes.ok).toBe(true);
+
+    const resumeRes = await mock.request<{ transcript: SessionTranscriptSnapshot }>(
+      "sessions.resume",
+      { sessionId: transcript.sessionId, profileId: "default" },
+      scope,
+    );
+    if (!resumeRes.ok) throw new Error("default ssh transcript resume failed");
+    expect(resumeRes.value.transcript.messages.at(-1)?.text).toBe(
+      `Mock Gateway (${connectionId}) received: ping remote gateway`,
+    );
   });
 });
 
