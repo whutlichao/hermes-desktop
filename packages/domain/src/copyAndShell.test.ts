@@ -53,10 +53,6 @@ describe("zh-CN copy catalog & terminology lint", () => {
             content: 'throw makeBridgeError("invalid_request", "english only");',
           },
           {
-            path: "apps/desktop/src/main/multiline.ts",
-            content: 'throw new Error("第一行\n第二行");',
-          },
-          {
             path: "apps/desktop/src/main/nearbyCopy.ts",
             content:
               'throw makeBridgeError("invalid_request", getCopy("copy.key"));\nconst title = "新对话";',
@@ -88,6 +84,129 @@ describe("zh-CN copy catalog & terminology lint", () => {
           "apps/desktop/src/main/allowed.ts": { 已登记: 1 },
         },
       ),
+    ).toEqual([]);
+  });
+
+  it("does not let comments or multiline templates hide visible error literals", () => {
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/blockCommentBypass.ts",
+            content: 'throw new Error(/* ) */ "新的未入目录错误");',
+          },
+        ],
+        {},
+      ),
+    ).toHaveLength(1);
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/lineCommentBypass.ts",
+            content: 'throw new Error(\n  // )\n  "新的未入目录错误"\n);',
+          },
+        ],
+        {},
+      ),
+    ).toHaveLength(1);
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/commentBetweenNewAndError.ts",
+            content: 'throw new /* ) */ Error("新的未入目录错误");',
+          },
+        ],
+        {},
+      ),
+    ).toHaveLength(1);
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/multilineTemplate.ts",
+            content: "throw new Error(`第一行\n第二行`);",
+          },
+        ],
+        {},
+      ),
+    ).toHaveLength(1);
+    expect(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/commentOnly.ts",
+            content: 'throw new Error(/* "未入目录注释" */ getCopy("copy.key"));',
+          },
+        ],
+        {},
+      ),
+    ).toEqual([]);
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/commentCall.ts",
+            content:
+              '// new Error("未入目录注释")\n/* new Error("另一条注释") */\nconst url = "https://example.com";\nthrow new Error(\'新的未入目录错误\');',
+          },
+        ],
+        {},
+      ),
+    ).toHaveLength(1);
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/multilineCommentCall.ts",
+            content:
+              '/* 第一行\n new Error("未入目录注释") */\nthrow new Error("新的未入目录错误");',
+          },
+        ],
+        {},
+      ),
+    ).toHaveLength(1);
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/unterminatedBlockComment.ts",
+            content: 'const marker = 1; /* new Error("未入目录注释")',
+          },
+        ],
+        {},
+      ),
+    ).toEqual([]);
+    expect.soft(
+      lintVisibleErrorLiterals(
+        [
+          {
+            path: "apps/desktop/src/main/lineCommentAtEof.ts",
+            content: 'const marker = 1; // new Error("未入目录注释")',
+          },
+        ],
+        {},
+      ),
+    ).toEqual([]);
+  });
+
+  it("requires the three-part template for terminal.*Error and chat.*Error without per-key registration", () => {
+    const prefixedViolations = lintCopyCatalog({
+      "terminal.futureError": "未来终端错误",
+      "chat.futureError": "未来对话错误",
+    });
+    expect(
+      prefixedViolations.filter((violation) => violation.reason.includes("错误文案必须包含")),
+    ).toHaveLength(6);
+
+    expect(
+      lintCopyCatalog({
+        "terminal.futureError":
+          "发生了什么：终端操作失败。可能原因：连接已中断。下一步：恢复连接后重试。",
+        "chat.futureError":
+          "发生了什么：消息发送失败。可能原因：连接已中断。下一步：恢复连接后重试。",
+      }),
     ).toEqual([]);
   });
 
