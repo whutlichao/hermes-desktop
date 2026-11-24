@@ -4,7 +4,9 @@ import type {
   CapabilitySnapshot,
   ConnectionMutationResponse,
   ConnectionTestResult,
+  FleetSnapshot,
   RegistrySnapshotView,
+  SessionTranscriptSnapshot,
   SshHostKeyConfirmResult,
 } from "@hermes/contracts";
 import { createMockHostBridge } from "./mockHostAdapter";
@@ -983,6 +985,245 @@ describe("MockHostBridge Ticket #41 Subagents and Checkpoints contract (S0)", ()
     } finally {
       (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
     }
+  });
+});
+
+describe("MockHostBridge sample conversation (bot item 12)", () => {
+  async function seedSampleConversation(mock: ReturnType<typeof createMockHostBridge>) {
+    const addRes = await mock.request<ConnectionMutationResponse>("connections.add", {
+      kind: "ssh",
+      label: "Demo Lab",
+      host: "lab.local",
+      user: "demo",
+      seedSample: true,
+    });
+    expect(addRes.ok && addRes.value.committed).toBe(true);
+    const selectRes = await mock.request<{
+      fleet: FleetSnapshot;
+      transcript: SessionTranscriptSnapshot;
+    }>(
+      "sessions.select",
+      { connectionId: "demo-lab", profileId: "default" },
+      { connectionId: "demo-lab", profileId: "default" },
+    );
+    if (!selectRes.ok) throw new Error("sample conversation seed failed");
+    return selectRes.value;
+  }
+
+  async function seedDefaultSshConversation(mock: ReturnType<typeof createMockHostBridge>) {
+    const addRes = await mock.request<ConnectionMutationResponse>("connections.add", {
+      kind: "ssh",
+      label: "GPU Node",
+      host: "lab.local",
+      user: "ops",
+    });
+    expect(addRes.ok && addRes.value.committed).toBe(true);
+    const connectionId = addRes.ok
+      ? addRes.value.snapshot.connections.find((connection) => connection.label === "GPU Node")?.id
+      : undefined;
+    if (!connectionId) throw new Error("default ssh connection seed failed");
+    const selectRes = await mock.request<{
+      fleet: FleetSnapshot;
+      transcript: SessionTranscriptSnapshot;
+    }>(
+      "sessions.select",
+      { connectionId, profileId: "default" },
+      { connectionId, profileId: "default" },
+    );
+    if (!selectRes.ok) throw new Error("default ssh conversation seed failed");
+    return { connectionId, ...selectRes.value };
+  }
+
+  it("seeds a labeled multi-turn transcript with completed tool rows and a pending approval", async () => {
+    const mock = createMockHostBridge();
+    const { fleet, transcript } = await seedSampleConversation(mock);
+
+    const sampleSession = fleet.sessions.find(
+      (session) => session.sessionId === "demo-lab-sess-1",
+    );
+    expect(sampleSession?.title).toBe("示例对话 · 模拟数据");
+    expect(sampleSession?.needsInput).toBe(false);
+    expect(fleet.activeSessionId).toBe("demo-lab-sess-1");
+
+    expect(transcript.messages.filter((message) => message.role === "user").length).toBeGreaterThanOrEqual(2);
+    expect(transcript.messages[0]?.text).toContain("这周的发布准备");
+
+    const toolRows = transcript.messages.flatMap((message) => message.toolRows ?? []);
+    expect(toolRows.length).toBeGreaterThanOrEqual(2);
+    expect(
+      toolRows.some(
+        (row) =>
+          row.name === "shell.exec" &&
+          row.status === "completed" &&
+          row.durationMs === 2400 &&
+          row.summary?.includes("pnpm typecheck"),
+      ),
+    ).toBe(true);
+    expect(
+      toolRows.some(
+        (row) =>
+          row.name === "files.list" &&
+          row.status === "completed" &&
+          row.durationMs === 180 &&
+          row.summary?.includes("docs/release"),
+      ),
+    ).toBe(true);
+
+    expect(transcript.pendingApprovals).toHaveLength(1);
+    expect(transcript.pendingApprovals?.[0]).toMatchObject({
+      toolName: "shell.exec",
+      status: "pending",
+    });
+    expect(transcript.pendingApprovals?.[0]?.summary).toContain("pnpm test");
+  });
+
+  it("returns a deterministic realistic canned reply instead of the old echo after a sample prompt", async () => {
+    const mock = createMockHostBridge();
+    const { transcript } = await seedSampleConversation(mock);
+    const scope = {
+      connectionId: "demo-lab",
+      profileId: "default",
+      sessionId: transcript.sessionId,
+    };
+
+    const sendRes = await mock.request("prompts.send", {
+      sessionId: transcript.sessionId,
+      text: "继续跑测试并给我一份摘要",
+    });
+    expect(sendRes.ok).toBe(true);
+
+    const resumeRes = await mock.request<{ transcript: SessionTranscriptSnapshot }>(
+      "sessions.resume",
+      { sessionId: transcript.sessionId, profileId: "default" },
+      scope,
+    );
+    if (!resumeRes.ok) throw new Error("sample transcript resume failed");
+    const updated = resumeRes.value.transcript;
+    const lastMessage = updated.messages.at(-1);
+
+    expect(lastMessage?.role).toBe("assistant");
+    expect(lastMessage?.text).toContain("（模拟数据）");
+    expect(lastMessage?.text).not.toContain("Mock Gateway");
+    expect(updated.pendingApprovals).toHaveLength(1);
+
+    const secondSend = await mock.request("prompts.send", {
+      sessionId: transcript.sessionId,
+      text: "继续跑测试并给我一份摘要",
+    });
+    expect(secondSend.ok).toBe(true);
+    const secondResume = await mock.request<{ transcript: SessionTranscriptSnapshot }>(
+      "sessions.resume",
+      { sessionId: transcript.sessionId, profileId: "default" },
+      scope,
+    );
+    if (!secondResume.ok) throw new Error("sample transcript resume failed");
+    expect(secondResume.value.transcript.messages.at(-1)?.text).toBe(lastMessage?.text);
+  });
+
+  it("keeps fixture-driven prompt echo unchanged", async () => {
+    const prevFixture = (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__;
+    try {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = {
+        fleet: {
+          connections: [
+            {
+              connectionId: "local",
+              label: "This device",
+              kind: "local",
+              originDisplay: "127.0.0.1",
+              actual: "ready",
+              degraded: false,
+              latencyMs: 2,
+              nextRetryAt: null,
+            },
+          ],
+          profiles: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              displayName: "Default",
+              handle: "default",
+              isDefault: true,
+              actual: "ready",
+            },
+          ],
+          sessions: [
+            {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-1",
+              title: "Fixture Session",
+              preview: "",
+              updatedAt: "2026-11-23T08:00:00.000Z",
+              pinned: false,
+              unreadCount: 0,
+              needsInput: false,
+              activeTurnId: null,
+              status: "idle",
+            },
+          ],
+          activeScope: { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+          activeSessionId: "sess-1",
+        },
+        transcripts: {
+          "local::default::sess-1": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-1",
+            messages: [],
+            activeTurnId: null,
+            turnStopping: false,
+            chatAvailable: true,
+            supportedActions: {
+              promptSubmit: true,
+              promptCancel: true,
+              promptSteer: true,
+              sessionCreate: true,
+              sessionResume: true,
+            },
+            snapshotSeq: 0,
+          },
+        },
+      };
+
+      const mock = createMockHostBridge();
+      const sendRes = await mock.request("prompts.send", { text: "fixture ping" });
+      expect(sendRes.ok).toBe(true);
+
+      const resumeRes = await mock.request<{ transcript: SessionTranscriptSnapshot }>(
+        "sessions.resume",
+        { sessionId: "sess-1", profileId: "default" },
+        { connectionId: "local", profileId: "default", sessionId: "sess-1" },
+      );
+      if (!resumeRes.ok) throw new Error("fixture transcript resume failed");
+      expect(resumeRes.value.transcript.messages.at(-1)?.text).toBe(
+        "Mock Gateway (local) received: fixture ping",
+      );
+    } finally {
+      (globalThis as Record<string, unknown>).__HERMES_E2E_FIXTURE__ = prevFixture;
+    }
+  });
+
+  it("keeps non-sample default-mock prompts on the echo path", async () => {
+    const mock = createMockHostBridge();
+    const { connectionId, transcript } = await seedDefaultSshConversation(mock);
+    const scope = { connectionId, profileId: "default", sessionId: transcript.sessionId };
+
+    const sendRes = await mock.request("prompts.send", {
+      sessionId: transcript.sessionId,
+      text: "ping remote gateway",
+    });
+    expect(sendRes.ok).toBe(true);
+
+    const resumeRes = await mock.request<{ transcript: SessionTranscriptSnapshot }>(
+      "sessions.resume",
+      { sessionId: transcript.sessionId, profileId: "default" },
+      scope,
+    );
+    if (!resumeRes.ok) throw new Error("default ssh transcript resume failed");
+    expect(resumeRes.value.transcript.messages.at(-1)?.text).toBe(
+      `Mock Gateway (${connectionId}) received: ping remote gateway`,
+    );
   });
 });
 
