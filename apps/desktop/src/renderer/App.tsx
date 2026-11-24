@@ -1831,6 +1831,10 @@ export default function App() {
     };
   }, [effectiveScope, isSettingsOpen]);
 
+  const reportSurfaceFailure = useCallback((message: string) => {
+    dispatch({ type: "SET_STOP_ERROR", message });
+  }, []);
+
   const handleSendPrompt = useCallback(async () => {
     const text = composerDraft.trim();
     if (
@@ -1852,12 +1856,7 @@ export default function App() {
         targetSessionId = created?.sessionId ?? null;
       }
       if (!targetSessionId) {
-        dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.sendFailed") });
-        dispatch({
-          type: "ANNOUNCE",
-          message: getCopy("chat.sendFailed"),
-          priority: "assertive",
-        });
+        reportSurfaceFailure(getCopy("chat.sendFailed"));
         return;
       }
       const targetScope: BridgeScope = {
@@ -1905,8 +1904,7 @@ export default function App() {
         }
       } else {
         const message = res.error.message || getCopy("chat.sendFailed");
-        dispatch({ type: "SET_STOP_ERROR", message });
-        dispatch({ type: "ANNOUNCE", message, priority: "assertive" });
+        reportSurfaceFailure(message);
       }
     } finally {
       dispatch({ type: "SET_CHAT_BUSY", busy: false });
@@ -1920,6 +1918,7 @@ export default function App() {
     flushPendingDraftSave,
     handleCreateSession,
     hasReadyConnection,
+    reportSurfaceFailure,
     state.activeSessionId,
     state.chatBusy,
   ]);
@@ -1975,8 +1974,7 @@ export default function App() {
           targetScope,
         );
         if (!res.ok) {
-          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
-          dispatch({ type: "ANNOUNCE", message: res.error.message, priority: "assertive" });
+          reportSurfaceFailure(res.error.message);
           return "failed";
         }
         const receipt = res.value.receipt ?? res.value.receiptStatus;
@@ -2007,6 +2005,7 @@ export default function App() {
       effectiveScope,
       handleCreateSession,
       hasReadyConnection,
+      reportSurfaceFailure,
       state.activeSessionId,
     ],
   );
@@ -2029,8 +2028,7 @@ export default function App() {
           { ...effectiveScope, sessionId: state.activeSessionId },
         );
         if (!res.ok) {
-          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
-          dispatch({ type: "ANNOUNCE", message: res.error.message, priority: "assertive" });
+          reportSurfaceFailure(res.error.message);
           return;
         }
         dispatch({
@@ -2045,7 +2043,7 @@ export default function App() {
         setRecoveryBusy(false);
       }
     },
-    [effectiveScope, state.activeSessionId],
+    [effectiveScope, reportSurfaceFailure, state.activeSessionId],
   );
 
   const handleRetryQueue = useCallback(
@@ -2062,13 +2060,7 @@ export default function App() {
           { ...effectiveScope, sessionId: state.activeSessionId },
         );
         if (!res.ok) {
-          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
-          dispatch({
-            type: "ANNOUNCE",
-            message: res.error.message,
-            eventId: `queue-retry:${submissionId}:error`,
-            priority: "assertive",
-          });
+          reportSurfaceFailure(res.error.message);
           return;
         }
         if (res.value.status !== "admitted") {
@@ -2089,7 +2081,7 @@ export default function App() {
         setRecoveryBusy(false);
       }
     },
-    [effectiveScope, state.activeSessionId],
+    [effectiveScope, reportSurfaceFailure, state.activeSessionId],
   );
 
   const handleCancelQueued = useCallback(
@@ -2103,12 +2095,7 @@ export default function App() {
           { ...effectiveScope, sessionId: state.activeSessionId },
         );
         if (!res.ok) {
-          dispatch({ type: "SET_STOP_ERROR", message: getCopy("turn.queue.cancelFailed") });
-          dispatch({
-            type: "ANNOUNCE",
-            message: getCopy("turn.queue.cancelFailed"),
-            priority: "assertive",
-          });
+          reportSurfaceFailure(getCopy("turn.queue.cancelFailed"));
           return;
         }
         const outcome = res.value.outcome ?? "cancel_unknown";
@@ -2127,7 +2114,7 @@ export default function App() {
         setRecoveryBusy(false);
       }
     },
-    [effectiveScope, state.activeSessionId],
+    [effectiveScope, reportSurfaceFailure, state.activeSessionId],
   );
 
   const handleDiscardUnknownTurn = useCallback(async (unknown: UnknownTurnRecord) => {
@@ -2144,12 +2131,7 @@ export default function App() {
         { ...effectiveScope, sessionId: state.activeSessionId },
       );
       if (!res.ok) {
-        dispatch({ type: "SET_STOP_ERROR", message: getCopy("turn.unknown.discardFailed") });
-        dispatch({
-          type: "ANNOUNCE",
-          message: getCopy("turn.unknown.discardFailed"),
-          priority: "assertive",
-        });
+        reportSurfaceFailure(getCopy("turn.unknown.discardFailed"));
         return;
       }
         dispatch({
@@ -2160,7 +2142,7 @@ export default function App() {
     } finally {
       setRecoveryBusy(false);
     }
-  }, [effectiveScope, state.activeSessionId]);
+  }, [effectiveScope, reportSurfaceFailure, state.activeSessionId]);
 
   const handleSteerTurn = useCallback(
     async (text: string) => {
@@ -2187,8 +2169,7 @@ export default function App() {
           { ...effectiveScope, sessionId: state.activeSessionId },
         );
         if (!res.ok) {
-          dispatch({ type: "SET_STOP_ERROR", message: res.error.message });
-          dispatch({ type: "ANNOUNCE", message: res.error.message, priority: "assertive" });
+          reportSurfaceFailure(res.error.message);
           return;
         }
         if (res.value.steered) {
@@ -2203,6 +2184,7 @@ export default function App() {
     },
     [
       effectiveScope,
+      reportSurfaceFailure,
       state.activeSessionId,
       state.transcript?.activeTurnId,
       state.transcript?.executionGeneration,
@@ -2259,12 +2241,7 @@ export default function App() {
       targetScope,
     );
     if (!res.ok) {
-      dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.stopFailed") });
-      dispatch({
-        type: "ANNOUNCE",
-        message: getCopy("chat.stopFailed"),
-        priority: "assertive",
-      });
+      reportSurfaceFailure(getCopy("chat.stopFailed"));
     } else if (res.value.status === "cancel_outcome_unknown") {
       dispatch({
         type: "ANNOUNCE",
@@ -2274,6 +2251,7 @@ export default function App() {
     }
   }, [
     effectiveScope,
+    reportSurfaceFailure,
     state.activeSessionId,
     state.transcript?.activeTurnId,
     state.transcript?.executionGeneration,

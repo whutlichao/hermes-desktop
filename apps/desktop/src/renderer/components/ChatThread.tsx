@@ -831,7 +831,7 @@ export function ChatThread({
       )}
 
       {stopError && (
-        <div className="chat-alert" role="alert">
+        <div className="chat-alert" role="alert" data-testid="chat-surface-alert">
           {stopError}
         </div>
       )}

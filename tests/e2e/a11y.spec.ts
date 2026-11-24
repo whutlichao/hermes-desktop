@@ -1792,9 +1792,59 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
       assertiveSeq ?? "1",
     );
 
-    await page.locator("#composer-input").fill("x".repeat(1024 * 1024 + 64));
-    const surfaceAlert = page.getByTestId("draft-capacity-alert");
+    await page.evaluate(() => {
+      const fixture = (
+        window as unknown as {
+          __HERMES_E2E_FIXTURE__: {
+            failPromptSend?: boolean;
+            promptReceiptMode?: "accepted" | "admitted" | "delivery_unknown";
+          };
+        }
+      ).__HERMES_E2E_FIXTURE__;
+      fixture.failPromptSend = true;
+    });
+    const assertiveSeqBeforeSurfaceFailure =
+      await assertiveRegion.getAttribute("data-announcement-seq");
+    await page.locator("#composer-input").fill("surface announcement probe");
+    const sendButton = page
+      .locator(".composer-shell")
+      .getByRole("button", { name: "发送消息", exact: true });
+    await sendButton.click();
+
+    const surfaceAlert = page.getByTestId("chat-surface-alert");
+    const surfaceErrorText = "宿主内部处理失败，请重试或导出脱敏诊断信息。";
+    await expect(surfaceAlert).toBeVisible();
     await expect(surfaceAlert).toHaveAttribute("role", "alert");
+    await expect(surfaceAlert).toContainText(surfaceErrorText);
+    await expect(
+      page
+        .locator('[role="alert"], [aria-live]:not([aria-live="off"])')
+        .filter({ hasText: surfaceErrorText }),
+    ).toHaveCount(1);
+    await expect(assertiveRegion).not.toContainText(surfaceErrorText);
+    await expect(assertiveRegion).toHaveAttribute(
+      "data-announcement-seq",
+      assertiveSeqBeforeSurfaceFailure ?? "1",
+    );
+
+    await page.evaluate(() => {
+      const fixture = (
+        window as unknown as {
+          __HERMES_E2E_FIXTURE__: {
+            failPromptSend?: boolean;
+            promptReceiptMode?: "accepted" | "admitted" | "delivery_unknown";
+          };
+        }
+      ).__HERMES_E2E_FIXTURE__;
+      fixture.failPromptSend = false;
+      fixture.promptReceiptMode = "accepted";
+    });
+    await sendButton.click();
+    await expect(surfaceAlert).toHaveCount(0);
+
+    await page.locator("#composer-input").fill("x".repeat(1024 * 1024 + 64));
+    const capacityAlert = page.getByTestId("draft-capacity-alert");
+    await expect(capacityAlert).toHaveAttribute("role", "alert");
     await expect(page.getByRole("alert")).toHaveCount(1);
   });
 });
