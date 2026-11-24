@@ -14,7 +14,11 @@ import type {
   SessionTranscriptSnapshot,
   TurnRecoveryTopicSnapshot,
 } from "@hermes/contracts";
-import { makeActiveChatDraftKey, makeNewChatDraftKey } from "@hermes/domain";
+import {
+  makeActiveChatDraftKey,
+  makeNewChatDraftKey,
+  makeSessionJournalKey,
+} from "@hermes/domain";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
 import { startFakeGatewayServer } from "../../../../tests/helpers/fakeGatewayServer";
 import { ChatSessionStateStore } from "./chatSessionStateStore";
@@ -135,6 +139,32 @@ async function bootFakeLocalSupervisor(input: {
   const supervisor = new LocalConnectionSupervisor(backend);
   await supervisor.connectLocal("default");
   return supervisor;
+}
+
+function readJournal(
+  supervisor: ConnectionSupervisor,
+  connectionId: string,
+  profileId: string,
+  sessionId: string,
+): {
+  eventCount: number;
+  lastGatewaySeq: number | null;
+  resyncRequired: boolean;
+} | null {
+  const journal = (
+    supervisor as unknown as {
+      backgroundJournal: {
+        getState(key: string):
+          | {
+              eventCount: number;
+              lastGatewaySeq: number | null;
+              resyncRequired: boolean;
+            }
+          | undefined;
+      };
+    }
+  ).backgroundJournal.getState(makeSessionJournalKey(connectionId, profileId, sessionId));
+  return journal ?? null;
 }
 
 describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)", () => {
@@ -641,10 +671,7 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
           return true;
         }
         if (method === "config.get") {
-          // Hang longer than probeTimeoutMs so settings probe times out -> unknown without blocking connect!
-          setTimeout(() => {
-            ctx.replyResult({ config: {} });
-          }, 250);
+          // Never reply so the settings probe times out -> unknown without blocking connect.
           return true;
         }
         if (method === "skills.list") {
@@ -1852,7 +1879,8 @@ process.exit(1);
         dialOrder.push(cid);
         activeDials += 1;
         maxConcurrentObserved = Math.max(maxConcurrentObserved, activeDials);
-        await new Promise((r) => setTimeout(r, 40));
+        // Let every worker admitted by the cap start before any dial completes.
+        await new Promise<void>((resolve) => queueMicrotask(resolve));
         try {
           if (cid === "local") {
             return await origEnsure(cid, pid, opts);
@@ -2540,7 +2568,9 @@ process.exit(1);
           mcp_server: "filesystem",
         },
       });
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(() => capturedActivityRow?.attribution?.sourceLabel)
+        .toBe("外部提供 · MCP · filesystem");
       unsubActivity();
       const observedActivityRow =
         capturedActivityRow as import("@hermes/contracts").ToolExecutionRow | null;
@@ -2548,7 +2578,16 @@ process.exit(1);
 
       // 6. Resync notification invalidates cached extension inventories
       notifyGateway?.("resync_required", { authority_epoch: 2 });
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(() => {
+          const extensions = supervisor.getCapabilitySnapshot().extensions;
+          return (
+            extensions.skills.items.length +
+            extensions.tools.items.length +
+            extensions.mcp.items.length
+          );
+        })
+        .toBe(0);
       const afterResync = supervisor.getCapabilitySnapshot();
       expect(afterResync.extensions.skills.items).toEqual([]);
       expect(afterResync.extensions.tools.items).toEqual([]);
@@ -2632,7 +2671,7 @@ process.exit(1);
         { connectionId: "local", profileId: "default", sessionId: "s-fg" },
         (ev) => fgTranscriptEvents.push({ kind: ev.kind, payload: ev.payload }),
       );
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
       fgTranscriptEvents.length = 0;
 
       // Background session receives token deltas (0 unread), tool running (0 unread), tool completed (+1), turn completed (+1), approval (+needsInput)
@@ -2653,7 +2692,12 @@ process.exit(1);
         status: "running",
         seq: 6,
       });
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(
+          () =>
+            readJournal(supervisor1, "local", "default", "s-bg-progress")?.lastGatewaySeq,
+        )
+        .toBe(6);
 
       // Still zero unread from token deltas or running tool, and zero patches leaked to s-fg subscriber
       expect(fgTranscriptEvents).toHaveLength(0);
@@ -2682,7 +2726,18 @@ process.exit(1);
         turn_id: "t-bg-1",
         approval_id: "appr-1",
       });
-      await new Promise((r) => setTimeout(r, 40));
+      await expect
+        .poll(() => {
+          const summary = supervisor1
+            .getFleetSnapshot()
+            .sessions.find((s) => s.sessionId === "s-bg-progress");
+          return {
+            unread: summary?.unreadCount,
+            needsInput: summary?.needsInput,
+            pinned: summary?.pinned,
+          };
+        })
+        .toEqual({ unread: 2, needsInput: true, pinned: true });
 
       bgSummary = supervisor1
         .getFleetSnapshot()
@@ -2720,7 +2775,14 @@ process.exit(1);
         message_id: "m-fg-1",
         seq: 1,
       });
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(
+          () =>
+            supervisor1
+              .getFleetSnapshot()
+              .sessions.find((s) => s.sessionId === "s-fg")?.unreadCount,
+        )
+        .toBe(1);
       expect(
         supervisor1.getFleetSnapshot().sessions.find((s) => s.sessionId === "s-fg")?.unreadCount,
       ).toBe(1);
@@ -2746,8 +2808,15 @@ process.exit(1);
           seq: i,
         });
       }
-      // Wait for WS notifications to process
-      await new Promise((r) => setTimeout(r, 150));
+      await expect
+        .poll(() => {
+          const journal = readJournal(supervisor1, "local", "default", "s-bg-overflow");
+          return {
+            lastSeq: journal?.lastGatewaySeq,
+            resyncRequired: journal?.resyncRequired,
+          };
+        })
+        .toEqual({ lastSeq: 2_005, resyncRequired: true });
 
       // Still zero RPC fetches for s-bg-overflow until user switches to it!
       expect(
@@ -2770,7 +2839,7 @@ process.exit(1);
         { connectionId: "local", profileId: "default", sessionId: "s-bg-overflow" },
         (ev) => ovfEvents.push({ kind: ev.kind, payload: ev.payload }),
       );
-      await new Promise((r) => setTimeout(r, 30));
+      await expect.poll(() => ovfEvents.length).toBeGreaterThan(0);
 
       expect(selectRes.resyncRequired || ovfEvents.some((e) => e.kind === "resync_required")).toBe(
         true,
@@ -2801,7 +2870,14 @@ process.exit(1);
         message_id: "m-fg-q",
         seq: 99,
       });
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(
+          () =>
+            supervisor1
+              .getFleetSnapshot()
+              .sessions.find((s) => s.sessionId === "s-fg")?.unreadCount,
+        )
+        .toBe(1);
       expect(
         supervisor1.getFleetSnapshot().sessions.find((s) => s.sessionId === "s-fg")?.unreadCount,
       ).toBe(1);
@@ -2885,12 +2961,20 @@ process.exit(1);
           seq: 1,
         });
       }
-      await new Promise((r) => setTimeout(r, 60));
+      await expect
+        .poll(() => readJournal(supervisor, "local", "default", "u-12")?.eventCount)
+        .toBe(1);
 
       // Now add u-13 and u-14 -> must evict oldest unpinned u-1, u-2, NEVER any of the 4 pinned sessions
       gw.sendNotification("prompt.delta", { session_id: "u-13", turn_id: "t-13", message_id: "m-13", delta: "ok", seq: 1 });
       gw.sendNotification("prompt.delta", { session_id: "u-14", turn_id: "t-14", message_id: "m-14", delta: "ok", seq: 1 });
-      await new Promise((r) => setTimeout(r, 50));
+      await expect
+        .poll(() => ({
+          u13: readJournal(supervisor, "local", "default", "u-13")?.eventCount,
+          u14: readJournal(supervisor, "local", "default", "u-14")?.eventCount,
+          u1Resync: readJournal(supervisor, "local", "default", "u-1")?.resyncRequired,
+        }))
+        .toEqual({ u13: 1, u14: 1, u1Resync: true });
 
       // u-1 was evicted -> switching to u-1 requires resync; s-pin-running / clarify / unread / queued were NOT evicted
       const selPin = (await supervisor.handlers["sessions.select"](
@@ -2913,7 +2997,23 @@ process.exit(1);
       for (let i = 1; i <= 5; i += 1) {
         gw.sendNotification("prompt.delta", { session_id: "s-bytes", turn_id: "t-b", message_id: "m-b", delta: oneMiB, seq: i });
       }
-      await new Promise((r) => setTimeout(r, 80));
+      await expect
+        .poll(() => {
+          const gap = readJournal(supervisor, "local", "default", "s-gap");
+          const bytes = readJournal(supervisor, "local", "default", "s-bytes");
+          return {
+            gapLastSeq: gap?.lastGatewaySeq,
+            gapResync: gap?.resyncRequired,
+            bytesLastSeq: bytes?.lastGatewaySeq,
+            bytesResync: bytes?.resyncRequired,
+          };
+        })
+        .toEqual({
+          gapLastSeq: 3,
+          gapResync: true,
+          bytesLastSeq: 5,
+          bytesResync: true,
+        });
 
       const selGap = (await supervisor.handlers["sessions.select"](
         { connectionId: "local", profileId: "default", sessionId: "s-gap" },
@@ -3116,7 +3216,15 @@ process.exit(1);
         description: "Restart nginx service",
         choices: ["once", "deny"],
       });
-      await new Promise((r) => setTimeout(r, 40));
+      await expect
+        .poll(async () => {
+          const snap = (await supervisor.handlers["approvals.list"](
+            {},
+            null,
+          )) as ApprovalTopicSnapshot;
+          return snap.approvals.find((a) => a.command === "sudo systemctl restart nginx")?.state;
+        })
+        .toBe("actionable");
 
       const snap2 = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
       const sudoApr = snap2.approvals.find((a) => a.command === "sudo systemctl restart nginx")!;
@@ -3167,7 +3275,15 @@ process.exit(1);
         command: "git status",
         choices: ["once", "deny"],
       });
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(async () => {
+          const snap = (await supervisor.handlers["approvals.list"](
+            {},
+            null,
+          )) as ApprovalTopicSnapshot;
+          return snap.approvals.find((a) => a.command === "git status")?.state;
+        })
+        .toBe("actionable");
 
       // Keep startup-1 in pendingFromServer with exact matching tuple, omit apr-missing-in-resync
       pendingFromServer = [
@@ -3183,7 +3299,18 @@ process.exit(1);
         },
       ];
       gw.sendNotification("possible_event_loss", { authority_epoch: 2 });
-      await new Promise((r) => setTimeout(r, 50));
+      await expect
+        .poll(async () => {
+          const snap = (await supervisor.handlers["approvals.list"](
+            {},
+            null,
+          )) as ApprovalTopicSnapshot;
+          return {
+            matched: snap.approvals.find((a) => a.approvalKey === startupApr.approvalKey)?.state,
+            missing: snap.approvals.find((a) => a.command === "git status")?.state,
+          };
+        })
+        .toEqual({ matched: "actionable", missing: "unverified" });
 
       const snapAfterResync = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
       const resyncMatched = snapAfterResync.approvals.find((a) => a.approvalKey === startupApr.approvalKey)!;
@@ -3221,7 +3348,15 @@ process.exit(1);
         command: "pwd",
         choices: ["once", "deny"],
       });
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(async () => {
+          const snap = (await supervisor.handlers["approvals.list"](
+            {},
+            null,
+          )) as ApprovalTopicSnapshot;
+          return snap.approvals.find((a) => a.command === "pwd")?.state;
+        })
+        .toBe("actionable");
       const snapPreReconnect = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
       const staleCandidate = snapPreReconnect.approvals.find((a) => a.command === "pwd")!;
       expect(staleCandidate.state).toBe("actionable");
@@ -3257,7 +3392,15 @@ process.exit(1);
         session_id: "sess-with-cwd",
         turn_id: "turn-stale-1",
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await expect
+        .poll(async () => {
+          const snap = (await supervisor.handlers["approvals.list"](
+            {},
+            null,
+          )) as ApprovalTopicSnapshot;
+          return snap.approvals.find((a) => a.approvalKey === newKeyView.approvalKey)?.state;
+        })
+        .toBe("expired");
       const snapAfterExpire = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
       expect(
         snapAfterExpire.approvals.find((a) => a.approvalKey === newKeyView.approvalKey)?.state,
@@ -3273,7 +3416,15 @@ process.exit(1);
         command: "whoami",
         choices: ["once", "deny"],
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await expect
+        .poll(async () => {
+          const snap = (await supervisor.handlers["approvals.list"](
+            {},
+            null,
+          )) as ApprovalTopicSnapshot;
+          return snap.approvals.find((a) => a.command === "whoami")?.state;
+        })
+        .toBe("actionable");
       const preOrphan = (await supervisor.handlers["approvals.list"]({}, null)) as ApprovalTopicSnapshot;
       const opsOrphanTarget = preOrphan.approvals.find((a) => a.command === "whoami")!;
       expect(opsOrphanTarget.state).toBe("actionable");

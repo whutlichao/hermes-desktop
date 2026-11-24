@@ -249,20 +249,21 @@ describe("TerminalManager (Main-owned PTY, grant, bounded scrollback, lifecycle)
       data: "tty && stty size && echo \"REAL_MAIN_\"\"PTY_OK\"\n",
     });
 
-    const deadline = Date.now() + 5000;
-    let joined = "";
-    while (Date.now() < deadline) {
-      joined = manager.getSnapshot(SCOPE_A).lines.join("\n");
-      if (
-        joined.includes("/dev/tty") &&
-        joined.includes("32 104") &&
-        /\nREAL_MAIN_PTY_OK(?:\n|$)/.test(joined)
-      ) {
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 40));
-    }
+    await expect
+      .poll(
+        () => {
+          const output = manager.getSnapshot(SCOPE_A).lines.join("\n");
+          return {
+            tty: output.includes("/dev/tty"),
+            size: output.includes("32 104"),
+            marker: /\nREAL_MAIN_PTY_OK(?:\n|$)/.test(output),
+          };
+        },
+        { timeout: 5000 },
+      )
+      .toEqual({ tty: true, size: true, marker: true });
 
+    const joined = manager.getSnapshot(SCOPE_A).lines.join("\n");
     expect(joined).toContain("/dev/tty");
     expect(joined).toContain("32 104");
     expect(joined).toMatch(/\nREAL_MAIN_PTY_OK(?:\n|$)/);

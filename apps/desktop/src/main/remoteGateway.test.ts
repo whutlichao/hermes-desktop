@@ -198,8 +198,13 @@ describe("Remote HTTP(S) two-leg probe & OAuth/PKCE manager (S1)", () => {
       const cbResponse = await fetch(callbackLocation!);
       expect(cbResponse.status).toBe(200);
 
-      // Wait briefly for auth.state "granted"
-      await new Promise((r) => setTimeout(r, 30));
+      await expect
+        .poll(() =>
+          authStates.some(
+            (s) => s.authSessionId === startRes.authSessionId && s.status === "granted",
+          ),
+        )
+        .toBe(true);
 
       const grantedEvent = authStates.find(
         (s) => s.authSessionId === startRes.authSessionId && s.status === "granted",

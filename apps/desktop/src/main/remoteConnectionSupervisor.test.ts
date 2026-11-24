@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { BridgeEvent } from "@hermes/contracts";
 import { createSequenceTracker } from "@hermes/domain";
 import { createTestSandbox } from "../../../../tests/helpers/sandbox";
@@ -189,11 +189,19 @@ describe("ConnectionSupervisor multi-gateway Local + Remote HTTP(S)/WS (S1)", ()
       expect(health?.errorCode).toBe("auth_required");
 
       // Single attempt; no blind infinite retry hammering /api/gateway/ticket
-      const ticketCallsAfterFail = remoteGw.httpRequests.filter((r) => r.url.includes("/ticket")).length;
-      await new Promise((r) => setTimeout(r, 80));
-      expect(remoteGw.httpRequests.filter((r) => r.url.includes("/ticket")).length).toBe(
-        ticketCallsAfterFail,
-      );
+      vi.useFakeTimers();
+      try {
+        const ticketCallsAfterFail = remoteGw.httpRequests.filter((r) =>
+          r.url.includes("/ticket"),
+        ).length;
+        // Advance through the supervisor's full 30s backoff window without real time.
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(remoteGw.httpRequests.filter((r) => r.url.includes("/ticket")).length).toBe(
+          ticketCallsAfterFail,
+        );
+      } finally {
+        vi.useRealTimers();
+      }
 
       // Re-authorize by writing fresh token via RegistryStore and reconnecting
       const secretRes = store.writeSecret({
