@@ -778,6 +778,41 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
     expect(filterProfilesForConnection([], "")).toEqual([]);
   });
 
+  it("classifies the Hermes 0.23.3 runtime capability tags without a served_methods catalog", () => {
+    const caps = classifyRuntimeCapabilities({
+      runtime_protocol: 1,
+      capabilities: [
+        "durable-admission-v1",
+        "event-replay-v1",
+        "local-cli-create-v1",
+        "acp-editor-policy-v1",
+        "acp-session-mcp-v1",
+        "clarify-batch-v1",
+        "plugin-rpc-v1",
+        "session-client-v1",
+        "session-transcript-v1",
+        "session-list-picker-v1",
+        "session-list-cursor-v1",
+      ],
+      session_create: {
+        sources: ["acp", "cli", "gui", "oneshot", "tool", "tui"],
+        parameters: ["title", "source"],
+      },
+    });
+
+    expect(caps).toEqual({
+      chatAvailable: true,
+      promptSubmit: true,
+      promptCancel: true,
+      promptSteer: true,
+      sessionCreate: true,
+      sessionResume: true,
+      sessionList: true,
+      sessionTranscript: true,
+      profilesList: true,
+    });
+  });
+
   it("reduces transcript snapshots, unknown scopes, upserts, turn state, and sync-controller resets", () => {
     const makeSnap = (): SessionTranscriptSnapshot => ({
       connectionId: "local",

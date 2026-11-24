@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type {
   ActivityEventPayload,
   ActiveChatRef,
@@ -249,6 +250,23 @@ function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+function mergeSessionListFeeds(
+  stored: Array<Record<string, unknown>>,
+  live: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const row of stored) {
+    const id = asString(row.session_id ?? row.sessionId ?? row.id).trim();
+    if (id) byId.set(id, row);
+  }
+  for (const row of live) {
+    const id = asString(row.session_id ?? row.sessionId ?? row.id).trim();
+    if (!id) continue;
+    byId.set(id, { ...(byId.get(id) ?? {}), ...row });
+  }
+  return [...byId.values()];
+}
+
 function mapRawSession(
   raw: Record<string, unknown>,
   connectionId: string,
@@ -351,8 +369,23 @@ function isRpcAuthError(err: unknown): boolean {
 function isProfileUnavailableRpcError(err: unknown): boolean {
   if (!(err instanceof GatewayRpcError)) return false;
   if (err.rpcCode === -32004) return true;
-  const msg = err.message.toLowerCase();
+  const reason = err.reason?.toLowerCase();
+  if (
+    reason === "profile_not_served" ||
+    reason === "profile_mismatch" ||
+    reason === "profile_unavailable" ||
+    reason === "profile_parked"
+  ) {
+    return true;
+  }
+  const msg = `${err.rpcMessage ?? ""} ${err.message}`.toLowerCase();
   return msg.includes("profile_not_served") || msg.includes("profile_mismatch") || msg.includes("profile_unavailable");
+}
+
+function isInvalidParamsRpcError(err: unknown): boolean {
+  if (!(err instanceof GatewayRpcError)) return false;
+  if (err.reason === "invalid_params") return true;
+  return err.rpcMessage?.toLowerCase() === "invalid_params";
 }
 
 export class ConnectionSupervisor {
@@ -3146,12 +3179,18 @@ export class ConnectionSupervisor {
       const existingById = new Map(currentProfiles.map((p) => [p.profileId, p]));
 
       for (const raw of rawProfiles) {
-        const pid = asString(raw.profile_id ?? raw.profileId ?? raw.id).trim();
+        const name = asString(raw.name).trim();
+        const pid = asString(raw.profile_id ?? raw.profileId ?? raw.id ?? raw.path).trim();
         if (!pid) continue;
         seenIds.add(pid);
-        const displayName = asString(raw.display_name ?? raw.displayName, pid) || pid;
-        const handle = asString(raw.handle, pid) || pid;
-        const isDefault = Boolean(raw.is_default ?? raw.isDefault ?? pid === "default");
+        const explicitDisplayName = asString(raw.display_name ?? raw.displayName).trim();
+        const displayName = explicitDisplayName || name || pid;
+        const handle = asString(raw.handle).trim() || name || pid;
+        const defaultFlag = raw.is_default ?? raw.isDefault;
+        const isDefault =
+          typeof defaultFlag === "boolean"
+            ? defaultFlag
+            : name === "default" || pid === "default";
         const initialDesired: ConnectionDesiredState =
           isDefault || pid === activeProfileId ? "enabled" : "disabled";
         const link = this.ensureLinkState(connectionId, pid, initialDesired);
@@ -3250,16 +3289,30 @@ export class ConnectionSupervisor {
   ): Promise<SessionSummary[]> {
     const connectionId = entry.connectionId;
     let rawList: Array<Record<string, unknown>> = [];
-    const callList = async (method: string) => {
-      const res = await entry.client.call<{ sessions?: Array<Record<string, unknown>> }>(method, {
-        profile_id: profileId,
-      });
+    const callList = async (
+      method: string,
+      extraParams: Record<string, unknown> = {},
+    ) => {
+      const res = await entry.client.call<{ sessions?: Array<Record<string, unknown>> }>(
+        method,
+        {
+          ...this.gatewayProfileParams(entry, profileId),
+          ...extraParams,
+        },
+      );
       return Array.isArray(res?.sessions) ? res.sessions : [];
     };
 
     if (entry.capabilities.sessionList) {
       try {
-        rawList = await callList("session.list");
+        const stored = await callList("session.list", { scope: "stored" });
+        let live: Array<Record<string, unknown>> = [];
+        try {
+          live = await callList("session.list", { scope: "live" });
+        } catch {
+          // The stored picker feed is authoritative; a live-feed refusal must not hide it.
+        }
+        rawList = mergeSessionListFeeds(stored, live);
       } catch (err) {
         if (isProfileUnavailableRpcError(err)) {
           this.markProfileUnavailable(connectionId, profileId, err);
@@ -3400,7 +3453,7 @@ export class ConnectionSupervisor {
     if (entry.supportedActions.sessionResume) {
       try {
         rawResult = await entry.client.call<Record<string, unknown>>("session.resume", {
-          profile_id: profileId,
+          ...this.gatewayProfileParams(entry, profileId),
           session_id: sessionId,
         });
       } catch (err) {
@@ -3413,7 +3466,7 @@ export class ConnectionSupervisor {
     if (!rawResult && entry.capabilities.sessionTranscript) {
       try {
         rawResult = await entry.client.call<Record<string, unknown>>("session.transcript", {
-          profile_id: profileId,
+          ...this.gatewayProfileParams(entry, profileId),
           session_id: sessionId,
         });
       } catch (err) {
@@ -5187,6 +5240,24 @@ export class ConnectionSupervisor {
     }
   }
 
+  private gatewayProfileParams(
+    entry: GatewayTransportEntry,
+    profileId: string,
+  ): { profile?: string } {
+    if (
+      entry.transportMode === "shared-host-scope" &&
+      profileId &&
+      profileId !== entry.defaultProfileId
+    ) {
+      const handle = this.profilesByConnection
+        .get(entry.connectionId)
+        ?.find((profile) => profile.profileId === profileId)
+        ?.handle.trim();
+      return { profile: handle || profileId };
+    }
+    return {};
+  }
+
   private translateRpcFailure(
     entry: GatewayTransportEntry,
     err: unknown,
@@ -5210,6 +5281,9 @@ export class ConnectionSupervisor {
         "not_found",
         getLocalFailureCopy("profile_unavailable").whatHappened,
       );
+    }
+    if (isInvalidParamsRpcError(err)) {
+      throw makeBridgeError("invalid_request", getCopy("connection.invalidRequestError"));
     }
     if (isJsonRpcMethodNotFound(err)) {
       if (singleAction) {
@@ -5829,7 +5903,7 @@ export class ConnectionSupervisor {
       let res: Record<string, unknown>;
       try {
         res = await entry.client.call<Record<string, unknown>>("session.create", {
-          profile_id: profileId,
+          ...this.gatewayProfileParams(entry, profileId),
           title,
         });
       } catch (err) {
@@ -5978,10 +6052,17 @@ export class ConnectionSupervisor {
 
       let res: Record<string, unknown>;
       try {
+        const submissionId =
+          typeof payload.submissionId === "string" && payload.submissionId.trim()
+            ? payload.submissionId.trim()
+            : typeof payload.draftId === "string" && payload.draftId.trim()
+              ? payload.draftId.trim()
+              : crypto.randomUUID();
         res = await entry.client.call<Record<string, unknown>>("prompt.submit", {
-          profile_id: profileId,
+          ...this.gatewayProfileParams(entry, profileId),
           session_id: sessionId,
           text,
+          submission_id: submissionId,
         });
       } catch (err) {
         if (this.chatSessionStateStore && !isJsonRpcMethodNotFound(err)) {
@@ -6002,7 +6083,11 @@ export class ConnectionSupervisor {
       }
 
       const rawReceipt = asString(res.receipt ?? res.status).toLowerCase();
-      if (rawReceipt === "delivery_unknown" || res.delivery_unknown === true) {
+      if (
+        rawReceipt === "delivery_unknown" ||
+        rawReceipt === "unknown" ||
+        res.delivery_unknown === true
+      ) {
         if (this.chatSessionStateStore) {
           this.chatSessionStateStore.markDraftDeliveryStatus(draftRef, "delivery_unknown");
           this.emitChatState();
@@ -6168,7 +6253,7 @@ export class ConnectionSupervisor {
           },
           async ({ turnId: tId, executionGeneration: execGen }) => {
             const rpcPayload = {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
               turn_id: tId,
               ...(execGen > 0 ? { execution_generation: execGen } : {}),
@@ -6345,7 +6430,7 @@ export class ConnectionSupervisor {
           },
           async ({ admission_id, execution_generation }) =>
             entry.client.call<Record<string, unknown>>("prompt.resolve_unknown", {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
               admission_id,
               execution_generation,
@@ -6417,7 +6502,7 @@ export class ConnectionSupervisor {
         async (subId) => {
           try {
             const receiptRes = await entry.client.call<Record<string, unknown>>("prompt.receipt", {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
               submission_id: subId,
             });
@@ -6444,7 +6529,7 @@ export class ConnectionSupervisor {
               this.translateRpcFailure(entry, err, undefined, "prompt.receipt", profileId);
             }
             const listRes = await entry.client.call<Record<string, unknown>>("session.resume", {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
             });
             const rawList = Array.isArray(
@@ -6492,7 +6577,7 @@ export class ConnectionSupervisor {
           { connectionId, profileId, sessionId, submissionId, online: true },
           async (rpcPayload) =>
             entry.client.call<Record<string, unknown>>("prompt.submit", {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
               ...rpcPayload,
             }),
@@ -6534,7 +6619,7 @@ export class ConnectionSupervisor {
           { connectionId, profileId, sessionId, admissionId },
           async ({ admission_id }) =>
             entry.client.call<Record<string, unknown>>("prompt.cancel", {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
               admission_id,
             }),
@@ -7660,7 +7745,7 @@ export class ConnectionSupervisor {
         },
         async (rpcPayload) =>
           entry.client.call<Record<string, unknown>>("prompt.submit", {
-            profile_id: input.profileId,
+            ...this.gatewayProfileParams(entry, input.profileId),
             session_id: input.sessionId,
             ...rpcPayload,
           }),

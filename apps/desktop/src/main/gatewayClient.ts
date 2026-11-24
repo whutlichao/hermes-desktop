@@ -9,12 +9,20 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 export class GatewayRpcError extends Error {
   readonly rpcCode: number;
   readonly isMethodNotFound: boolean;
+  readonly rpcMessage?: string;
+  readonly reason?: string;
 
-  constructor(rpcCode: number, safeMessage: string) {
+  constructor(
+    rpcCode: number,
+    safeMessage: string,
+    details?: { rpcMessage?: string; reason?: string },
+  ) {
     super(safeMessage);
     this.name = "GatewayRpcError";
     this.rpcCode = rpcCode;
     this.isMethodNotFound = rpcCode === -32601;
+    this.rpcMessage = details?.rpcMessage;
+    this.reason = details?.reason;
   }
 }
 
@@ -406,12 +414,20 @@ export class GatewayClient {
       this.pending.delete(id);
       clearTimeout(entry.timer);
       if (msg.error && typeof msg.error === "object") {
-        const errObj = msg.error as { code?: unknown; message?: unknown };
+        const errObj = msg.error as { code?: unknown; message?: unknown; data?: unknown };
         const rpcCode = typeof errObj.code === "number" ? errObj.code : -32000;
+        const data =
+          errObj.data && typeof errObj.data === "object"
+            ? (errObj.data as Record<string, unknown>)
+            : undefined;
         entry.reject(
           new GatewayRpcError(
             rpcCode,
             rpcCode === -32601 ? "Method not supported by gateway" : "Gateway RPC failed",
+            {
+              ...(typeof errObj.message === "string" ? { rpcMessage: errObj.message } : {}),
+              ...(typeof data?.reason === "string" ? { reason: data.reason } : {}),
+            },
           ),
         );
       } else {

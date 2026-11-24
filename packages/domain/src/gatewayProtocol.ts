@@ -353,17 +353,36 @@ export function classifyRuntimeCapabilities(
   }
 
   const capList = asStringArray(caps);
-  const promptSubmit = capList.includes("prompt.submit") || capList.includes("chat-v1");
+  const gatewayLocalSessions = capList.includes("local-cli-create-v1");
+  const durableAdmission = capList.includes("durable-admission-v1");
+  const promptSubmit =
+    capList.includes("prompt.submit") ||
+    capList.includes("chat-v1") ||
+    gatewayLocalSessions ||
+    durableAdmission;
+  const sessionAuthority = capList.includes("session-authority-v1");
   return {
     chatAvailable: promptSubmit,
     promptSubmit,
-    promptCancel: capList.includes("prompt.cancel") || promptSubmit,
-    promptSteer: capList.includes("session.steer") || promptSubmit,
-    sessionCreate: capList.includes("session.create") || capList.includes("session-authority-v1"),
-    sessionResume: capList.includes("session.resume") || capList.includes("session-authority-v1"),
-    sessionList: capList.includes("session.list") || capList.includes("session-authority-v1"),
-    sessionTranscript: capList.includes("session.transcript") || capList.includes("session-authority-v1"),
-    profilesList: capList.includes("profiles.list") || capList.includes("session-authority-v1"),
+    promptCancel:
+      capList.includes("prompt.cancel") || gatewayLocalSessions || durableAdmission || promptSubmit,
+    promptSteer:
+      capList.includes("session.steer") || gatewayLocalSessions || durableAdmission || promptSubmit,
+    sessionCreate: capList.includes("session.create") || sessionAuthority || gatewayLocalSessions,
+    sessionResume: capList.includes("session.resume") || sessionAuthority || gatewayLocalSessions,
+    sessionList:
+      capList.includes("session.list") ||
+      sessionAuthority ||
+      gatewayLocalSessions ||
+      capList.includes("session-list-picker-v1") ||
+      capList.includes("session-list-cursor-v1"),
+    sessionTranscript:
+      capList.includes("session.transcript") ||
+      sessionAuthority ||
+      gatewayLocalSessions ||
+      capList.includes("session-transcript-v1"),
+    profilesList:
+      capList.includes("profiles.list") || sessionAuthority || gatewayLocalSessions || durableAdmission,
   };
 }
 

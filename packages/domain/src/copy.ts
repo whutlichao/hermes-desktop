@@ -172,6 +172,7 @@ export const COPY_CATALOG = {
   "connection.disconnectedOrTimeoutError": "Gateway 连接中断或超时",
   "connection.requestExecutionFailedError": "Gateway 执行请求失败",
   "connection.requestFailedError": "请求失败",
+  "connection.invalidRequestError": "Gateway 拒绝了请求参数：客户端与 Gateway 的协议不匹配。Draft 仍保留，请更新 Gateway 或客户端后重试。",
   "session.targetRequiredError": "缺少目标 Session",
   "session.createUnsupportedError": "当前 Gateway 不支持新建 Session",
   "capabilities.title": "能力目录",

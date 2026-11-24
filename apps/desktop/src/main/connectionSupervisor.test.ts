@@ -11,10 +11,13 @@ import type {
   ChatSessionProjection,
   SafeBackgroundNotification,
   DraftExportBundle,
+  SessionSummary,
   SessionTranscriptSnapshot,
   TurnRecoveryTopicSnapshot,
 } from "@hermes/contracts";
 import {
+  getCopy,
+  getLocalFailureCopy,
   makeActiveChatDraftKey,
   makeNewChatDraftKey,
   makeSessionJournalKey,
@@ -71,7 +74,7 @@ if (rest[0] === "gateway" && rest[1] === "ensure") {
       instance_id: "inst-fake-1",
       authority_epoch: 1,
       runtime_protocol: 1,
-      capabilities: ["session-authority-v1", "host-scope-interactive"],
+      capabilities: ${JSON.stringify(["session-authority-v1", "host-scope-interactive"])},
       code_sha: "sha_1",
       ws_url: ${JSON.stringify(options.wsUrl)},
       ws_protocol: "hermes-gateway-v1",
@@ -91,7 +94,7 @@ if (rest[0] === "gateway" && rest[1] === "attach") {
       instance_id: "inst-fake-1",
       authority_epoch: 1,
       runtime_protocol: 1,
-      capabilities: ["session-authority-v1"],
+      capabilities: ${JSON.stringify(["session-authority-v1"])},
       code_sha: "sha_1",
       ws_url: ${JSON.stringify(options.wsUrl)},
       ws_protocol: "hermes-gateway-v1",
@@ -110,6 +113,7 @@ async function bootFakeLocalSupervisor(input: {
   wsUrl: string;
   validTickets: Set<string>;
   profileIdentity?: string;
+  chatSessionStateStore?: ChatSessionStateStore;
 }): Promise<ConnectionSupervisor> {
   const cliPath = path.join(input.sandbox.rootDir, "hermes");
   await writeFakeHermesCli({
@@ -136,7 +140,12 @@ async function bootFakeLocalSupervisor(input: {
     return res;
   };
   const backend = new LocalBackendManager(ports);
-  const supervisor = new LocalConnectionSupervisor(backend);
+  const supervisor = new LocalConnectionSupervisor(
+    backend,
+    input.chatSessionStateStore
+      ? { chatSessionStateStore: input.chatSessionStateStore }
+      : undefined,
+  );
   await supervisor.connectLocal("default");
   return supervisor;
 }
@@ -572,6 +581,7 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
         { profile_id: "default", session_id: "s-def", title: "Default Chat" },
         { profile_id: "ops", session_id: "s-ops", title: "Ops Chat" },
       ],
+      profileForTicket: (ticket) => /^tkt_attach_(default|ops)_\d+$/.exec(ticket)?.[1],
     });
 
     try {
@@ -1465,13 +1475,17 @@ process.exit(1);
           ctx.replyResult({ profiles: activeProfilesList });
           return true;
         }
-        if ((method === "session.list" || method === "sessions.list") && params.profile_id === "ops" && blockOpsProfile) {
+        if (
+          (method === "session.list" || method === "sessions.list") &&
+          params.profile === "ops" &&
+          blockOpsProfile
+        ) {
           ctx.replyError(-32004, "profile_not_served");
           return true;
         }
         if (method === "prompt.submit") {
           const sid = String(params.session_id);
-          const pid = String(params.profile_id ?? "default");
+          const pid = String(params.profile ?? params.profile_id ?? "default");
           const turnId = `turn-${pid}-1`;
           ctx.replyResult({
             accepted: true,
@@ -3895,7 +3909,6 @@ process.exit(1);
       expect(discard).toMatchObject({ resolved: true, status: "interrupted" });
       const resolveCall = gw.rpcCalls.find((call) => call.method === "prompt.resolve_unknown");
       expect(resolveCall?.params).toEqual({
-        profile_id: "default",
         session_id: "sess-43",
         admission_id: "adm-lost-1",
         execution_generation: executionGeneration,
@@ -3930,7 +3943,6 @@ process.exit(1);
       expect(interruptCalls).toBe(1);
       const interruptPayload = gw.rpcCalls.find((call) => call.method === "session.interrupt");
       expect(interruptPayload?.params).toEqual({
-        profile_id: "default",
         session_id: "sess-43",
         turn_id: secondSend.turnId,
         execution_generation: executionGeneration,
@@ -4203,7 +4215,6 @@ process.exit(1);
         admission: { admissionId: "adm-q-1", submissionId: "sub-q-1" },
       });
       expect(promptSubmits[0]).toEqual({
-        profile_id: "default",
         session_id: "sess-queue",
         text: "queued first",
         queued: true,
@@ -4328,8 +4339,8 @@ process.exit(1);
       )) as { outcome: string; admission: { state: string } };
       expect(cancelled).toMatchObject({ outcome: "cancelled", admission: { state: "cancelled" } });
       expect(promptCancels).toEqual([
-        { profile_id: "default", session_id: "sess-queue", admission_id: "adm-q-1" },
-        { profile_id: "default", session_id: "sess-queue", admission_id: "adm-q-2" },
+        { session_id: "sess-queue", admission_id: "adm-q-1" },
+        { session_id: "sess-queue", admission_id: "adm-q-2" },
       ]);
       expect(latestRecovery()?.queuedAdmissions.find((q) => q.admissionId === "adm-q-2")?.state).toBe(
         "cancelled",
@@ -4384,7 +4395,7 @@ process.exit(1);
         admission: { state: "already_started", turnId: "turn-started" },
       });
       expect(promptCancels.slice(cancelsBeforeRace)).toEqual([
-        { profile_id: "default", session_id: "sess-queue", admission_id: fourthAdmissionId },
+        { session_id: "sess-queue", admission_id: fourthAdmissionId },
       ]);
       expect(promptSubmits).toHaveLength(submitsBeforeRace);
       expect(latestRecovery()?.queuedAdmissions.find((q) => q.admissionId === fourthAdmissionId)?.state).toBe(
@@ -4775,6 +4786,850 @@ process.exit(1);
       await supervisor.dispose();
       passed = true;
     } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+});
+
+describe("Hermes 0.23.3 strict canonical send path", () => {
+  type StrictGatewayOptions = {
+    profileIdentity: string;
+    storedSessions?: Array<Record<string, unknown>>;
+    liveSessions?: Array<Record<string, unknown>>;
+    promptFailure?: { reason: string } | null;
+    promptStatus?: string;
+  };
+
+  const strictMethods = new Set([
+    "session.create",
+    "session.list",
+    "sessions.list",
+    "session.resume",
+    "session.transcript",
+    "prompt.submit",
+    "prompt.cancel",
+    "prompt.receipt",
+  ]);
+
+  function makeStrictOnRpc(options: StrictGatewayOptions) {
+    let createdSeq = 0;
+    return (
+      method: string,
+      params: Record<string, unknown>,
+      ctx: {
+        replyResult: (result: unknown) => void;
+        replyError: (code: number, message: string, data?: Record<string, unknown>) => void;
+      },
+    ): boolean => {
+      if (strictMethods.has(method) && "profile_id" in params) {
+        ctx.replyError(4001, "invalid_params", {
+          reason: "invalid_params",
+          fields: ["profile_id"],
+        });
+        return true;
+      }
+      if (strictMethods.has(method) && params.profile === options.profileIdentity) {
+        ctx.replyError(4001, "profile_mismatch", { reason: "profile_mismatch" });
+        return true;
+      }
+
+      switch (method) {
+        case "session.list":
+        case "sessions.list": {
+          if (method === "session.list" && params.scope !== "stored") {
+            ctx.replyResult({ sessions: options.liveSessions ?? [], scope: "live" });
+            return true;
+          }
+          ctx.replyResult({ sessions: options.storedSessions ?? [], scope: "stored" });
+          return true;
+        }
+        case "session.create": {
+          createdSeq += 1;
+          const sessionId = `sess-strict-${createdSeq}`;
+          ctx.replyResult({
+            session_id: sessionId,
+            stored_session_id: sessionId,
+            title:
+              typeof params.title === "string" && params.title.trim() ? params.title.trim() : "新对话",
+            messages: [],
+            message_count: 0,
+            running: false,
+          });
+          return true;
+        }
+        case "session.resume":
+        case "session.transcript": {
+          const sessionId = String(params.session_id ?? "");
+          ctx.replyResult({
+            session_id: sessionId,
+            messages: [
+              {
+                message_id: `stored-message-${sessionId}`,
+                role: "user",
+                text: `stored hello ${sessionId}`,
+                created_at: "2026-11-24T00:00:00.000Z",
+              },
+            ],
+            active_turn_id: null,
+          });
+          return true;
+        }
+        case "prompt.submit": {
+          if (options.promptFailure) {
+            ctx.replyError(4001, options.promptFailure.reason, {
+              reason: options.promptFailure.reason,
+            });
+            return true;
+          }
+          if (typeof params.submission_id !== "string" || !params.submission_id.trim()) {
+            ctx.replyError(4001, "invalid_params", { reason: "invalid_params" });
+            return true;
+          }
+          const sessionId = String(params.session_id ?? "");
+          if (options.promptStatus) {
+            ctx.replyResult({
+              admission_id: "adm-strict-status",
+              ref: { profile_id: options.profileIdentity, session_id: sessionId },
+              sequence: 1,
+              status: options.promptStatus,
+              outcome: null,
+              authority_epoch: 1,
+              execution_generation: null,
+            });
+            return true;
+          }
+          ctx.replyResult({
+            accepted: true,
+            receipt: "accepted",
+            session_id: sessionId,
+            turn_id: "turn-strict-1",
+            user_message_id: "user-strict-1",
+            assistant_message_id: "assistant-strict-1",
+          });
+          return true;
+        }
+        default:
+          return false;
+      }
+    };
+  }
+
+  it("creates a new session and submits its first prompt without profile_id, including a submission_id", async () => {
+    const sandbox = createTestSandbox("hermes-strict-new-");
+    const profileIdentity = "/private/tmp/hermes-strict-new-home";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      onRpc: makeStrictOnRpc({ profileIdentity }),
+    });
+    const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+        chatSessionStateStore: store,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: profileIdentity,
+          draftId: "draft-strict-new",
+          text: "strict gateway hello",
+        },
+        scope,
+      );
+
+      const created = (await supervisor.handlers["sessions.create"](
+        { title: "Strict New Chat", draftId: "draft-strict-new" },
+        scope,
+      )) as { session: SessionSummary };
+      expect(created.session.profileId).toBe(profileIdentity);
+
+      const send = (await supervisor.handlers["prompts.send"](
+        {
+          sessionId: created.session.sessionId,
+          text: "strict gateway hello",
+          draftId: "draft-strict-new",
+        },
+        { ...scope, sessionId: created.session.sessionId },
+      )) as { accepted?: boolean; receipt?: string };
+      expect(send.accepted).toBe(true);
+      expect(send.receipt).toBe("accepted");
+
+      const projection = store.getProjection();
+      expect(
+        projection.draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, created.session.sessionId)
+        ],
+      ).toBeUndefined();
+      expect(
+        projection.draftsByKey?.[
+          makeNewChatDraftKey("local", profileIdentity, "draft-strict-new")
+        ],
+      ).toBeUndefined();
+
+      const sendCalls = gw.rpcCalls.filter((call) => call.method === "prompt.submit");
+      expect(sendCalls).toHaveLength(1);
+      expect(sendCalls[0].params).not.toHaveProperty("profile_id");
+      expect(sendCalls[0].params).not.toHaveProperty("profile");
+      expect(sendCalls[0].params.submission_id).toEqual(expect.any(String));
+      expect((sendCalls[0].params.submission_id as string).length).toBeGreaterThan(0);
+
+      for (const call of gw.rpcCalls.filter(
+        (rpc) => rpc.method === "session.create" || rpc.method === "session.resume",
+      )) {
+        expect(call.params).not.toHaveProperty("profile_id");
+        expect(call.params).not.toHaveProperty("profile");
+      }
+      const storedListCall = gw.rpcCalls.find(
+        (rpc) => rpc.method === "session.list" && rpc.params.scope === "stored",
+      );
+      expect(storedListCall?.params).not.toHaveProperty("profile_id");
+      expect(storedListCall?.params).not.toHaveProperty("profile");
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("lists stored sessions with scope=stored, resumes an existing session, and submits into it", async () => {
+    const sandbox = createTestSandbox("hermes-strict-existing-");
+    const profileIdentity = "/private/tmp/hermes-strict-existing-home";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      onRpc: makeStrictOnRpc({
+        profileIdentity,
+        storedSessions: [
+          {
+            session_id: "sess-stored-1",
+            id: "sess-stored-1",
+            title: "Stored Chat",
+            source: "cli",
+            started_at: 1795510000,
+            message_count: 1,
+          },
+        ],
+      }),
+    });
+    const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+        chatSessionStateStore: store,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+
+      expect(
+        supervisor
+          .getFleetSnapshot()
+          .sessions.some((session) => session.sessionId === "sess-stored-1"),
+      ).toBe(true);
+
+      const listCall = gw.rpcCalls.find(
+        (call) => call.method === "session.list" && call.params.scope === "stored",
+      );
+      expect(listCall?.params).toMatchObject({ scope: "stored" });
+      expect(listCall?.params).not.toHaveProperty("profile_id");
+      expect(listCall?.params).not.toHaveProperty("profile");
+
+      const resumed = (await supervisor.handlers["sessions.resume"](
+        { sessionId: "sess-stored-1" },
+        { ...scope, sessionId: "sess-stored-1" },
+      )) as { transcript: SessionTranscriptSnapshot };
+      expect(resumed.transcript.messages.map((message) => message.text)).toContain(
+        "stored hello sess-stored-1",
+      );
+
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: profileIdentity,
+          sessionId: "sess-stored-1",
+          draftId: "draft-strict-existing",
+          text: "existing gateway hello",
+        },
+        { ...scope, sessionId: "sess-stored-1" },
+      );
+
+      const send = (await supervisor.handlers["prompts.send"](
+        {
+          sessionId: "sess-stored-1",
+          text: "existing gateway hello",
+          draftId: "draft-strict-existing",
+        },
+        { ...scope, sessionId: "sess-stored-1" },
+      )) as { accepted?: boolean };
+      expect(send.accepted).toBe(true);
+      expect(
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, "sess-stored-1")
+        ],
+      ).toBeUndefined();
+
+      const sendCall = gw.rpcCalls.find((call) => call.method === "prompt.submit");
+      expect(sendCall?.params).toMatchObject({ session_id: "sess-stored-1" });
+      expect(sendCall?.params).not.toHaveProperty("profile_id");
+      expect(sendCall?.params).not.toHaveProperty("profile");
+      expect(sendCall?.params.submission_id).toEqual(expect.any(String));
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("classifies invalid_params, profile_unavailable, and disconnect separately while preserving the draft", async () => {
+    const sandbox = createTestSandbox("hermes-strict-errors-");
+    const profileIdentity = "/private/tmp/hermes-strict-errors-home";
+    const validTickets = new Set<string>();
+    const promptFailure: { reason: string } | null = null;
+    let failure: { reason: string } | null = promptFailure;
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      onRpc: (method, params, ctx) =>
+        makeStrictOnRpc({ profileIdentity, promptFailure: failure })(method, params, ctx),
+    });
+    const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+        chatSessionStateStore: store,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: profileIdentity,
+          sessionId: "sess-error-1",
+          draftId: "draft-strict-error",
+          text: "must survive failures",
+        },
+        { ...scope, sessionId: "sess-error-1" },
+      );
+
+      failure = { reason: "invalid_params" };
+      await expect(
+        supervisor.handlers["prompts.send"](
+          { sessionId: "sess-error-1", text: "must survive failures" },
+          { ...scope, sessionId: "sess-error-1" },
+        ),
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        message: getCopy("connection.invalidRequestError"),
+      });
+      expect(
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, "sess-error-1")
+        ]?.text,
+      ).toBe("must survive failures");
+
+      failure = { reason: "profile_mismatch" };
+      await expect(
+        supervisor.handlers["prompts.send"](
+          { sessionId: "sess-error-1", text: "must survive failures" },
+          { ...scope, sessionId: "sess-error-1" },
+        ),
+      ).rejects.toMatchObject({
+        code: "not_found",
+        message: getLocalFailureCopy("profile_unavailable").whatHappened,
+      });
+      expect(supervisor.getConnectionLink("local", profileIdentity)?.unavailableCode).toBe(
+        "profile_unavailable",
+      );
+      expect(
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, "sess-error-1")
+        ]?.text,
+      ).toBe("must survive failures");
+
+      failure = null;
+      await gw.close();
+      await expect(
+        supervisor.handlers["prompts.send"](
+          { sessionId: "sess-error-1", text: "must survive failures" },
+          { ...scope, sessionId: "sess-error-1" },
+        ),
+      ).rejects.toMatchObject({
+        code: expect.stringMatching(/^(unreachable|timeout)$/),
+      });
+      expect(
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, "sess-error-1")
+        ]?.text,
+      ).toBe("must survive failures");
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("preserves the draft when prompt.submit reports the gateway's unknown admission status", async () => {
+    const sandbox = createTestSandbox("hermes-strict-unknown-");
+    const profileIdentity = "/private/tmp/hermes-strict-unknown-home";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [{ name: "default", path: profileIdentity, is_default: true }],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: ["durable-admission-v1", "local-cli-create-v1"],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: makeStrictOnRpc({ profileIdentity, promptStatus: "unknown" }),
+    });
+    const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+        chatSessionStateStore: store,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: profileIdentity,
+          sessionId: "sess-unknown-1",
+          draftId: "draft-strict-unknown",
+          text: "unknown admission must keep the draft",
+        },
+        { ...scope, sessionId: "sess-unknown-1" },
+      );
+
+      const send = (await supervisor.handlers["prompts.send"](
+        {
+          sessionId: "sess-unknown-1",
+          text: "unknown admission must keep the draft",
+          draftId: "draft-strict-unknown",
+        },
+        { ...scope, sessionId: "sess-unknown-1" },
+      )) as { accepted?: boolean; deliveryUnknown?: boolean; receipt?: string };
+      expect(send).toMatchObject({
+        accepted: false,
+        deliveryUnknown: true,
+        receipt: "delivery_unknown",
+      });
+
+      const draft =
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, "sess-unknown-1")
+        ];
+      expect(draft?.text).toBe("unknown admission must keep the draft");
+      expect(draft?.deliveryStatus).toBe("delivery_unknown");
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("uses the Hermes 0.23.3 runtime capability tags and profiles.list shape for a new-session send", async () => {
+    const sandbox = createTestSandbox("hermes-real-caps-new-");
+    const profileIdentity = "/private/tmp/hermes-real-caps-new-home";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          name: "default",
+          path: profileIdentity,
+          display_name: "",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "acp-editor-policy-v1",
+          "acp-session-mcp-v1",
+          "clarify-batch-v1",
+          "plugin-rpc-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: {
+          sources: ["acp", "cli", "gui", "oneshot", "tool", "tui"],
+          parameters: ["title", "source"],
+        },
+      },
+      onRpc: makeStrictOnRpc({ profileIdentity }),
+    });
+    const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+        chatSessionStateStore: store,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: profileIdentity,
+          draftId: "draft-real-caps-new",
+          text: "real capability tags hello",
+        },
+        scope,
+      );
+
+      const created = (await supervisor.handlers["sessions.create"](
+        { title: "Real Caps New Chat", draftId: "draft-real-caps-new" },
+        scope,
+      )) as { session: SessionSummary };
+      expect(created.session.sessionId).toBe("sess-strict-1");
+
+      const send = (await supervisor.handlers["prompts.send"](
+        {
+          sessionId: created.session.sessionId,
+          text: "real capability tags hello",
+          draftId: "draft-real-caps-new",
+        },
+        { ...scope, sessionId: created.session.sessionId },
+      )) as { accepted?: boolean; receipt?: string };
+      expect(send.accepted).toBe(true);
+      expect(send.receipt).toBe("accepted");
+
+      expect(
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, created.session.sessionId)
+        ],
+      ).toBeUndefined();
+
+      const profile = supervisor
+        .getFleetSnapshot()
+        .profiles.find((entry) => entry.profileId === profileIdentity);
+      expect(profile).toMatchObject({
+        profileId: profileIdentity,
+        displayName: "default",
+        handle: "default",
+        isDefault: true,
+      });
+
+      expect(gw.rpcCalls.some((call) => call.method === "session.create")).toBe(true);
+      expect(gw.rpcCalls.some((call) => call.method === "prompt.submit")).toBe(true);
+      expect(
+        gw.rpcCalls.some(
+          (call) => call.method === "session.list" && call.params.scope === "stored",
+        ),
+      ).toBe(true);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("lists and submits into an existing stored session with the Hermes 0.23.3 runtime capability tags", async () => {
+    const sandbox = createTestSandbox("hermes-real-caps-existing-");
+    const profileIdentity = "/private/tmp/hermes-real-caps-existing-home";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        {
+          name: "default",
+          path: profileIdentity,
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+        ],
+        session_create: {
+          sources: ["acp", "cli", "gui", "oneshot", "tool", "tui"],
+          parameters: ["title", "source"],
+        },
+      },
+      onRpc: makeStrictOnRpc({
+        profileIdentity,
+        storedSessions: [
+          {
+            id: "sess-real-stored-1",
+            session_id: "sess-real-stored-1",
+            title: "Stored Real Caps",
+            source: "cli",
+            started_at: 1795510000,
+            message_count: 1,
+          },
+        ],
+      }),
+    });
+    const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+        chatSessionStateStore: store,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+
+      await supervisor.handlers["chatState.saveDraft"](
+        {
+          connectionId: "local",
+          profileId: profileIdentity,
+          sessionId: "sess-real-stored-1",
+          draftId: "draft-real-caps-existing",
+          text: "real existing hello",
+        },
+        { ...scope, sessionId: "sess-real-stored-1" },
+      );
+
+      const send = (await supervisor.handlers["prompts.send"](
+        {
+          sessionId: "sess-real-stored-1",
+          text: "real existing hello",
+          draftId: "draft-real-caps-existing",
+        },
+        { ...scope, sessionId: "sess-real-stored-1" },
+      )) as { accepted?: boolean };
+      expect(send.accepted).toBe(true);
+
+      expect(
+        supervisor
+          .getFleetSnapshot()
+          .sessions.some((session) => session.sessionId === "sess-real-stored-1"),
+      ).toBe(true);
+      expect(
+        store.getProjection().draftsByKey?.[
+          makeActiveChatDraftKey("local", profileIdentity, "sess-real-stored-1")
+        ],
+      ).toBeUndefined();
+      expect(
+        gw.rpcCalls.some(
+          (call) => call.method === "prompt.submit" && call.params.session_id === "sess-real-stored-1",
+        ),
+      ).toBe(true);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("merges live sessions into the stored picker feed so a running session stays visible", async () => {
+    const sandbox = createTestSandbox("hermes-live-session-list-");
+    const profileIdentity = "/private/tmp/hermes-live-session-list-home";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [{ name: "default", path: profileIdentity, is_default: true }],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "local-cli-create-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+      onRpc: makeStrictOnRpc({
+        profileIdentity,
+        storedSessions: [
+          {
+            id: "sess-stored-idle",
+            session_id: "sess-stored-idle",
+            title: "Stored Idle",
+            source: "cli",
+            started_at: 1795510000,
+            message_count: 0,
+            running: false,
+          },
+        ],
+        liveSessions: [
+          {
+            id: "sess-live-running",
+            session_id: "sess-live-running",
+            title: "Live Running",
+            source: "gui",
+            started_at: 1795510100,
+            message_count: 2,
+            running: true,
+          },
+        ],
+      }),
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+      const scope = { connectionId: "local", profileId: profileIdentity };
+      const listed = (await supervisor.handlers["sessions.list"]({}, scope)) as {
+        sessions: SessionSummary[];
+      };
+      expect(listed.sessions.map((session) => session.sessionId).sort()).toEqual([
+        "sess-live-running",
+        "sess-stored-idle",
+      ]);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("maps a non-default shared-host Profile to its handle for RPC routing", async () => {
+    const sandbox = createTestSandbox("hermes-shared-profile-route-");
+    const defaultProfile = "/private/tmp/hermes-shared-profile-default";
+    const opsProfile = "/private/tmp/hermes-shared-profile-ops";
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        { name: "default", path: defaultProfile, is_default: true },
+        { name: "ops", path: opsProfile, is_default: false },
+      ],
+      initialSessions: [],
+      runtimeDescribe: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "local-cli-create-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+        ],
+        session_create: { sources: ["gui"], parameters: ["title", "source"] },
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+    let passed = false;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity: defaultProfile,
+      });
+
+      const routeFor = (profileId: string) =>
+        (
+          supervisor as unknown as {
+            gatewayProfileParams: (
+              entry: { connectionId: string; defaultProfileId: string; transportMode: string },
+              profileId: string,
+            ) => { profile?: string };
+          }
+        ).gatewayProfileParams(
+          {
+            connectionId: "local",
+            defaultProfileId: defaultProfile,
+            transportMode: "shared-host-scope",
+          },
+          profileId,
+        );
+
+      expect(routeFor(opsProfile)).toEqual({ profile: "ops" });
+      expect(routeFor(defaultProfile)).toEqual({});
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
       await gw.close();
       sandbox.cleanup(passed);
     }

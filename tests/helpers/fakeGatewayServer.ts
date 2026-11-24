@@ -18,7 +18,19 @@ export interface FakeGatewayConnectionRecord {
 export interface FakeGatewayServerOptions {
   validTickets: Set<string>;
   servedMethods?: string[];
-  profiles?: Array<{ profile_id: string; display_name: string; handle?: string; is_default?: boolean }>;
+  profiles?: Array<{
+    profile_id?: string;
+    profileId?: string;
+    id?: string;
+    path?: string;
+    name?: string;
+    display_name?: string;
+    displayName?: string;
+    handle?: string;
+    is_default?: boolean;
+    isDefault?: boolean;
+  }>;
+  runtimeDescribe?: Record<string, unknown>;
   initialSessions?: Array<{
     profile_id: string;
     session_id: string;
@@ -27,13 +39,14 @@ export interface FakeGatewayServerOptions {
     updated_at?: string;
     cwd?: string;
   }>;
+  profileForTicket?: (ticket: string) => string | undefined;
   onRpc?: (
     method: string,
     params: Record<string, unknown>,
     ctx: {
       sendNotification: (method: string, params: Record<string, unknown>) => void;
       replyResult: (result: unknown) => void;
-      replyError: (code: number, message: string) => void;
+      replyError: (code: number, message: string, data?: Record<string, unknown>) => void;
     },
   ) => boolean | void | Promise<boolean | void>;
 }
@@ -138,6 +151,7 @@ export async function startFakeGatewayServer(
 
     // Enforce single-use ticket on the fake gateway side too!
     options.validTickets.delete(ticket);
+    const connectionProfileId = ticket ? options.profileForTicket?.(ticket) : undefined;
 
     const key = req.headers["sec-websocket-key"];
     if (!key || Array.isArray(key)) {
@@ -192,10 +206,14 @@ export async function startFakeGatewayServer(
         replied = true;
         sendJson({ jsonrpc: "2.0", id: reqMsg.id, result });
       };
-      const replyError = (code: number, message: string) => {
+      const replyError = (code: number, message: string, data?: Record<string, unknown>) => {
         if (replied || reqMsg.id === undefined) return;
         replied = true;
-        sendJson({ jsonrpc: "2.0", id: reqMsg.id, error: { code, message } });
+        sendJson({
+          jsonrpc: "2.0",
+          id: reqMsg.id,
+          error: { code, message, ...(data ? { data } : {}) },
+        });
       };
 
       if (options.onRpc) {
@@ -214,12 +232,14 @@ export async function startFakeGatewayServer(
 
       switch (reqMsg.method) {
         case "runtime.describe":
-          replyResult({
-            runtime_protocol: 1,
-            capabilities: ["session-authority-v1", "host-scope-interactive"],
-            served_methods: servedMethods,
-            session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
-          });
+          replyResult(
+            options.runtimeDescribe ?? {
+              runtime_protocol: 1,
+              capabilities: ["session-authority-v1", "host-scope-interactive"],
+              served_methods: servedMethods,
+              session_create: { sources: ["desktop"], parameters: ["title", "profile_id"] },
+            },
+          );
           return;
         case "client.capabilities":
           replyResult({ accepted: true, server_requests: Boolean(params.server_requests) });
@@ -232,13 +252,23 @@ export async function startFakeGatewayServer(
           return;
         case "session.list":
         case "sessions.list": {
-          const pid = typeof params.profile_id === "string" ? params.profile_id : undefined;
+          const pid =
+            typeof params.profile === "string"
+              ? params.profile
+              : typeof params.profile_id === "string"
+                ? params.profile_id
+                : connectionProfileId;
           const list = pid ? sessions.filter((s) => s.profile_id === pid) : sessions;
           replyResult({ sessions: list });
           return;
         }
         case "session.create": {
-          const profileId = typeof params.profile_id === "string" ? params.profile_id : "default";
+          const profileId =
+            typeof params.profile === "string"
+              ? params.profile
+              : typeof params.profile_id === "string"
+                ? params.profile_id
+                : connectionProfileId ?? "default";
           const sessionId = `sess-${sessions.length + 1}`;
           const title = typeof params.title === "string" && params.title.trim() ? params.title.trim() : "新对话";
           const entry = {

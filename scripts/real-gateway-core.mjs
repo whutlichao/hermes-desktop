@@ -1708,16 +1708,16 @@ export async function runRealGateway(argv = [], runtimeOverrides = {}) {
       }
 
       const sessionsStage = await runStage("sessions.list", async () => {
-        const listParams =
+        const legacyListParams =
           options.profileId && options.profileId !== "default"
             ? { profile_id: options.profileId }
             : {};
         try {
-          await wsClient.call("sessions.list", listParams);
+          await wsClient.call("sessions.list", legacyListParams);
         } catch (err) {
           if (err?.rpcCode === -32601) {
             try {
-              await wsClient.call("session.list", listParams);
+              await wsClient.call("session.list", { scope: "stored" });
             } catch (err2) {
               throw Object.assign(new Error(err2 instanceof Error ? err2.message : "session.list failed"), {
                 typedCode: "rpc_failed",
@@ -1744,7 +1744,6 @@ export async function runRealGateway(argv = [], runtimeOverrides = {}) {
       if (options.mode === "isolated" && options.withTurn) {
         const turnStage = await runStage("turn_smoke", async () => {
           const created = await wsClient.call("session.create", {
-            profile_id: readyDial.endpoint.profileId,
             title: "Harness Smoke Turn",
           });
           const sessionId =
@@ -1758,9 +1757,9 @@ export async function runRealGateway(argv = [], runtimeOverrides = {}) {
             });
           }
           await wsClient.call("prompt.submit", {
-            profile_id: readyDial.endpoint.profileId,
             session_id: sessionId,
             text: "Reply with OK",
+            submission_id: crypto.randomUUID(),
           });
         });
         if (!turnStage.ok) {
