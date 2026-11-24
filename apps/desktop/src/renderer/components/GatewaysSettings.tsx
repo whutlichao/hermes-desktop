@@ -854,7 +854,9 @@ export function GatewaysSettings({
               <div className="gateway-row-main">
                 <div className="gateway-row-title">
                   <strong>{conn.label}</strong>
-                  <span className="gateway-kind-tag">{conn.kind}</span>
+                  <span className="gateway-kind-tag">
+                    {getCopy(`connection.kind.${conn.kind}` as CopyKey)}
+                  </span>
                   {conn.isLocal && <span className="gateway-badge">{getCopy("gateways.localBadge")}</span>}
                   {conn.isPrimary && (
                     <span className="gateway-badge is-primary">{getCopy("gateways.primaryBadge")}</span>
@@ -1250,21 +1252,33 @@ export function GatewaysSettings({
                     <div className="remote-test-legs">
                       <div className="remote-test-leg-row">
                         <span>{getCopy("gateways.testLegHttpLabel")}</span>
-                        <span className={legStatusClass(testResult.httpLeg)}>
-                          {legStatusText(testResult.httpLeg)}
-                          {testResult.httpLeg.statusCode ? ` (${testResult.httpLeg.statusCode})` : ""}
-                          {testResult.httpLeg.latencyMs !== undefined
-                            ? ` · ${testResult.httpLeg.latencyMs}ms`
-                            : ""}
+                        <span className="remote-test-result">
+                          <span className={legStatusClass(testResult.httpLeg)}>
+                            {legStatusText(testResult.httpLeg)}
+                          </span>
+                          {testResult.httpLeg.statusCode ? (
+                            <span className="remote-test-metric">
+                              HTTP {testResult.httpLeg.statusCode}
+                            </span>
+                          ) : null}
+                          {testResult.httpLeg.latencyMs !== undefined ? (
+                            <span className="remote-test-metric">
+                              {testResult.httpLeg.latencyMs}ms
+                            </span>
+                          ) : null}
                         </span>
                       </div>
                       <div className="remote-test-leg-row">
                         <span>{getCopy("gateways.testLegWsLabel")}</span>
-                        <span className={legStatusClass(testResult.wsLeg)}>
-                          {legStatusText(testResult.wsLeg)}
-                          {testResult.wsLeg.latencyMs !== undefined
-                            ? ` · ${testResult.wsLeg.latencyMs}ms`
-                            : ""}
+                        <span className="remote-test-result">
+                          <span className={legStatusClass(testResult.wsLeg)}>
+                            {legStatusText(testResult.wsLeg)}
+                          </span>
+                          {testResult.wsLeg.latencyMs !== undefined ? (
+                            <span className="remote-test-metric">
+                              {testResult.wsLeg.latencyMs}ms
+                            </span>
+                          ) : null}
                         </span>
                       </div>
                     </div>

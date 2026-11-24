@@ -1,3 +1,7 @@
+/* Hallmark · checked: 2026-11-24 · genre: modern-minimal (inferred)
+ * floor: 3 FAIL (audited: 2 × 47a real titlebar, 1 × 67 wordmark) · reflexes: 167 · warnings: 7
+ * built: the project · redesign: restyle · v2.0.0 */
+
 :root {
   --paper: #f7f7f5;
   --paper-raised: #fbfbf8;
@@ -6,7 +10,8 @@
   --surface: #ffffff;
   --ink: #16181b;
   --ink-soft: #30343a;
-  --muted: #4b5057;
+  --muted: #555a61;
+  --faint: #676c73;
   --line: #e2e2db;
   --line-strong: #c9c9c1;
   --control-line: #8a8a80;
@@ -15,10 +20,12 @@
   --accent: #c8442e;
   --accent-text: #a73826;
   --accent-soft: #faede8;
+  --danger: #9e2d1e;
   --focus-ring-color: #c8442e;
-  --status-ready: #1f7a4c;
-  --status-connecting: #a36a00;
-  --status-blocked: #c8442e;
+  --status-ready: #376d4a;
+  --status-connecting: #8a6215;
+  --status-blocked: #9e2d1e;
+  --scrim: rgb(22 24 27 / 32%);
   --font-ui: "Schibsted Grotesk", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-mono: "Spline Sans Mono", "SFMono-Regular", "Cascadia Mono", monospace;
   --shadow-pop: 0 12px 40px rgb(22 24 27 / 14%), 0 2px 8px rgb(22 24 27 / 7%);
@@ -32,6 +39,11 @@
 
 html {
   font-size: 81.25%;
+}
+
+html,
+body {
+  overflow-x: clip;
 }
 
 * {
@@ -48,7 +60,6 @@ body,
 
 body {
   min-width: 1120px;
-  overflow-x: hidden;
   background: var(--paper);
   color: var(--ink);
   font-size: 1rem;
@@ -146,16 +157,6 @@ button {
 
 .window-title svg {
   color: var(--accent);
-}
-
-.window-title-sub {
-  padding-left: 8px;
-  border-left: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 0.69231rem;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .window-meta {
@@ -301,7 +302,7 @@ button {
   border: 1px solid var(--control-line);
   border-radius: 5px;
   background: var(--surface);
-  font-size: 0.88462rem;
+  font-size: 0.84615rem;
   color: var(--ink);
 }
 
@@ -447,6 +448,14 @@ button {
   opacity: 0.6;
 }
 
+.button:not(:disabled):active,
+.route-chip:active,
+.sidebar-new-btn:not(:disabled):active,
+.palette-item:active,
+.workspace-tab:active {
+  transform: translateY(1px);
+}
+
 .icon-button {
   display: inline-flex;
   align-items: center;
@@ -486,7 +495,6 @@ button {
   display: flex;
   flex-direction: column;
   padding: 16px;
-  border-left: 1px solid var(--control-line);
   background: var(--paper-raised);
   box-shadow: var(--shadow-pop);
 }
@@ -562,7 +570,7 @@ button {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgb(22 24 27 / 32%);
+  background: var(--scrim);
 }
 
 .dialog-panel {
@@ -704,36 +712,51 @@ button {
   color: var(--muted);
 }
 
-.status-pill {
+.status-pill,
+.cap-status-badge {
   display: inline-flex;
   align-items: center;
-  min-height: 24px;
-  padding: 0 8px;
-  border: 1px solid var(--line-strong);
-  border-radius: 999px;
-  background: var(--paper-raised);
-  font-size: 0.84615rem;
-  font-weight: 600;
-  color: var(--ink);
+  gap: 4px;
+  min-height: 20px;
+  padding: 1px 6px;
+  border: 0;
+  border-radius: 3px;
+  background: var(--paper-deep);
+  color: var(--ink-soft);
+  font-family: var(--font-ui);
+  font-size: 0.69231rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1.4;
+  text-transform: none;
   white-space: nowrap;
 }
 
-.status-pill.is-blocked {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent-text);
+.status-pill::before,
+.cap-status-badge::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--faint);
 }
 
-.status-pill.is-warn {
-  border-color: var(--control-line);
-  background: var(--paper-deep);
-  color: var(--ink);
+.status-pill.is-ready::before,
+.status-pill.is-ok::before,
+.cap-status-badge.is-available::before {
+  background: var(--status-ready);
 }
 
-.status-pill.is-ready {
-  border-color: var(--ink);
-  background: var(--paper-raised);
-  color: var(--ink);
+.status-pill.is-warn::before,
+.cap-status-badge.is-degraded::before,
+.cap-status-badge.is-unknown::before {
+  background: var(--status-connecting);
+}
+
+.status-pill.is-blocked::before,
+.cap-status-badge.is-unavailable::before {
+  background: var(--danger);
 }
 
 .local-repair-dl {
@@ -1014,13 +1037,15 @@ button {
 }
 
 .gateway-kind-tag {
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   font-size: 0.76923rem;
-  text-transform: uppercase;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: none;
   padding: 1px 5px;
   border: 1px solid var(--line-strong);
   border-radius: 3px;
-  color: var(--muted);
+  color: var(--faint);
 }
 
 .gateway-badge {
@@ -1107,11 +1132,12 @@ button {
   color: var(--ink);
 }
 
+.settings-section input[type="checkbox"],
 .form-field input[type="checkbox"] {
   width: 24px;
   height: 24px;
   margin: 0;
-  accent-color: var(--accent);
+  accent-color: var(--ink);
 }
 
 .gateway-form-actions {
@@ -1253,10 +1279,11 @@ button {
 }
 
 .transcript-role {
-  font-family: var(--font-mono);
-  font-size: 0.80769rem;
+  font-family: var(--font-ui);
+  font-size: 0.76923rem;
   font-weight: 600;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.01em;
+  text-transform: none;
   color: var(--muted);
 }
 
@@ -1381,6 +1408,10 @@ button {
   justify-content: flex-end;
   align-items: stretch;
   padding: 0;
+}
+
+.modal-scrim.domain-inspect-scrim {
+  padding: 0 0 0 16px;
 }
 
 .dialog-panel.capabilities-drawer {
@@ -1565,48 +1596,6 @@ button {
   color: var(--muted);
 }
 
-.cap-status-badge {
-  font-size: 0.80769rem;
-  font-weight: 600;
-  padding: 1px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--line-strong);
-  background: var(--surface);
-  color: var(--ink);
-  white-space: nowrap;
-}
-
-.cap-status-badge.is-available {
-  border-color: var(--ink);
-  background: var(--ink);
-  color: var(--paper);
-}
-
-.cap-status-badge.is-read_only {
-  border-color: var(--control-line);
-  background: var(--paper-raised);
-  color: var(--ink);
-}
-
-.cap-status-badge.is-degraded,
-.cap-status-badge.is-unknown {
-  border-color: var(--control-line);
-  background: var(--paper-deep);
-  color: var(--ink);
-}
-
-.cap-status-badge.is-deep_link {
-  border-color: var(--ink-soft);
-  background: var(--surface);
-  color: var(--ink-soft);
-}
-
-.cap-status-badge.is-unavailable {
-  border-color: var(--accent-text);
-  background: var(--accent-soft);
-  color: var(--accent-text);
-}
-
 .cap-domain-note {
   margin: 0;
   font-size: 0.88462rem;
@@ -1710,11 +1699,15 @@ button {
 }
 
 .session-cap-tag {
+  font-family: var(--font-ui);
   padding: 1px 5px;
   border: 1px solid var(--line-strong);
   border-radius: 3px;
   background: var(--surface);
   font-size: 0.76923rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--ink-soft);
 }
 
@@ -1765,10 +1758,11 @@ button {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  background: var(--surface);
+  padding: 10px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
 }
 
 .wizard-step-label {
@@ -1833,11 +1827,28 @@ button {
 
 .remote-test-leg-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 4px 8px;
   font-size: 0.92308rem;
   color: var(--ink);
+}
+
+.remote-test-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 6px;
+  min-width: 0;
+  margin-left: auto;
+}
+
+.remote-test-metric {
+  font-family: var(--font-mono);
+  font-size: 0.76923rem;
+  color: var(--muted);
 }
 
 .remote-test-message {
@@ -2643,8 +2654,8 @@ button {
 
 .session-item-badges .status-pill {
   min-height: 20px;
-  padding: 0 6px;
-  font-size: 0.80769rem;
+  padding: 1px 6px;
+  font-size: 0.69231rem;
 }
 
 .session-mark-read-btn {
@@ -2832,8 +2843,43 @@ button {
   gap: 12px;
 }
 
+.approval-generation-dl {
+  margin: 0;
+  display: grid;
+  gap: 0;
+}
+
+.approval-generation-dl > div {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.approval-generation-dl > div:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.approval-generation-dl dt {
+  font-size: 0.80769rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.approval-generation-dl dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.84615rem;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
 .dialog-panel.domain-inspect-drawer {
-  width: min(480px, calc(100vw - 32px));
+  width: 100%;
+  max-width: 480px;
   max-height: min(780px, calc(100vh - 48px));
 }
 

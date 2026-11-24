@@ -17,6 +17,7 @@ colors:
   postal-vermilion-text: "#a73826"
   postal-vermilion-soft: "#faede8"
   danger: "#9e2d1e"
+  scrim: "rgb(22 24 27 / 32%)"
   ok: "#376d4a"
   warn: "#8a6215"
 typography:
@@ -51,11 +52,17 @@ typography:
     lineHeight: 1
     letterSpacing: "0em"
   label:
-    fontFamily: "Spline Sans Mono, SFMono-Regular, Cascadia Mono, monospace"
-    fontSize: "8.5px"
+    fontFamily: "Schibsted Grotesk, PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+    fontSize: "10px"
     fontWeight: 500
     lineHeight: 1.4
-    letterSpacing: "0.1em"
+    letterSpacing: "0.01em"
+  status:
+    fontFamily: "Schibsted Grotesk, PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+    fontSize: "9px"
+    fontWeight: 500
+    lineHeight: 1.4
+    letterSpacing: "0.01em"
   code:
     fontFamily: "Spline Sans Mono, SFMono-Regular, Cascadia Mono, monospace"
     fontSize: "7.5px"
@@ -74,8 +81,11 @@ spacing:
   xs: "4px"
   sm: "6px"
   md: "8px"
+  md-plus: "10px"
   lg: "12px"
+  lg-plus: "14px"
   xl: "16px"
+  xl-plus: "18px"
   xxl: "24px"
 components:
   button-primary:
@@ -109,16 +119,16 @@ components:
     backgroundColor: "{colors.paper}"
     textColor: "{colors.ink}"
     rounded: "{rounded.md}"
-    padding: "6px 9px"
+    padding: "0 10px"
     height: "28px"
-    typography: "{typography.label}"
+    typography: "{typography.control}"
   chip-status:
     backgroundColor: "{colors.paper-deep}"
     textColor: "{colors.ink-soft}"
     rounded: "{rounded.sm}"
-    padding: "2px 6px"
+    padding: "1px 6px"
     height: "20px"
-    typography: "{typography.label}"
+    typography: "{typography.status}"
   toggle-switch:
     backgroundColor: "{colors.line-strong}"
     rounded: "{rounded.pill}"
@@ -157,7 +167,7 @@ The visual world borrows from postal routing slips, dispatch dockets, and techni
 - Paper-white field, near-black ink, and a single vermilion routing accent.
 - A 720px conversation column that stays visually still while scope changes.
 - Hairline structure, small radii, and almost no resting shadow.
-- Technical labels set in Spline Sans Mono, but never as decoration.
+- Measurements and machine values set in Spline Sans Mono; navigation, meta, role, and capability labels stay in Schibsted Grotesk.
 - Local versus remote context readable in text at every width.
 
 ## Colors
@@ -180,11 +190,12 @@ The palette is a warm-neutral paper stack with one high-chroma routing ink. Stat
 - **Faint Ink** (#676c73): Metadata that must still clear 4.5:1 on paper.
 - **Hairline** (#e2e2db): Structural rules and card borders.
 - **Strong Hairline** (#c9c9c1): Control borders and the composer edge.
+- **Scrim** (rgb(22 24 27 / 32%)): Modal and drawer overlay; the only translucent neutral.
 
 ### Status
-- **Route Green** (#376d4a): Reachable, ready, and completed states.
-- **Custody Amber** (#8a6215): Degraded, pending, or update-ready states.
-- **Seal Red** (#9e2d1e): Errors and destructive confirmation.
+- **Route Green** (#376d4a, `--status-ready`): Reachable, ready, and completed states.
+- **Custody Amber** (#8a6215, `--status-connecting`): Degraded, pending, or update-ready states.
+- **Seal Red** (#9e2d1e, `--status-blocked`, `--danger`): Errors and destructive confirmation.
 
 ### Named Rules
 **The Postal Red Rule.** Vermilion occupies less than ten percent of any screen. If it starts filling surfaces, the route has stopped being a signal.
@@ -195,7 +206,8 @@ The palette is a warm-neutral paper stack with one high-chroma routing ink. Stat
 
 **Display Font:** Schibsted Grotesk (with PingFang SC for Chinese)
 **Body Font:** Schibsted Grotesk (with PingFang SC, Hiragino Sans GB, Microsoft YaHei)
-**Label/Mono Font:** Spline Sans Mono (with SFMono-Regular, Cascadia Mono)
+**Label Font:** Schibsted Grotesk (with PingFang SC for Chinese)
+**Mono Font:** Spline Sans Mono (with SFMono-Regular, Cascadia Mono)
 
 **Character:** Schibsted Grotesk gives the interface a compact, unsentimental Nordic calm; Spline Sans Mono reads as measurement and machine address, not as a costume. Chinese copy falls back to the platform's clean sans while technical English terms keep their Latin letterforms.
 
@@ -205,19 +217,22 @@ The palette is a warm-neutral paper stack with one high-chroma routing ink. Stat
 - **Title** (600, 17px, 1.3, -0.025em): Modal and drawer titles, section leads.
 - **Body** (400, 13px, 1.45): Conversation copy; measures roughly 65–75 Latin characters inside the 720px column.
 - **Control** (500, 11px, 1): Buttons, menu rows, and gateway names.
-- **Label** (500, 8.5px, 0.1em, uppercase): Scope, status, and measurement labels only.
+- **Label** (500, 10px, 1.4, 0.01em): Navigation, meta, role, capability, and command-palette group labels; sentence case or Chinese as-is, never uppercase.
+- **Status** (500, 9px, 1.4, 0.01em): Status-pill words beside a 4px dot; no uppercase transform.
 - **Code** (400, 7.5px, 1.55): Diffs, tool args, terminal output, and file paths.
 
 ### Named Rules
 **The Heading Stands Alone Rule.** No kicker or eyebrow above a heading. Context belongs in a neighbouring control, a status line, or the heading's own words.
 
-**The Measurement Rule.** Monospace is for code, paths, model names, counts, and latency. It never carries a marketing sentence.
+**The Measurement Rule.** Monospace is for code, paths, model names, counts, latency, and IDs. It never carries navigation, meta, role, or capability labels, and it never carries a marketing sentence.
 
 ## Layout
 
 The resting desktop is a three-zone composition: a 232px session rail, a centered conversation column capped at 720px, and a closed 448px workspace rail. A 40px execution strip sits above the conversation and repeats the full route in one line. The composer is anchored to the foot of the conversation; the workspace rail only takes width when explicitly opened.
 
 At 1380px the sidebar narrows to 220px, the workspace rail to 420px, and route connectors shorten before labels do. At 1220px the sidebar is 208px and the workspace rail 390px; the workspace trigger keeps its icon and drops its word. Below 820px height, chat rhythm tightens and the session title steps down. The document has a 1120px minimum width because this is a desktop surface, not a responsive marketing page.
+
+Spacing follows a 2px grid. The documented scale includes the 10px, 14px, and 18px steps between the base rhythm for dense control rows and dialog padding; they are not a second spacing system.
 
 Hide is not Close. Hide collapses the workspace rail to zero width while keeping its DOM, terminal scrollback, preview, and annotation state mounted and inert. Close unmounts the body and releases that state. Drawers and modals overlay the same conversation rather than reflowing it.
 
@@ -250,9 +265,11 @@ Avoid pill-shaped cards, oversized corner radii, and one-sided color bars. A sta
 - **Focus:** Two-pixel vermilion outline with a two-pixel offset. Never remove it.
 
 ### Chips
-- **Route chip:** Paper ground, mono label, 5px radius; the host name may use ink weight while the profile stays muted.
-- **Status chip:** Deep paper ground, 3px radius, 8.5px uppercase mono; dot plus word, never color alone.
+- **Route chip:** Paper ground, 10px Grotesk label, 5px radius; the host name may use ink weight while the profile stays muted.
+- **Status chip:** Deep paper ground, 3px radius, 9px Grotesk text; one 4px dot plus word, never color alone.
 - **Context chips:** White or vermilion-wash ground with a removable `×`; the label states the object kind.
+
+Status uses one grammar everywhere it appears — route strip, capability catalog, and connection test results: 3px radius, deep-paper ground, one 4px dot, then the word. Do not add outline or filled variants.
 
 ### Cards / Containers
 - **Corner style:** 5px for rows, 7px for dialogs and approval cards, 9px for the composer.
@@ -271,13 +288,13 @@ Avoid pill-shaped cards, oversized corner radii, and one-sided color bars. A sta
 - `⌘K` opens a focused command palette with grouped rows, arrow-key selection, and `Escape` dismissal.
 
 ### Route String (signature)
-The persistent execution strip reads `YOU → <GATEWAY> → <PROFILE>` with a small transport chip (`LOCAL`, `SSH`, `REMOTE`, `CLOUD`) and latency. The active gateway uses ink weight and a running status dot; the active profile is muted. On scope change the route re-arrives with a 420ms ease-out and the screen reader receives a polite context announcement.
+The persistent execution strip reads `YOU → <GATEWAY> → <PROFILE>` with a small transport chip (`Local`, `SSH`, `Remote`, `Cloud`) and latency. The active gateway uses ink weight and a running status dot; the active profile is muted. On scope change the route re-arrives with a 420ms ease-out and the screen reader receives a polite context announcement.
 
 ### Approval Card (signature)
 The dangerous-command card is a vermilion-wash block with a 7px radius, one-pixel accent border, and explicit target host, profile, and working directory. Approve is primary ink; Deny is secondary; Inspect reveals the exact command and arguments without moving the target. The command is copyable and never truncated silently.
 
 ### Command Palette
-A 620px white panel over a translucent paper scrim. The search field owns the first focus, groups use 8.5px mono labels, and the selected row uses raised paper with an ink title. The footer teaches arrows, Enter, and Escape without adding another panel.
+A 620px white panel over a translucent paper scrim. The search field owns the first focus, groups use 10px Grotesk labels, and the selected row uses raised paper with an ink title. The footer teaches arrows, Enter, and Escape without adding another panel.
 
 ## Do's and Don'ts
 

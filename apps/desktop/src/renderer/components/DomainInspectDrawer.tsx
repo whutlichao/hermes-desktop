@@ -72,7 +72,7 @@ function MemoryPanel({ memory }: { memory: MemoryContextView }) {
           <div>
             <dt>{getCopy("memory.totalTokensLabel")}</dt>
             <dd>
-              {memory.totalTokens ?? "—"}
+              {memory.totalTokens ?? getCopy("common.notProvided")}
               {memory.maxTokens !== undefined ? ` / ${memory.maxTokens}` : ""}
             </dd>
           </div>
@@ -402,7 +402,7 @@ export function DomainInspectDrawer({
       title={getCopy("domainInspect.title")}
       closeLabel={getCopy("domainInspect.close")}
       className="domain-inspect-drawer"
-      scrimClassName="is-drawer"
+      scrimClassName="is-drawer domain-inspect-scrim"
       onClose={onClose}
     >
       <div className="domain-inspect-toolbar">

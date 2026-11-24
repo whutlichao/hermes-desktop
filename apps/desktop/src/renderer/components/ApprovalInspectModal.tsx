@@ -27,7 +27,7 @@ export function ApprovalInspectModal({ approval, onClose }: ApprovalInspectModal
             </div>
             <div>
               <dt>{getCopy("approval.field.host")}</dt>
-              <dd>{approval.hostDisplay || "—"}</dd>
+              <dd>{approval.hostDisplay || getCopy("common.notProvided")}</dd>
             </div>
             <div>
               <dt>{getCopy("approval.field.profile")}</dt>
@@ -39,21 +39,37 @@ export function ApprovalInspectModal({ approval, onClose }: ApprovalInspectModal
             </div>
             <div>
               <dt>{getCopy("approval.field.turn")}</dt>
-              <dd>{approval.turnId ?? "—"}</dd>
+              <dd>{approval.turnId ?? getCopy("common.notProvided")}</dd>
             </div>
             <div>
               <dt>{getCopy("approval.field.cwd")}</dt>
               <dd>
-                <code>{approval.cwd ?? "—"}</code>
+                {approval.cwd ? <code>{approval.cwd}</code> : getCopy("common.notProvided")}
               </dd>
             </div>
             <div>
               <dt>{getCopy("approval.field.generation")}</dt>
               <dd>
-                <code>
-                  owner={approval.ownerGeneration} · execution={approval.executionGeneration} · epoch=
-                  {approval.authorityEpoch}
-                </code>
+                <dl className="approval-generation-dl">
+                  <div>
+                    <dt>{getCopy("approval.field.generationOwner")}</dt>
+                    <dd>
+                      <code>{approval.ownerGeneration}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>{getCopy("approval.field.generationExecution")}</dt>
+                    <dd>
+                      <code>{approval.executionGeneration}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>{getCopy("approval.field.generationEpoch")}</dt>
+                    <dd>
+                      <code>{approval.authorityEpoch}</code>
+                    </dd>
+                  </div>
+                </dl>
               </dd>
             </div>
             <div>
@@ -62,8 +78,8 @@ export function ApprovalInspectModal({ approval, onClose }: ApprovalInspectModal
                 {approval.riskCategories.length > 0
                   ? approval.riskCategories
                       .map((r) => getCopy(`approval.risk.${r}` as CopyKey))
-                      .join(" · ")
-                  : "—"}
+                      .join(", ")
+                  : getCopy("common.notProvided")}
               </dd>
             </div>
             <div>
@@ -72,20 +88,20 @@ export function ApprovalInspectModal({ approval, onClose }: ApprovalInspectModal
                 {approval.command ? (
                   <code className="approval-command-code">{approval.command}</code>
                 ) : (
-                  "—"
+                  getCopy("common.notProvided")
                 )}
               </dd>
             </div>
             <div>
               <dt>{getCopy("approval.field.description")}</dt>
-              <dd>{approval.description || "—"}</dd>
+              <dd>{approval.description || getCopy("common.notProvided")}</dd>
             </div>
             {approval.persistentGrant && (
               <div>
                 <dt>{getCopy("approval.field.persistentGrant")}</dt>
                 <dd>
-                  <code>{approval.persistentGrant.pattern}</code> · {approval.persistentGrant.scope} ·{" "}
-                  {approval.persistentGrant.revokeHint}
+                  <code>{approval.persistentGrant.pattern}</code>,{" "}
+                  {approval.persistentGrant.scope}, {approval.persistentGrant.revokeHint}
                 </dd>
               </div>
             )}
@@ -97,7 +113,7 @@ export function ApprovalInspectModal({ approval, onClose }: ApprovalInspectModal
             )}
             <div>
               <dt>{getCopy("approval.field.expiresAt")}</dt>
-              <dd>{approval.expiresAt ?? "—"}</dd>
+              <dd>{approval.expiresAt ?? getCopy("common.notProvided")}</dd>
             </div>
           </dl>
 

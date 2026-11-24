@@ -267,7 +267,7 @@ export function SessionRailList({
                     ))}
                   </span>
                 ) : (
-                  <span>—</span>
+                  <span>{getCopy("common.notProvided")}</span>
                 )}
               </dd>
             </div>
