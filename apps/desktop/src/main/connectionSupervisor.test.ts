@@ -27,11 +27,13 @@ async function writeFakeHermesCli(options: {
   cliPath: string;
   wsUrl: string;
   perProfileTicketPrefix?: string;
+  profileIdentity?: string;
 }) {
   const script = `#!/usr/bin/env node
 const args = process.argv.slice(2);
 const profileIdx = args.indexOf("--profile");
 const profileId = profileIdx >= 0 && args[profileIdx + 1] ? args[profileIdx + 1] : "default";
+const endpointProfileId = ${options.profileIdentity ? JSON.stringify(options.profileIdentity) : "profileId"};
 const rest = profileIdx >= 0 ? args.slice(profileIdx + 2) : args;
 
 if (rest[0] === "--version") {
@@ -61,7 +63,7 @@ if (rest[0] === "gateway" && rest[1] === "ensure") {
     install_code_sha: "sha_1",
     client_code_sha: "sha_1",
     endpoint: {
-      profile_id: profileId,
+      profile_id: endpointProfileId,
       instance_id: "inst-fake-1",
       authority_epoch: 1,
       runtime_protocol: 1,
@@ -81,7 +83,7 @@ if (rest[0] === "gateway" && rest[1] === "attach") {
     ticket,
     expires_in_seconds: 30,
     endpoint: {
-      profile_id: profileId,
+      profile_id: endpointProfileId,
       instance_id: "inst-fake-1",
       authority_epoch: 1,
       runtime_protocol: 1,
@@ -103,9 +105,14 @@ async function bootFakeLocalSupervisor(input: {
   sandbox: ReturnType<typeof createTestSandbox>;
   wsUrl: string;
   validTickets: Set<string>;
+  profileIdentity?: string;
 }): Promise<ConnectionSupervisor> {
   const cliPath = path.join(input.sandbox.rootDir, "hermes");
-  await writeFakeHermesCli({ cliPath, wsUrl: input.wsUrl });
+  await writeFakeHermesCli({
+    cliPath,
+    wsUrl: input.wsUrl,
+    profileIdentity: input.profileIdentity,
+  });
   const ports = createNodeLocalBackendPorts({
     userDataDir: input.sandbox.userDataDir,
     hermesHomeDir: input.sandbox.hermesHomeDir,
@@ -372,6 +379,55 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
       passed = true;
     } finally {
       udsServer.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("retires the local CLI selector alias when the Gateway reports a path profile identity", async () => {
+    const sandbox = createTestSandbox("hermes-s1-local-profile-identity-");
+    let passed = false;
+    const profileIdentity = path.join(sandbox.hermesHomeDir, "profile-identity");
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "sessions.list",
+        "session.list",
+      ],
+      profiles: [
+        {
+          profile_id: profileIdentity,
+          display_name: "Default",
+          handle: "default",
+          is_default: true,
+        },
+      ],
+      initialSessions: [],
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+
+      expect(supervisor.getConnectionLink("local", "default")).toBeNull();
+      expect(supervisor.getConnectionLink("local", profileIdentity)?.actual).toBe("ready");
+      const health = supervisor.getLocalHealth();
+      expect(health.actual).toBe("ready");
+      expect(health.degraded).toBe(false);
+      expect(health.profileExceptionCount).toBe(0);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
       await gw.close();
       sandbox.cleanup(passed);
     }

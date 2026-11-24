@@ -157,11 +157,11 @@ describe("Quiet Relay shell state & layout invariants", () => {
     expect(state.surfaceStack).toEqual([]);
   });
 
-  it("derives 1440 rail vs 1280 popover layout at 1340px breakpoint", () => {
+  it("derives rail layout above 1120px and popover at or below 1120px", () => {
     expect(deriveViewportMode(1440)).toBe("rail");
-    expect(deriveViewportMode(1341)).toBe("rail");
-    expect(deriveViewportMode(1340)).toBe("popover");
-    expect(deriveViewportMode(1280)).toBe("popover");
+    expect(deriveViewportMode(1280)).toBe("rail");
+    expect(deriveViewportMode(1121)).toBe("rail");
+    expect(deriveViewportMode(1120)).toBe("popover");
   });
 
   it("closes only the topmost surface on Esc and supports command palette, settings, workspace, and shortcuts", () => {

@@ -426,7 +426,7 @@ test.describe("Electron hardened smoke", () => {
       const page = await electronApp.firstWindow();
       await page.waitForLoadState("load");
       // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
-      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      // still exercise the >1120px desktop rail layout instead of clamping into popover mode.
       await page.setViewportSize({ width: 1440, height: 900 });
       await expect(page.locator("nav.sidebar")).toBeVisible();
 
@@ -621,7 +621,7 @@ test.describe("Electron hardened smoke", () => {
       const page1 = await app1.firstWindow();
       await page1.waitForLoadState("load");
       // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
-      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      // still exercise the >1120px desktop rail layout instead of clamping into popover mode.
       await page1.setViewportSize({ width: 1440, height: 900 });
       await expect(page1.locator("nav.sidebar")).toBeVisible();
       await expect(page1.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
@@ -668,10 +668,10 @@ test.describe("Electron hardened smoke", () => {
         expect(bounds2.width).toBe(1240);
         expect(bounds2.height).toBe(760);
 
-        // At 1240 width (<=1340), popover trigger is shown -> open popover to verify sess-2 active
-        await page2.getByRole("button", { name: /Sessions\s+2/ }).click();
-        const popDialog = page2.getByRole("dialog", { name: "Sessions" });
-        await expect(popDialog.getByRole("button", { name: /Session Two/ })).toHaveAttribute(
+        // At 1240 width (>1120), the session rail stays visible -> verify sess-2 active directly
+        const sidebar2 = page2.locator("nav.sidebar");
+        await expect(sidebar2).toBeVisible();
+        await expect(sidebar2.getByRole("button", { name: /Session Two/ })).toHaveAttribute(
           "aria-current",
           "page",
         );
@@ -791,7 +791,7 @@ test.describe("Electron hardened smoke", () => {
       const page = await electronApp.firstWindow();
       await page.waitForLoadState("load");
       // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
-      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      // still exercise the >1120px desktop rail layout instead of clamping into popover mode.
       await page.setViewportSize({ width: 1440, height: 900 });
       await expect(page.locator("nav.sidebar")).toBeVisible();
 

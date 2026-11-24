@@ -62,6 +62,30 @@ function asStringArray(v: unknown): string[] {
   return v.filter((item): item is string => typeof item === "string");
 }
 
+function deriveGatewayWsUrlFromApiOrigin(apiOrigin: string | undefined): string | undefined {
+  if (!apiOrigin) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(apiOrigin);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+  if (
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash ||
+    (parsed.pathname !== "" && parsed.pathname !== "/")
+  ) {
+    return undefined;
+  }
+  parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+  parsed.pathname = "/api/ws";
+  return parsed.toString();
+}
+
 function mapReasonCodeToFailure(reasonCode: string | undefined, exitCode: number | null): LocalFailureCode {
   switch (reasonCode) {
     case "profile_parked":
@@ -173,7 +197,9 @@ export function parseEnsureOrAttachOutput(
       ? (raw.endpoint as Record<string, unknown>)
       : raw;
 
-  const wsUrl = asOptionalString(ep.ws_url ?? ep.wsUrl ?? ep.url);
+  const wsUrl =
+    asOptionalString(ep.ws_url ?? ep.wsUrl ?? ep.url ?? raw.url) ??
+    deriveGatewayWsUrlFromApiOrigin(asOptionalString(ep.api_origin ?? ep.apiOrigin));
   if (!wsUrl) {
     return {
       kind: "failure",
@@ -191,7 +217,8 @@ export function parseEnsureOrAttachOutput(
     capabilities: asStringArray(ep.capabilities),
     codeSha: asOptionalString(ep.code_sha ?? ep.codeSha),
     wsUrl,
-    wsProtocol: asOptionalString(ep.ws_protocol ?? ep.wsProtocol) ?? GATEWAY_WS_PROTOCOL,
+    wsProtocol:
+      asOptionalString(ep.ws_protocol ?? ep.wsProtocol ?? raw.protocol) ?? GATEWAY_WS_PROTOCOL,
     ticketProtocolPrefix:
       asOptionalString(ep.ticket_protocol_prefix ?? ep.ticketProtocolPrefix) ??
       GATEWAY_TICKET_PREFIX,

@@ -109,10 +109,31 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
     expect(overflow).toBe(false);
   });
 
-  test("E2E-SHELL-01: 1280x800 collapses rail into Sessions popover without overflow", async ({
+  test("E2E-SHELL-01: 1280x800 keeps the 232px session rail visible without page overflow", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/");
+
+    const rail = page.locator("nav.sidebar");
+    await expect(rail).toBeVisible();
+    const railBox = await rail.boundingBox();
+    expect(railBox?.width).toBe(232);
+
+    const documentOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(documentOverflow).toBe(false);
+    const bodyOverflow = await page.evaluate(
+      () => document.body.scrollWidth > document.body.clientWidth,
+    );
+    expect(bodyOverflow).toBe(false);
+  });
+
+  test("E2E-SHELL-01: 1120x700 collapses rail into Sessions popover without overflow", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1120, height: 700 });
     await page.goto("/");
 
     await expect(page.locator("nav.sidebar")).toBeHidden();
@@ -610,7 +631,7 @@ test.describe("E2E-SHELL-01 & E2E-KB-01 Quiet Relay shell", () => {
 });
 
 test.describe("Ticket #31 Session rail, recovery, route banner, and transcript resync", () => {
-  test("E2E-KB-03: 1440 session rail & 1280 Sessions popover support search, keyboard nav, IME composition, aria-current, mouse focus retention, New Chat, and Session Details", async ({
+  test("E2E-KB-03: 1440 session rail & 1120 Sessions popover support search, keyboard nav, IME composition, aria-current, mouse focus retention, New Chat, and Session Details", async ({
     page,
   }) => {
     await page.addInitScript(() => {
@@ -777,8 +798,8 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await expect(sidebar).toContainText("没有匹配的 Session。");
     await searchInput.fill("");
 
-    // 1280x800 Sessions popover (~378x456) with search, New Chat (Cmd+N), and Session Details
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // 1120x700 Sessions popover (~378x456) with search, New Chat (Cmd+N), and Session Details
+    await page.setViewportSize({ width: 1120, height: 700 });
     const popTrigger = page.getByRole("button", { name: /Sessions\s+3/ });
     await popTrigger.click();
     const popDialog = page.getByRole("dialog", { name: "Sessions" });
@@ -1810,8 +1831,8 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     await expect(settingsDialog).toBeHidden();
     await expect(composer).toBeFocused();
 
-    // 4. 1280x800 adaptive check: Scope popover, Settings modal, and Sessions popover CLI deep links
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // 4. 1120x700 adaptive check: Scope popover, Settings modal, and Sessions popover CLI deep links
+    await page.setViewportSize({ width: 1120, height: 700 });
     await scopeChip.click();
     await expect(scopeDialog).toBeVisible();
     await page.keyboard.press("Escape");
@@ -3801,8 +3822,8 @@ test.describe("Ticket #37 Background journal, attention badges, unread mark-read
     await expect(needsInputBadge).toBeVisible();
     await expect(needsInputBadge).toContainText("1");
 
-    // 1280x800 popover still exposes session badges cleanly without global approval inbox
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // 1120x700 popover still exposes session badges cleanly without global approval inbox
+    await page.setViewportSize({ width: 1120, height: 700 });
     await routeStrip.getByRole("button", { name: /Sessions\s+3/ }).click();
     const popover = page.getByRole("dialog", { name: "Sessions" });
     await expect(popover).toBeVisible();
