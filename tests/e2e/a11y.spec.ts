@@ -1737,6 +1737,7 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
     const assertiveRegion = page.getByTestId("live-region-assertive");
     await expect(politeRegion).toHaveCount(1);
     await expect(assertiveRegion).toHaveCount(1);
+    await expect(assertiveRegion).not.toHaveAttribute("role", "alert");
     await expect(politeRegion).toHaveAttribute("aria-atomic", "false");
     await expect(assertiveRegion).toHaveAttribute("aria-atomic", "false");
     await expect(politeRegion).toHaveText("");
@@ -1790,6 +1791,11 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
       "data-announcement-seq",
       assertiveSeq ?? "1",
     );
+
+    await page.locator("#composer-input").fill("x".repeat(1024 * 1024 + 64));
+    const surfaceAlert = page.getByTestId("draft-capacity-alert");
+    await expect(surfaceAlert).toHaveAttribute("role", "alert");
+    await expect(page.getByRole("alert")).toHaveCount(1);
   });
 });
 

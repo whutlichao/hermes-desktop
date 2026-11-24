@@ -3633,7 +3633,6 @@ export default function App() {
         className="sr-only"
         aria-live="assertive"
         aria-atomic="false"
-        role="alert"
         data-testid="live-region-assertive"
         data-announcement-seq={state.assertiveAnnouncementSeq}
       >
