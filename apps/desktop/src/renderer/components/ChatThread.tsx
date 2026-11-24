@@ -27,6 +27,7 @@ import { TurnRecoveryCards } from "./TurnRecoveryCards";
 
 interface ChatThreadProps {
   hasReadyConnection: boolean;
+  isMockMode: boolean;
   activeConnection?: ConnectionHealthSummary | null;
   activeScope: BridgeScope | null;
   activeSessionId: string | null;
@@ -78,6 +79,7 @@ interface ChatThreadProps {
   onRepairLocal: () => void;
   onAddRemote: () => void;
   onAddSsh: () => void;
+  onViewSampleConversation: () => void;
   onDiscardUnknown: (unknown: UnknownTurnRecord) => void;
   onCancelQueued: (admissionId: string) => void;
   onCheckQueueReceipt: (submissionId: string) => void;
@@ -99,6 +101,10 @@ function getToolStatusLabel(status: ToolExecutionRow["status"]): string {
     case "cancelled":
       return getCopy("chat.toolCancelled");
   }
+}
+
+function formatToolDuration(durationMs: number): string {
+  return durationMs < 1000 ? `${durationMs}ms` : `${(durationMs / 1000).toFixed(1)}s`;
 }
 
 function getRoleLabel(role: "user" | "assistant" | "system"): string {
@@ -125,6 +131,7 @@ function getApprovalStatusLabel(status: TranscriptPendingApprovalView["status"])
 
 export function ChatThread({
   hasReadyConnection,
+  isMockMode,
   activeConnection,
   activeScope,
   activeSessionId,
@@ -176,6 +183,7 @@ export function ChatThread({
   onRepairLocal,
   onAddRemote,
   onAddSsh,
+  onViewSampleConversation,
   onDiscardUnknown,
   onCancelQueued,
   onCheckQueueReceipt,
@@ -620,9 +628,19 @@ export function ChatThread({
             </dl>
           )}
           <div className="empty-relay-actions">
+            {isMockMode && (
+              <button
+                type="button"
+                className="button button-primary"
+                data-testid="view-sample-conversation"
+                onClick={onViewSampleConversation}
+              >
+                {getCopy("empty.actionViewSample")}
+              </button>
+            )}
             <button
               type="button"
-              className="button button-primary"
+              className={isMockMode ? "button button-secondary" : "button button-primary"}
               disabled={localBusy}
               onClick={onRepairLocal}
             >
@@ -719,6 +737,24 @@ export function ChatThread({
         </div>
       )}
 
+      {isMockMode && transcript && transcript.messages.length > 0 && (
+        <div
+          role="status"
+          data-testid="sample-conversation-badge"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-start",
+            gap: 6,
+          }}
+        >
+          <span className="status-pill is-warn">{getCopy("chat.sampleBadge")}</span>
+          <span style={{ fontSize: "0.92308rem", color: "var(--ink-soft)" }}>
+            {getCopy("chat.sampleNotice")}
+          </span>
+        </div>
+      )}
+
       {(!transcript || transcript.messages.length === 0) && scopeNewDrafts.length === 0 ? (
         <section
           className="empty-relay-card chat-empty-card"
@@ -786,6 +822,11 @@ export function ChatThread({
                         {getToolStatusLabel(row.status)}
                       </span>
                       {row.summary && <span className="tool-execution-summary">{row.summary}</span>}
+                      {typeof row.durationMs === "number" && (
+                        <span className="tool-execution-summary">
+                          {formatToolDuration(row.durationMs)}
+                        </span>
+                      )}
                     </li>
                   ))}
                 </ul>

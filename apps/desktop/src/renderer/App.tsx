@@ -21,6 +21,7 @@ import {
   type ChatSessionProjection,
   type CheckpointDiffSnapshot,
   type ConnectionKind,
+  type ConnectionMutationResponse,
   type CronJobActionRequest,
   type CronMutationResult,
   type CronSubmitRequest,
@@ -220,6 +221,7 @@ export default function App() {
   }, [state.activeScope?.connectionId, state.connections]);
 
   const hasReadyConnection = Boolean(activeConnection && activeConnection.actual === "ready");
+  const isMockMode = state.appInfo?.mode === "mock";
   const activeScopeConnId = state.activeScope?.connectionId;
   const activeScopeProfileId = state.activeScope?.profileId;
   const activeScopeSessionId = state.activeScope?.sessionId;
@@ -3095,6 +3097,61 @@ export default function App() {
     void handleLocalAction(primary);
   }, [handleLocalAction, state.localInspection?.failure?.actions]);
 
+  const handleViewSampleConversation = useCallback(async () => {
+    if (!isMockMode) return;
+    const sampleLabel = "Demo Lab";
+    const fail = () => dispatch({ type: "ANNOUNCE", message: getCopy("empty.sampleFailed") });
+    const addRes = await host.request<ConnectionMutationResponse>("connections.add", {
+      kind: "ssh",
+      label: sampleLabel,
+      host: "lab.local",
+      user: "demo",
+      seedSample: true,
+    });
+    if (!addRes.ok) {
+      fail();
+      return;
+    }
+    const demoConnection =
+      addRes.value.snapshot.connections.find((connection) => connection.label === sampleLabel) ??
+      null;
+    const connectionId = demoConnection?.id ?? addRes.value.conflict?.existing.id ?? null;
+    if (!connectionId) {
+      fail();
+      return;
+    }
+    const selectRes = await host.request<{
+      fleet?: FleetSnapshot;
+      transcript?: SessionTranscriptSnapshot | null;
+    }>(
+      "sessions.select",
+      { connectionId, profileId: "default" },
+      { connectionId, profileId: "default" },
+    );
+    if (!selectRes.ok) {
+      fail();
+      return;
+    }
+    if (selectRes.value.fleet) {
+      dispatch({
+        type: "APPLY_FLEET_SNAPSHOT",
+        connections: selectRes.value.fleet.connections,
+        profiles: selectRes.value.fleet.profiles,
+        sessions: selectRes.value.fleet.sessions,
+        activeScope: selectRes.value.fleet.activeScope,
+        activeSessionId: selectRes.value.fleet.activeSessionId,
+      });
+    }
+    if (selectRes.value.transcript) {
+      const applied = transcriptSyncRef.current.applySnapshot(
+        selectRes.value.transcript,
+        selectRes.value.transcript.snapshotSeq ?? 0,
+        { replace: true },
+      );
+      dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
+    }
+  }, [isMockMode]);
+
   const handleAnnounce = useCallback((message: string) => {
     dispatch({ type: "ANNOUNCE", message });
   }, []);
@@ -3126,8 +3183,6 @@ export default function App() {
       dispatch({ type: "ANNOUNCE", message: getCopy("gateways.retryConnectionAction") });
     }
   }, [activeConnection?.connectionId, effectiveScope?.connectionId, effectiveScope?.profileId]);
-
-  const isMockMode = state.appInfo?.mode === "mock";
 
   return (
     <>
@@ -3451,6 +3506,7 @@ export default function App() {
             <div className="thread-viewport">
               <ChatThread
                 hasReadyConnection={hasReadyConnection}
+                isMockMode={isMockMode}
                 activeConnection={activeConnection}
                 activeScope={state.activeScope}
                 activeSessionId={state.activeSessionId}
@@ -3504,6 +3560,7 @@ export default function App() {
                 onRepairLocal={handleRepairLocalConnection}
                 onAddRemote={() => openSettingsForAdd("remote")}
                 onAddSsh={() => openSettingsForAdd("ssh")}
+                onViewSampleConversation={() => void handleViewSampleConversation()}
                 onDiscardUnknown={(unknown) => void handleDiscardUnknownTurn(unknown)}
                 onCancelQueued={(admissionId) => void handleCancelQueued(admissionId)}
                 onCheckQueueReceipt={(submissionId) => void handleCheckQueueReceipt(submissionId)}

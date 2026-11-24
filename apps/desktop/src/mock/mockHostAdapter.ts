@@ -122,6 +122,11 @@ import {
   type RawGatewayQueueItem,
   type RawGatewayUnknownTurn,
 } from "@hermes/domain";
+import {
+  SAMPLE_SESSION_TITLE,
+  buildCannedMockReply,
+  buildSampleTranscript,
+} from "./sampleConversation";
 
 declare const __HERMES_MOCK_BUILD_META__:
   | {
@@ -1538,7 +1543,13 @@ export function createMockHostBridge(): HermesHost {
     }
   }
 
-  function seedMockSshConnection(connectionId: string, label: string, host: string, remoteProfile?: string): void {
+  function seedMockSshConnection(
+    connectionId: string,
+    label: string,
+    host: string,
+    remoteProfile?: string,
+    seedSample = false,
+  ): void {
     const defaultProfile = remoteProfile?.trim() || "default";
     const health: ConnectionHealthSummary = {
       connectionId,
@@ -1579,12 +1590,12 @@ export function createMockHostBridge(): HermesHost {
         connectionId,
         profileId: defaultProfile,
         sessionId: `${connectionId}-sess-1`,
-        title: `Remote SSH (${label})`,
-        preview: host,
+        title: seedSample ? SAMPLE_SESSION_TITLE : `Remote SSH (${label})`,
+        preview: seedSample ? "发布准备检查 · typecheck 通过 · 1 个待审批" : host,
         updatedAt: new Date().toISOString(),
         pinned: false,
         unreadCount: 0,
-        needsInput: false,
+        needsInput: seedSample,
         activeTurnId: null,
         status: "idle",
       };
@@ -1603,22 +1614,34 @@ export function createMockHostBridge(): HermesHost {
       };
       mockSessions.push(sess1, sess2);
       for (const s of [sess1, sess2]) {
-        mockTranscripts.set(transcriptKey(connectionId, s.profileId, s.sessionId), {
+        const transcript: SessionTranscriptSnapshot =
+          seedSample && s === sess1
+            ? buildSampleTranscript(connectionId, s.profileId, s.sessionId)
+            : {
+                connectionId,
+                profileId: s.profileId,
+                sessionId: s.sessionId,
+                messages: [],
+                activeTurnId: null,
+                turnStopping: false,
+                chatAvailable: true,
+                supportedActions: {
+                  promptSubmit: true,
+                  promptCancel: true,
+                  promptSteer: true,
+                  sessionCreate: true,
+                  sessionResume: true,
+                },
+              };
+        mockTranscripts.set(transcriptKey(connectionId, s.profileId, s.sessionId), transcript);
+      }
+      if (seedSample) {
+        mockActiveScope = {
           connectionId,
-          profileId: s.profileId,
-          sessionId: s.sessionId,
-          messages: [],
-          activeTurnId: null,
-          turnStopping: false,
-          chatAvailable: true,
-          supportedActions: {
-            promptSubmit: true,
-            promptCancel: true,
-            promptSteer: true,
-            sessionCreate: true,
-            sessionResume: true,
-          },
-        });
+          profileId: defaultProfile,
+          sessionId: sess1.sessionId,
+        };
+        mockActiveSessionId = sess1.sessionId;
       }
     }
     emitMockFleet();
@@ -2074,6 +2097,7 @@ export function createMockHostBridge(): HermesHost {
           check.connection.label,
           formatSshTargetDisplay(check.connection) ?? check.connection.host ?? check.connection.id,
           check.connection.remoteProfile,
+          payload.seedSample === true,
         );
       }
       return {
@@ -4018,6 +4042,7 @@ export function createMockHostBridge(): HermesHost {
       const userMsgId = `mock-u-${Date.now()}-${mockTurnSeq}`;
       const assistantMsgId = `mock-a-${Date.now()}-${mockTurnSeq}`;
       const keepRunning = Boolean(liveFix?.turnRecovery?.keepSendRunning);
+      const cannedReply = buildCannedMockReply(text, mockTurnSeq);
       const userMsg = {
         messageId: userMsgId,
         sessionId: sid,
@@ -4031,11 +4056,12 @@ export function createMockHostBridge(): HermesHost {
         messageId: assistantMsgId,
         sessionId: sid,
         role: "assistant" as const,
-        text: keepRunning ? "" : `Mock Gateway (${cid}) received: ${text}`,
+        text: keepRunning ? "" : cannedReply.text,
         createdAt: now,
         turnId,
         streaming: keepRunning,
         status: keepRunning ? ("streaming" as const) : ("complete" as const),
+        ...(!keepRunning && cannedReply.toolRows ? { toolRows: cannedReply.toolRows } : {}),
       };
       if (tx) {
         const nextTx: SessionTranscriptSnapshot = {
