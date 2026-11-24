@@ -534,6 +534,19 @@ export class ConnectionSupervisor {
     }
   }
 
+  private retireLocalProfileAlias(
+    connectionId: string,
+    requestedProfileId: string,
+    resolvedProfileId: string,
+  ): void {
+    if (connectionId !== "local" || requestedProfileId === resolvedProfileId) return;
+    const key = scopeKey(connectionId, requestedProfileId);
+    const alias = this.linksByKey.get(key);
+    if (!alias) return;
+    this.clearLinkTimers(alias);
+    this.linksByKey.delete(key);
+  }
+
   private getLinksForConnection(connectionId: string): ConnectionLinkState[] {
     const out: ConnectionLinkState[] = [];
     for (const link of this.linksByKey.values()) {
@@ -2803,6 +2816,9 @@ export class ConnectionSupervisor {
       nextRetryAt: null,
     });
     this.markLinkReady(connectionId, dial.profileId, latencyMs);
+    if ("cliProfileId" in dial) {
+      this.retireLocalProfileAlias(connectionId, dial.cliProfileId, dial.profileId);
+    }
 
     await this.refreshProfiles(entry, dial.profileId);
     const sessions = await this.refreshSessionsForProfile(entry, dial.profileId);
