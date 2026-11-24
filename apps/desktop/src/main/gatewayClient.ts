@@ -249,6 +249,9 @@ export class GatewayClient {
     if (this.closed) return;
     this.closed = true;
     this.pendingDisconnectReason = reason;
+    // Do not trust a dispatch flag left behind by an in-flight chain: any frames
+    // already parsed must still drain before close cleanup runs.
+    this.textFrameDispatchScheduled = false;
     if (this.pendingTextFrames.length === 0) {
       this.finishDisconnect();
       return;
@@ -382,7 +385,8 @@ export class GatewayClient {
       // A socket read can coalesce an RPC reply with notifications that follow it.
       // Yield to the event loop between frames so the full async continuation of a
       // reply (which applies admission state) runs before deltas or terminal events
-      // that arrived in the same socket read.
+      // that arrived in the same socket read. Admission must be applied without
+      // real I/O awaits before this yield, or a later frame can overtake it.
       setImmediate(() => this.dispatchNextTextFrame());
     }
   }

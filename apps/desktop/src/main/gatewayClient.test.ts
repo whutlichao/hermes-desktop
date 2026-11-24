@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   encodeServerTextFrame,
   startFakeGatewayServer,
@@ -27,8 +27,12 @@ describe("GatewayClient frame dispatch ordering", () => {
       order.push(`notification:${method}`);
     });
 
-    const call = client.call("prompt.submit", { session_id: "s-1" }).then(() => {
-      order.push("continuation");
+    const call = client.call("prompt.submit", { session_id: "s-1" }).then(async () => {
+      order.push("continuation:start");
+      await Promise.resolve();
+      order.push("continuation:admission");
+      await Promise.resolve();
+      order.push("continuation:end");
     });
 
     const frames = Buffer.concat([
@@ -47,7 +51,12 @@ describe("GatewayClient frame dispatch ordering", () => {
 
     await call;
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(order).toEqual(["continuation", "notification:prompt.delta"]);
+    expect(order).toEqual([
+      "continuation:start",
+      "continuation:admission",
+      "continuation:end",
+      "notification:prompt.delta",
+    ]);
   });
 
   it("delivers parsed notifications in FIFO order before close cleanup rejects outstanding RPCs", async () => {
@@ -135,6 +144,57 @@ describe("GatewayClient frame dispatch ordering", () => {
     await expect(closed).resolves.toBe("client_closed");
     await outstandingCall;
     expect(events).toEqual(["close"]);
+    expect(client.isOpen()).toBe(false);
+  });
+
+  it("resets a stale dispatch flag at disconnect entry so parsed frames still drain before close", async () => {
+    gw = await startFakeGatewayServer({
+      validTickets: new Set(["tkt-close-stale"]),
+      onRpc: () => true,
+    });
+    client = await GatewayClient.connect({ wsUrl: gw.wsUrl, ticket: "tkt-close-stale" });
+
+    const events: string[] = [];
+    client.onNotification((method) => {
+      events.push(`notification:${method}`);
+    });
+    client.onClose((reason) => {
+      events.push(`close:${reason}`);
+    });
+
+    const scheduled: Array<() => void> = [];
+    const setImmediateSpy = vi
+      .spyOn(globalThis, "setImmediate")
+      .mockImplementation(((callback: () => void) => {
+        scheduled.push(callback);
+        return 0 as unknown as NodeJS.Immediate;
+      }) as typeof setImmediate);
+
+    try {
+      const internals = client as unknown as {
+        pendingTextFrames: string[];
+        textFrameDispatchScheduled: boolean;
+        handleDisconnect(reason: string): void;
+      };
+      internals.pendingTextFrames.push(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "prompt.delta",
+          params: { session_id: "s-1", delta: "stale" },
+        }),
+      );
+      internals.textFrameDispatchScheduled = true;
+      internals.handleDisconnect("socket_closed");
+
+      expect(scheduled).toHaveLength(1);
+      while (scheduled.length > 0) {
+        scheduled.shift()!();
+      }
+    } finally {
+      setImmediateSpy.mockRestore();
+    }
+
+    expect(events).toEqual(["notification:prompt.delta", "close:socket_closed"]);
     expect(client.isOpen()).toBe(false);
   });
 });
