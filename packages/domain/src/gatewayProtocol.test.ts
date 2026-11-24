@@ -746,8 +746,8 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
     expect(capList).toMatchObject({
       chatAvailable: true,
       promptSubmit: true,
-      promptCancel: true,
-      promptSteer: true,
+      promptCancel: false,
+      promptSteer: false,
       sessionCreate: false,
       sessionResume: false,
       sessionList: false,
@@ -776,6 +776,111 @@ describe("Gateway protocol v1 parsing, capabilities & redaction (S0)", () => {
     expect(filterSessionsForScope([], null)).toEqual([]);
     expect(filterProfilesForConnection([], null)).toEqual([]);
     expect(filterProfilesForConnection([], "")).toEqual([]);
+  });
+
+  it("classifies the Hermes 0.23.3 runtime capability tags without a served_methods catalog", () => {
+    const caps = classifyRuntimeCapabilities({
+      runtime_protocol: 1,
+      capabilities: [
+        "durable-admission-v1",
+        "event-replay-v1",
+        "local-cli-create-v1",
+        "acp-editor-policy-v1",
+        "acp-session-mcp-v1",
+        "clarify-batch-v1",
+        "plugin-rpc-v1",
+        "session-client-v1",
+        "session-transcript-v1",
+        "session-list-picker-v1",
+        "session-list-cursor-v1",
+      ],
+      session_create: {
+        sources: ["acp", "cli", "gui", "oneshot", "tool", "tui"],
+        parameters: ["title", "source"],
+      },
+    });
+
+    expect(caps).toEqual({
+      chatAvailable: true,
+      promptSubmit: true,
+      promptCancel: true,
+      promptSteer: true,
+      sessionCreate: true,
+      sessionResume: true,
+      sessionList: true,
+      sessionTranscript: true,
+      profilesList: true,
+    });
+  });
+
+  it("derives only the capability each runtime tag actually asserts, and does not over-claim from a partial tag set", () => {
+    const localCreateOnly = classifyRuntimeCapabilities({
+      capabilities: ["local-cli-create-v1"],
+    });
+    expect(localCreateOnly).toEqual({
+      chatAvailable: false,
+      promptSubmit: false,
+      promptCancel: false,
+      promptSteer: false,
+      sessionCreate: true,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: false,
+      profilesList: false,
+    });
+
+    const durableAdmissionOnly = classifyRuntimeCapabilities({
+      capabilities: ["durable-admission-v1"],
+    });
+    expect(durableAdmissionOnly).toEqual({
+      chatAvailable: true,
+      promptSubmit: true,
+      promptCancel: false,
+      promptSteer: false,
+      sessionCreate: false,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: false,
+      profilesList: false,
+    });
+
+    expect(
+      classifyRuntimeCapabilities({ capabilities: ["session-transcript-v1"] }).sessionTranscript,
+    ).toBe(true);
+    expect(
+      classifyRuntimeCapabilities({ capabilities: ["session-list-picker-v1"] }).sessionList,
+    ).toBe(true);
+    expect(
+      classifyRuntimeCapabilities({ capabilities: ["session-list-cursor-v1"] }).sessionList,
+    ).toBe(true);
+
+    // session-client-v1 is attribution only (session.create "client"), never a chat/session surface.
+    const sessionClientOnly = classifyRuntimeCapabilities({
+      capabilities: ["session-client-v1"],
+    });
+    expect(Object.values(sessionClientOnly).every((value) => value === false)).toBe(true);
+
+    // A partial canonical set must not unlock cancel/steer/resume/profiles just because it has
+    // admission + local create + transcript.
+    const partialCanonical = classifyRuntimeCapabilities({
+      capabilities: [
+        "durable-admission-v1",
+        "local-cli-create-v1",
+        "session-client-v1",
+        "session-transcript-v1",
+      ],
+    });
+    expect(partialCanonical).toEqual({
+      chatAvailable: true,
+      promptSubmit: true,
+      promptCancel: false,
+      promptSteer: false,
+      sessionCreate: true,
+      sessionResume: false,
+      sessionList: false,
+      sessionTranscript: true,
+      profilesList: false,
+    });
   });
 
   it("reduces transcript snapshots, unknown scopes, upserts, turn state, and sync-controller resets", () => {

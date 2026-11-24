@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type {
   ActivityEventPayload,
   ActiveChatRef,
@@ -249,6 +250,97 @@ function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+type PromptSubmitReceiptClass =
+  | { kind: "accepted"; receipt: "accepted" }
+  | { kind: "admitted"; receipt: "admitted" }
+  | { kind: "delivery_unknown"; receipt: "delivery_unknown" }
+  | { kind: "unconfirmed"; receipt: string };
+
+const PROMPT_SUBMIT_NEGATIVE_RECEIPTS = new Set([
+  "error",
+  "rejected",
+  "failed",
+  "denied",
+  "cancelled",
+  "canceled",
+  "invalid",
+  "invalid_params",
+]);
+
+function classifyPromptSubmitReceipt(res: Record<string, unknown>): PromptSubmitReceiptClass {
+  const receiptRaw = asString(res.receipt).trim().toLowerCase();
+  const statusRaw = asString(res.status).trim().toLowerCase();
+  const admissionId = asString(res.admission_id ?? res.admissionId).trim();
+  const hasAdmissionReference =
+    Boolean(admissionId) ||
+    (res.admission !== undefined && res.admission !== null) ||
+    (res.ref !== undefined && res.ref !== null && typeof res.ref === "object");
+  if (
+    res.delivery_unknown === true ||
+    res.deliveryUnknown === true ||
+    receiptRaw === "delivery_unknown" ||
+    receiptRaw === "unknown" ||
+    statusRaw === "unknown"
+  ) {
+    return { kind: "delivery_unknown", receipt: "delivery_unknown" };
+  }
+  if (
+    PROMPT_SUBMIT_NEGATIVE_RECEIPTS.has(receiptRaw) ||
+    PROMPT_SUBMIT_NEGATIVE_RECEIPTS.has(statusRaw)
+  ) {
+    return { kind: "unconfirmed", receipt: receiptRaw || statusRaw || "unconfirmed" };
+  }
+  if (res.accepted === false || res.admitted === false) {
+    return { kind: "unconfirmed", receipt: receiptRaw || statusRaw || "rejected" };
+  }
+  if (
+    res.admitted === true ||
+    receiptRaw === "admitted" ||
+    statusRaw === "admitted"
+  ) {
+    return { kind: "admitted", receipt: "admitted" };
+  }
+  if (res.accepted === true || receiptRaw === "accepted" || statusRaw === "accepted") {
+    return { kind: "accepted", receipt: "accepted" };
+  }
+  if (
+    (statusRaw === "queued" || statusRaw === "started" || statusRaw === "terminal") &&
+    hasAdmissionReference
+  ) {
+    return { kind: "admitted", receipt: "admitted" };
+  }
+  // Legacy prompt.submit returns a concrete turn id on success and carries no receipt envelope.
+  // An empty or malformed response stays unconfirmed so the draft is never cleared speculatively.
+  const legacyTurnId = asString(res.turn_id ?? res.turnId).trim();
+  if (
+    legacyTurnId &&
+    res.receipt === undefined &&
+    res.status === undefined &&
+    res.accepted === undefined &&
+    res.admitted === undefined
+  ) {
+    return { kind: "accepted", receipt: "accepted" };
+  }
+  return { kind: "unconfirmed", receipt: receiptRaw || statusRaw || "unconfirmed" };
+}
+
+function mergeSessionListFeeds(
+  stored: Array<Record<string, unknown>>,
+  live: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const row of stored) {
+    const id = asString(row.session_id ?? row.sessionId ?? row.id).trim();
+    if (id) byId.set(id, row);
+  }
+  for (const row of live) {
+    const id = asString(row.session_id ?? row.sessionId ?? row.id).trim();
+    if (!id) continue;
+    byId.set(id, { ...(byId.get(id) ?? {}), ...row });
+  }
+  return [...byId.values()];
+}
+
 function mapRawSession(
   raw: Record<string, unknown>,
   connectionId: string,
@@ -351,8 +443,221 @@ function isRpcAuthError(err: unknown): boolean {
 function isProfileUnavailableRpcError(err: unknown): boolean {
   if (!(err instanceof GatewayRpcError)) return false;
   if (err.rpcCode === -32004) return true;
-  const msg = err.message.toLowerCase();
+  const reason = err.reason?.toLowerCase();
+  if (
+    reason === "profile_not_served" ||
+    reason === "profile_mismatch" ||
+    reason === "profile_unavailable" ||
+    reason === "profile_parked"
+  ) {
+    return true;
+  }
+  const msg = `${err.rpcMessage ?? ""} ${err.message}`.toLowerCase();
   return msg.includes("profile_not_served") || msg.includes("profile_mismatch") || msg.includes("profile_unavailable");
+}
+
+function isInvalidParamsRpcError(err: unknown): boolean {
+  if (!(err instanceof GatewayRpcError)) return false;
+  if (err.reason === "invalid_params") return true;
+  return err.rpcMessage?.toLowerCase() === "invalid_params";
+}
+
+function normalizeCanonicalInterruptReceipt(
+  res: Record<string, unknown>,
+): Record<string, unknown> {
+  // `session.interrupt` returns a CanonicalSessionHandle, not a legacy stop receipt. The handle
+  // proves the interrupt was accepted; the turn is still stopping until prompt.stopped/terminal.
+  return {
+    ...res,
+    accepted: true,
+    status: "stopping",
+    ...(typeof res.execution_generation === "number"
+      ? { execution_generation: res.execution_generation }
+      : {}),
+  };
+}
+
+function normalizeCanonicalQueuedCancelReceipt(
+  res: Record<string, unknown>,
+): Record<string, unknown> {
+  const status = asString(res.status).toLowerCase();
+  if (status === "started") {
+    return { ...res, status: "already_started" };
+  }
+  if (status === "unknown") {
+    return { ...res, status: "cancel_unknown" };
+  }
+  if (status !== "terminal") {
+    return res;
+  }
+  const outcome = asString(res.outcome).toLowerCase();
+  const mapped =
+    outcome === "cancelled" || outcome === "canceled"
+      ? "cancelled"
+      : outcome === "stopped" || outcome === "interrupted"
+        ? outcome
+        : outcome === "completed" || outcome === "settled"
+          ? "completed"
+          : outcome === "failed" || outcome === "error"
+            ? "error"
+            : "cancel_unknown";
+  return { ...res, status: mapped };
+}
+
+interface CanonicalPendingAdmission {
+  admissionId: string;
+  inputId: string;
+  text: string;
+  status: "queued" | "started" | "unknown";
+  executionGeneration?: number;
+  position: number;
+}
+
+interface CanonicalPendingProjection {
+  present: boolean;
+  admissions: CanonicalPendingAdmission[];
+  unknownTurns: RawGatewayUnknownTurn[];
+  queuedAdmissions: RawGatewayQueueItem[];
+}
+
+function projectCanonicalPending(
+  rawResult: Record<string, unknown> | null | undefined,
+): CanonicalPendingProjection {
+  if (!Array.isArray(rawResult?.pending)) {
+    return { present: false, admissions: [], unknownTurns: [], queuedAdmissions: [] };
+  }
+  const admissions: CanonicalPendingAdmission[] = [];
+  const unknownTurns: RawGatewayUnknownTurn[] = [];
+  const queuedAdmissions: RawGatewayQueueItem[] = [];
+  rawResult.pending.forEach((raw, index) => {
+    if (!raw || typeof raw !== "object") return;
+    const row = raw as Record<string, unknown>;
+    const admissionId = asString(row.admission_id ?? row.admissionId).trim();
+    const inputId = asString(row.input_id ?? row.inputId).trim();
+    const statusRaw = asString(row.status).trim().toLowerCase();
+    const status =
+      statusRaw === "queued" || statusRaw === "started" || statusRaw === "unknown"
+        ? statusRaw
+        : null;
+    if (!status) return;
+    const text = typeof row.text === "string" ? row.text : "";
+    const executionGenerationRaw = row.execution_generation ?? row.executionGeneration;
+    const executionGeneration =
+      typeof executionGenerationRaw === "number" && Number.isFinite(executionGenerationRaw)
+        ? executionGenerationRaw
+        : undefined;
+
+    if (status === "unknown") {
+      // Keep even an incomplete row so reconcileFromResume can surface a protocol error rather
+      // than silently dropping an unknown admission.
+      unknownTurns.push({
+        ...(admissionId ? { admission_id: admissionId } : {}),
+        ...(executionGeneration !== undefined
+          ? { execution_generation: executionGeneration }
+          : {}),
+        ...(text ? { text } : {}),
+      });
+      // The row still carries its request identity, so prompt.receipt can address it even though
+      // it must never be projected into the queued-admission list.
+      if (admissionId && inputId) {
+        admissions.push({
+          admissionId,
+          inputId,
+          text,
+          status,
+          ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+          position: index + 1,
+        });
+      }
+      return;
+    }
+    if (!admissionId || !inputId) return;
+
+    const admission: CanonicalPendingAdmission = {
+      admissionId,
+      inputId,
+      text,
+      status,
+      ...(executionGeneration !== undefined ? { executionGeneration } : {}),
+      position: index + 1,
+    };
+    admissions.push(admission);
+    queuedAdmissions.push({
+      admission_id: admissionId,
+      submission_id: inputId,
+      text,
+      position: index + 1,
+      status,
+      ...(executionGeneration !== undefined
+        ? { execution_generation: executionGeneration }
+        : {}),
+    });
+  });
+  return { present: true, admissions, unknownTurns, queuedAdmissions };
+}
+
+function canonicalTerminalState(outcome: string): QueuedAdmissionState | null {
+  switch (outcome) {
+    case "cancelled":
+    case "canceled":
+      return "cancelled";
+    case "stopped":
+      return "stopped";
+    case "interrupted":
+      return "interrupted";
+    case "completed":
+    case "settled":
+      return "completed";
+    case "failed":
+    case "error":
+      return "error";
+    default:
+      return null;
+  }
+}
+
+function canonicalReceiptToQueueItem(
+  receipt: Record<string, unknown>,
+  pending: CanonicalPendingAdmission,
+  submissionId: string,
+): RawGatewayQueueItem | null {
+  const admissionId = asString(receipt.admission_id ?? receipt.admissionId).trim();
+  const status = asString(receipt.status).trim().toLowerCase();
+  if (!admissionId || admissionId !== pending.admissionId) return null;
+  const state =
+    status === "queued"
+      ? "queued"
+      : status === "started"
+        ? "started"
+        : status === "terminal"
+          ? canonicalTerminalState(asString(receipt.outcome).trim().toLowerCase())
+          : null;
+  if (!state) return null;
+  const executionGenerationRaw =
+    receipt.execution_generation ?? receipt.executionGeneration ?? pending.executionGeneration;
+  const executionGeneration =
+    typeof executionGenerationRaw === "number" && Number.isFinite(executionGenerationRaw)
+      ? executionGenerationRaw
+      : undefined;
+  return {
+    admission_id: admissionId,
+    submission_id: submissionId,
+    text: pending.text,
+    position: pending.position,
+    state,
+    ...(executionGeneration !== undefined
+      ? { execution_generation: executionGeneration }
+      : {}),
+  };
+}
+
+function normalizeCanonicalResolveUnknownReceipt(
+  res: Record<string, unknown>,
+): Record<string, unknown> {
+  const status = asString(res.status).trim().toLowerCase();
+  // Canonical resolve_unknown returns AdmissionStatus. Only a terminal row proves the unknown
+  // admission was acknowledged; queued/started/unknown must not remove it locally.
+  return { ...res, settled: status === "terminal" };
 }
 
 export class ConnectionSupervisor {
@@ -3146,12 +3451,18 @@ export class ConnectionSupervisor {
       const existingById = new Map(currentProfiles.map((p) => [p.profileId, p]));
 
       for (const raw of rawProfiles) {
-        const pid = asString(raw.profile_id ?? raw.profileId ?? raw.id).trim();
+        const name = asString(raw.name).trim();
+        const pid = asString(raw.profile_id ?? raw.profileId ?? raw.id ?? raw.path).trim();
         if (!pid) continue;
         seenIds.add(pid);
-        const displayName = asString(raw.display_name ?? raw.displayName, pid) || pid;
-        const handle = asString(raw.handle, pid) || pid;
-        const isDefault = Boolean(raw.is_default ?? raw.isDefault ?? pid === "default");
+        const explicitDisplayName = asString(raw.display_name ?? raw.displayName).trim();
+        const displayName = explicitDisplayName || name || pid;
+        const handle = asString(raw.handle).trim() || name || pid;
+        const defaultFlag = raw.is_default ?? raw.isDefault;
+        const isDefault =
+          typeof defaultFlag === "boolean"
+            ? defaultFlag
+            : name === "default" || pid === "default";
         const initialDesired: ConnectionDesiredState =
           isDefault || pid === activeProfileId ? "enabled" : "disabled";
         const link = this.ensureLinkState(connectionId, pid, initialDesired);
@@ -3250,16 +3561,58 @@ export class ConnectionSupervisor {
   ): Promise<SessionSummary[]> {
     const connectionId = entry.connectionId;
     let rawList: Array<Record<string, unknown>> = [];
-    const callList = async (method: string) => {
-      const res = await entry.client.call<{ sessions?: Array<Record<string, unknown>> }>(method, {
-        profile_id: profileId,
-      });
+    const callList = async (
+      method: string,
+      extraParams: Record<string, unknown> = {},
+    ) => {
+      const res = await entry.client.call<{ sessions?: Array<Record<string, unknown>> }>(
+        method,
+        {
+          ...this.gatewayProfileParams(entry, profileId),
+          ...extraParams,
+        },
+      );
       return Array.isArray(res?.sessions) ? res.sessions : [];
     };
 
     if (entry.capabilities.sessionList) {
       try {
-        rawList = await callList("session.list");
+        const runtimeCapabilities = Array.isArray(entry.describeResult?.capabilities)
+          ? entry.describeResult.capabilities.filter(
+              (capability): capability is string => typeof capability === "string",
+            )
+          : [];
+        const supportsScopedLiveFeed =
+          runtimeCapabilities.includes("session-list-picker-v1") ||
+          runtimeCapabilities.includes("session-list-cursor-v1");
+
+        if (supportsScopedLiveFeed) {
+          // picker/cursor are the owner's promise that both scoped feeds exist. A refusal here is
+          // a protocol failure, not an older Gateway; returning stored-only would hide it.
+          const stored = await callList("session.list", { scope: "stored" });
+          const live = await callList("session.list", { scope: "live" });
+          rawList = mergeSessionListFeeds(stored, live);
+        } else {
+          try {
+            const stored = await callList("session.list", { scope: "stored" });
+            let live: Array<Record<string, unknown>> = [];
+            try {
+              live = await callList("session.list", { scope: "live" });
+            } catch (err) {
+              if (!isJsonRpcMethodNotFound(err) && !isInvalidParamsRpcError(err)) {
+                throw err;
+              }
+              // Older owners may not serve the live scope; the stored picker feed still stands.
+            }
+            rawList = mergeSessionListFeeds(stored, live);
+          } catch (err) {
+            if (!isInvalidParamsRpcError(err)) {
+              throw err;
+            }
+            // Older owners serve a singular session.list with no scope parameter.
+            rawList = await callList("session.list");
+          }
+        }
       } catch (err) {
         if (isProfileUnavailableRpcError(err)) {
           this.markProfileUnavailable(connectionId, profileId, err);
@@ -3267,7 +3620,7 @@ export class ConnectionSupervisor {
         }
         if (isRpcAuthError(err) && connectionId !== "local") {
           this.markConnectionAuthRequired(connectionId);
-        } else {
+        } else if (isJsonRpcMethodNotFound(err)) {
           try {
             rawList = await callList("sessions.list");
           } catch (err2) {
@@ -3277,8 +3630,12 @@ export class ConnectionSupervisor {
             }
             if (isJsonRpcMethodNotFound(err2)) {
               entry.capabilities.sessionList = false;
+            } else {
+              throw err2;
             }
           }
+        } else {
+          throw err;
         }
       }
     }
@@ -3400,7 +3757,7 @@ export class ConnectionSupervisor {
     if (entry.supportedActions.sessionResume) {
       try {
         rawResult = await entry.client.call<Record<string, unknown>>("session.resume", {
-          profile_id: profileId,
+          ...this.gatewayProfileParams(entry, profileId),
           session_id: sessionId,
         });
       } catch (err) {
@@ -3413,7 +3770,7 @@ export class ConnectionSupervisor {
     if (!rawResult && entry.capabilities.sessionTranscript) {
       try {
         rawResult = await entry.client.call<Record<string, unknown>>("session.transcript", {
-          profile_id: profileId,
+          ...this.gatewayProfileParams(entry, profileId),
           session_id: sessionId,
         });
       } catch (err) {
@@ -3483,14 +3840,23 @@ export class ConnectionSupervisor {
       rawResult && typeof (rawResult.execution_generation ?? rawResult.executionGeneration) === "number"
         ? Number(rawResult.execution_generation ?? rawResult.executionGeneration)
         : undefined;
-    const rawUnknownTurns = rawResult
-      ? ((rawResult.unknown_turns ?? rawResult.unknownTurns) as RawGatewayUnknownTurn[] | undefined)
-      : undefined;
-    const rawQueue = rawResult
-      ? ((rawResult.queued_admissions ?? rawResult.queuedAdmissions ?? rawResult.queue) as
-          | RawGatewayQueueItem[]
-          | undefined)
-      : undefined;
+    const canonicalPending = this.usesCanonicalSessionControlWire(entry)
+      ? projectCanonicalPending(rawResult)
+      : null;
+    const rawUnknownTurns = canonicalPending?.present
+      ? canonicalPending.unknownTurns
+      : rawResult
+        ? ((rawResult.unknown_turns ?? rawResult.unknownTurns) as
+            | RawGatewayUnknownTurn[]
+            | undefined)
+        : undefined;
+    const rawQueue = canonicalPending?.present
+      ? canonicalPending.queuedAdmissions
+      : rawResult
+        ? ((rawResult.queued_admissions ?? rawResult.queuedAdmissions ?? rawResult.queue) as
+            | RawGatewayQueueItem[]
+            | undefined)
+        : undefined;
     const rawLastOutcome = rawResult
       ? ((rawResult.last_turn_outcome ?? rawResult.lastTurnOutcome) as
           | "completed"
@@ -3512,6 +3878,7 @@ export class ConnectionSupervisor {
           ...(gwExecGen !== undefined ? { executionGeneration: gwExecGen } : {}),
           ...(Array.isArray(rawUnknownTurns) ? { unknownTurns: rawUnknownTurns } : {}),
           ...(Array.isArray(rawQueue) ? { queuedAdmissions: rawQueue } : {}),
+          ...(canonicalPending?.present ? { queueSnapshotProvesAbsence: false } : {}),
           ...(rawLastOutcome !== undefined ? { lastTurnOutcome: rawLastOutcome } : {}),
         })
       : this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
@@ -5187,6 +5554,87 @@ export class ConnectionSupervisor {
     }
   }
 
+  private gatewayProfileParams(
+    entry: GatewayTransportEntry,
+    profileId: string,
+  ): { profile?: string; profile_id?: string } {
+    if (entry.transportMode === "per-profile") {
+      // Local per-Profile sockets are already bound to their Profile. Remote and legacy SSH
+      // transports predate the host-scoped `profile` handle and keep their explicit `profile_id`
+      // routing key; the profile-scoped SSH ticket is proven separately by its `--profile` attach.
+      if (entry.kind === "local") {
+        return {};
+      }
+      return profileId ? { profile_id: profileId } : {};
+    }
+    if (profileId && profileId !== entry.defaultProfileId) {
+      const handle = this.profilesByConnection
+        .get(entry.connectionId)
+        ?.find((profile) => profile.profileId === profileId)
+        ?.handle.trim();
+      return { profile: handle || profileId };
+    }
+    return {};
+  }
+
+  private usesCanonicalSessionControlWire(entry: GatewayTransportEntry): boolean {
+    if (entry.kind === "remote") {
+      return false;
+    }
+    if (entry.kind === "ssh" && entry.transportMode === "per-profile") {
+      return false;
+    }
+    const rawCapabilities = entry.describeResult?.capabilities;
+    if (!Array.isArray(rawCapabilities)) {
+      return false;
+    }
+    const has = (tag: string) => rawCapabilities.includes(tag);
+    return (
+      has("local-cli-create-v1") &&
+      has("durable-admission-v1") &&
+      has("session-transcript-v1") &&
+      has("session-list-picker-v1") &&
+      has("session-list-cursor-v1")
+    );
+  }
+
+  private async callPromptSubmit(
+    entry: GatewayTransportEntry,
+    profileId: string,
+    params: Record<string, unknown>,
+  ): Promise<{
+    res: Record<string, unknown>;
+    classification: PromptSubmitReceiptClass;
+  }> {
+    const res = await entry.client.call<Record<string, unknown>>("prompt.submit", {
+      ...this.gatewayProfileParams(entry, profileId),
+      ...params,
+    });
+    return { res, classification: classifyPromptSubmitReceipt(res) };
+  }
+
+  private normalizeQueuedPromptSubmit(
+    submitted: Awaited<ReturnType<ConnectionSupervisor["callPromptSubmit"]>>,
+  ): Record<string, unknown> {
+    if (submitted.classification.kind === "delivery_unknown") {
+      return {
+        ...submitted.res,
+        accepted: false,
+        delivery_unknown: true,
+        receipt: "delivery_unknown",
+      };
+    }
+    if (submitted.classification.kind === "unconfirmed") {
+      return {
+        ...submitted.res,
+        accepted: false,
+        admitted: false,
+        status: submitted.classification.receipt,
+      };
+    }
+    return submitted.res;
+  }
+
   private translateRpcFailure(
     entry: GatewayTransportEntry,
     err: unknown,
@@ -5210,6 +5658,9 @@ export class ConnectionSupervisor {
         "not_found",
         getLocalFailureCopy("profile_unavailable").whatHappened,
       );
+    }
+    if (isInvalidParamsRpcError(err)) {
+      throw makeBridgeError("invalid_request", getCopy("connection.invalidRequestError"));
     }
     if (isJsonRpcMethodNotFound(err)) {
       if (singleAction) {
@@ -5829,7 +6280,7 @@ export class ConnectionSupervisor {
       let res: Record<string, unknown>;
       try {
         res = await entry.client.call<Record<string, unknown>>("session.create", {
-          profile_id: profileId,
+          ...this.gatewayProfileParams(entry, profileId),
           title,
         });
       } catch (err) {
@@ -5976,12 +6427,18 @@ export class ConnectionSupervisor {
         this.emitChatState();
       }
 
-      let res: Record<string, unknown>;
+      let submitted: Awaited<ReturnType<ConnectionSupervisor["callPromptSubmit"]>>;
       try {
-        res = await entry.client.call<Record<string, unknown>>("prompt.submit", {
-          profile_id: profileId,
+        const submissionId =
+          typeof payload.submissionId === "string" && payload.submissionId.trim()
+            ? payload.submissionId.trim()
+            : typeof payload.draftId === "string" && payload.draftId.trim()
+              ? payload.draftId.trim()
+              : crypto.randomUUID();
+        submitted = await this.callPromptSubmit(entry, profileId, {
           session_id: sessionId,
           text,
+          submission_id: submissionId,
         });
       } catch (err) {
         if (this.chatSessionStateStore && !isJsonRpcMethodNotFound(err)) {
@@ -6001,8 +6458,8 @@ export class ConnectionSupervisor {
         this.translateRpcFailure(entry, err, "promptSubmit", "prompt.submit", profileId);
       }
 
-      const rawReceipt = asString(res.receipt ?? res.status).toLowerCase();
-      if (rawReceipt === "delivery_unknown" || res.delivery_unknown === true) {
+      const { res, classification } = submitted;
+      if (classification.kind === "delivery_unknown") {
         if (this.chatSessionStateStore) {
           this.chatSessionStateStore.markDraftDeliveryStatus(draftRef, "delivery_unknown");
           this.emitChatState();
@@ -6015,8 +6472,19 @@ export class ConnectionSupervisor {
         };
       }
 
-      const receipt =
-        rawReceipt === "admitted" || res.admitted === true ? "admitted" : "accepted";
+      if (classification.kind === "unconfirmed") {
+        if (this.chatSessionStateStore) {
+          this.chatSessionStateStore.markDraftDeliveryStatus(draftRef, "idle");
+          this.emitChatState();
+        }
+        return {
+          accepted: false,
+          receipt: classification.receipt,
+          sessionId,
+        };
+      }
+
+      const receipt = classification.receipt;
       if (this.chatSessionStateStore) {
         this.chatSessionStateStore.clearDraftOnReceipt(draftRef, receipt);
         this.emitChatState();
@@ -6153,7 +6621,8 @@ export class ConnectionSupervisor {
       const servedMethods = Array.isArray(entry.describeResult?.served_methods)
         ? (entry.describeResult?.served_methods as unknown[])
         : [];
-      let usedRpcMethod = servedMethods.includes("session.interrupt")
+      const canonicalWire = this.usesCanonicalSessionControlWire(entry);
+      let usedRpcMethod = canonicalWire || servedMethods.includes("session.interrupt")
         ? "session.interrupt"
         : "prompt.cancel";
 
@@ -6167,20 +6636,27 @@ export class ConnectionSupervisor {
             executionGeneration,
           },
           async ({ turnId: tId, executionGeneration: execGen }) => {
-            const rpcPayload = {
-              profile_id: profileId,
-              session_id: sessionId,
-              turn_id: tId,
-              ...(execGen > 0 ? { execution_generation: execGen } : {}),
-            };
+            const rpcPayload = canonicalWire
+              ? {
+                  ...this.gatewayProfileParams(entry, profileId),
+                  session_id: sessionId,
+                  execution_generation: execGen,
+                }
+              : {
+                  ...this.gatewayProfileParams(entry, profileId),
+                  session_id: sessionId,
+                  turn_id: tId,
+                  ...(execGen > 0 ? { execution_generation: execGen } : {}),
+                };
             if (usedRpcMethod === "session.interrupt") {
               try {
-                return await entry.client.call<Record<string, unknown>>(
+                const receipt = await entry.client.call<Record<string, unknown>>(
                   "session.interrupt",
                   rpcPayload,
                 );
+                return canonicalWire ? normalizeCanonicalInterruptReceipt(receipt) : receipt;
               } catch (err) {
-                if (isJsonRpcMethodNotFound(err)) {
+                if (!canonicalWire && isJsonRpcMethodNotFound(err)) {
                   usedRpcMethod = "prompt.cancel";
                   return entry.client.call<Record<string, unknown>>("prompt.cancel", rpcPayload);
                 }
@@ -6333,6 +6809,7 @@ export class ConnectionSupervisor {
           : undefined;
       const executionGeneration =
         typeof payload.executionGeneration === "number" ? payload.executionGeneration : undefined;
+      const canonicalWire = this.usesCanonicalSessionControlWire(entry);
 
       try {
         const result = await this.turnCoordinator.resolveUnknown(
@@ -6343,13 +6820,20 @@ export class ConnectionSupervisor {
             admissionId,
             executionGeneration,
           },
-          async ({ admission_id, execution_generation }) =>
-            entry.client.call<Record<string, unknown>>("prompt.resolve_unknown", {
-              profile_id: profileId,
-              session_id: sessionId,
-              admission_id,
-              execution_generation,
-            }),
+          async ({ admission_id, execution_generation }) => {
+            const receipt = await entry.client.call<Record<string, unknown>>(
+              "prompt.resolve_unknown",
+              {
+                ...(canonicalWire ? {} : this.gatewayProfileParams(entry, profileId)),
+                session_id: sessionId,
+                admission_id,
+                execution_generation,
+              },
+            );
+            return canonicalWire
+              ? normalizeCanonicalResolveUnknownReceipt(receipt)
+              : receipt;
+          },
         );
         this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
           type: "turn_state",
@@ -6415,9 +6899,37 @@ export class ConnectionSupervisor {
       return this.turnCoordinator.checkQueueReceipt(
         { connectionId, profileId, sessionId, submissionId },
         async (subId) => {
+          if (this.usesCanonicalSessionControlWire(entry)) {
+            // PromptReceiptParams is extra=forbid and has no submission_id/profile. Resolve the
+            // admission from the canonical resume snapshot's pending[].input_id first, then ask
+            // for the exact admission receipt.
+            const resumeRes = await entry.client.call<Record<string, unknown>>("session.resume", {
+              ...this.gatewayProfileParams(entry, profileId),
+              session_id: sessionId,
+            });
+            const pending = projectCanonicalPending(resumeRes);
+            if (!pending.present) {
+              return { found: false, absenceConfirmed: false };
+            }
+            const match = pending.admissions.find((item) => item.inputId === subId);
+            if (!match) {
+              // Terminal admissions are not listed in canonical pending. Absence there cannot
+              // prove the submission never entered the FIFO.
+              return { found: false, absenceConfirmed: false };
+            }
+            const receiptRes = await entry.client.call<Record<string, unknown>>("prompt.receipt", {
+              session_id: sessionId,
+              admission_id: match.admissionId,
+            });
+            const admission = canonicalReceiptToQueueItem(receiptRes, match, subId);
+            return admission
+              ? { found: true, admission }
+              : { found: false, absenceConfirmed: false };
+          }
+
           try {
             const receiptRes = await entry.client.call<Record<string, unknown>>("prompt.receipt", {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
               submission_id: subId,
             });
@@ -6444,7 +6956,7 @@ export class ConnectionSupervisor {
               this.translateRpcFailure(entry, err, undefined, "prompt.receipt", profileId);
             }
             const listRes = await entry.client.call<Record<string, unknown>>("session.resume", {
-              profile_id: profileId,
+              ...this.gatewayProfileParams(entry, profileId),
               session_id: sessionId,
             });
             const rawList = Array.isArray(
@@ -6491,11 +7003,12 @@ export class ConnectionSupervisor {
         const res = await this.turnCoordinator.retryQueued(
           { connectionId, profileId, sessionId, submissionId, online: true },
           async (rpcPayload) =>
-            entry.client.call<Record<string, unknown>>("prompt.submit", {
-              profile_id: profileId,
-              session_id: sessionId,
-              ...rpcPayload,
-            }),
+            this.normalizeQueuedPromptSubmit(
+              await this.callPromptSubmit(entry, profileId, {
+                session_id: sessionId,
+                ...rpcPayload,
+              }),
+            ),
         );
         if (res.status === "admitted" && res.admission) {
           this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
@@ -6532,12 +7045,18 @@ export class ConnectionSupervisor {
       try {
         const res = await this.turnCoordinator.cancelQueued(
           { connectionId, profileId, sessionId, admissionId },
-          async ({ admission_id }) =>
-            entry.client.call<Record<string, unknown>>("prompt.cancel", {
-              profile_id: profileId,
+          async ({ admission_id }) => {
+            const canonicalWire = this.usesCanonicalSessionControlWire(entry);
+            const receipt = await entry.client.call<Record<string, unknown>>("prompt.cancel", {
+              // Canonical `prompt.cancel` routes by admission_id alone; its params are extra=forbid.
+              ...(canonicalWire ? {} : this.gatewayProfileParams(entry, profileId)),
               session_id: sessionId,
               admission_id,
-            }),
+            });
+            return canonicalWire
+              ? normalizeCanonicalQueuedCancelReceipt(receipt)
+              : receipt;
+          },
         );
         this.emitTopic("prompt", { connectionId, profileId, sessionId }, "patch", {
           connectionId,
@@ -6571,6 +7090,7 @@ export class ConnectionSupervisor {
       if (!entry.supportedActions.promptSteer) {
         throw makeBridgeError("capability_unavailable", getCopy("turn.steer.unsupportedError"));
       }
+      const canonicalWire = this.usesCanonicalSessionControlWire(entry);
 
       const hasTurnHistory = this.turnCoordinator.hasTurnHistory({
         connectionId,
@@ -6612,17 +7132,41 @@ export class ConnectionSupervisor {
         (currentView && currentView.executionGeneration > 0
           ? currentView.executionGeneration
           : undefined);
+      if (canonicalWire && (effectiveGen === undefined || effectiveGen <= 0)) {
+        return this.turnCoordinator.recordSteerFailure({
+          connectionId,
+          profileId,
+          sessionId,
+          ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+          text,
+          reason: "not_running",
+          message: getCopy("turn.steer.reason.not_running"),
+        });
+      }
 
       try {
-        const res = await entry.client.call<Record<string, unknown>>("session.steer", {
-          profile_id: profileId,
-          session_id: sessionId,
-          ...(effectiveTurnId ? { turn_id: effectiveTurnId } : {}),
-          ...(effectiveGen !== undefined ? { execution_generation: effectiveGen } : {}),
-          text,
-        });
-        if (res?.steered === false) {
-          const reasonRaw = asString(res.reason, "rejected");
+        const rpcPayload = canonicalWire
+          ? {
+              ...this.gatewayProfileParams(entry, profileId),
+              session_id: sessionId,
+              execution_generation: effectiveGen,
+              text,
+            }
+          : {
+              profile_id: profileId,
+              session_id: sessionId,
+              ...(effectiveTurnId ? { turn_id: effectiveTurnId } : {}),
+              ...(effectiveGen !== undefined ? { execution_generation: effectiveGen } : {}),
+              text,
+            };
+        const res = await entry.client.call<Record<string, unknown>>("session.steer", rpcPayload);
+        const canonicalAccepted =
+          canonicalWire &&
+          (asString(res.status).toLowerCase() === "queued" ||
+            asString(res.status).toLowerCase() === "redirected");
+        const canonicalRejected = canonicalWire && !canonicalAccepted;
+        if (canonicalRejected || res?.steered === false) {
+          const reasonRaw = canonicalRejected ? "rejected" : asString(res.reason, "rejected");
           const reason =
             reasonRaw === "turn_finished" ||
             reasonRaw === "generation_mismatch" ||
@@ -6648,7 +7192,9 @@ export class ConnectionSupervisor {
             ...(effectiveGen !== undefined ? { executionGeneration: effectiveGen } : {}),
             text,
             reason,
-            message: asString(res.message, getCopy("turn.steer.fallbackBody")),
+            message: canonicalRejected
+              ? getCopy("turn.steer.fallbackBody")
+              : asString(res.message, getCopy("turn.steer.fallbackBody")),
           });
         }
         return this.turnCoordinator.recordSteerSuccess({
@@ -7658,12 +8204,14 @@ export class ConnectionSupervisor {
           online: true,
           ...(input.submissionId ? { submissionId: input.submissionId } : {}),
         },
-        async (rpcPayload) =>
-          entry.client.call<Record<string, unknown>>("prompt.submit", {
-            profile_id: input.profileId,
-            session_id: input.sessionId,
-            ...rpcPayload,
-          }),
+        async (rpcPayload) => {
+          return this.normalizeQueuedPromptSubmit(
+            await this.callPromptSubmit(entry, input.profileId, {
+              session_id: input.sessionId,
+              ...rpcPayload,
+            }),
+          );
+        },
       );
       if (res.status === "admitted" && res.admission) {
         this.emitTopic(

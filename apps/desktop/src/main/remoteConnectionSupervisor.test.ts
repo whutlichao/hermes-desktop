@@ -232,4 +232,322 @@ describe("ConnectionSupervisor multi-gateway Local + Remote HTTP(S)/WS (S1)", ()
       sandbox.cleanup(passed);
     }
   });
+
+  it("routes a non-default Remote profile over the legacy profile_id path for list/create/resume, submit/cancel, and steer", async () => {
+    const sandbox = createTestSandbox("hermes-remote-non-default-profile-");
+    let passed = false;
+    const remoteGw = await startFakeRemoteGatewayServer({
+      protocol: "http",
+      validTokens: new Set(["remote-ops-token"]),
+      useTicketEndpoint: true,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "remote-default-sess", title: "Default Chat" },
+        { profile_id: "ops", session_id: "remote-ops-sess", title: "Ops Chat" },
+      ],
+    });
+    const store = new RegistryStore({ rootDir: sandbox.hermesHomeDir });
+    const ports = createNodeLocalBackendPorts({
+      userDataDir: sandbox.userDataDir,
+      hermesHomeDir: sandbox.hermesHomeDir,
+      hermesHomeKind: "temp",
+      appVersion: "0.1.0",
+      buildMode: "dev",
+      pickCliFile: async () => ({ cancelled: true }),
+    });
+    const supervisor = new ConnectionSupervisor(
+      new LocalBackendManager(ports),
+      { registryStore: store },
+    );
+
+    try {
+      const addRes = store.add({
+        kind: "remote",
+        label: "Ops Remote",
+        url: remoteGw.baseUrl,
+        authMode: "token",
+        token: "remote-ops-token",
+      });
+      expect(addRes.ok).toBe(true);
+      const remoteId = addRes.snapshot.connections.find((c) => c.kind === "remote")!.id;
+
+      const connected = await supervisor.connectRemote(remoteId, {
+        profileId: "ops",
+        activate: true,
+      });
+      expect(connected.ok).toBe(true);
+      expect(connected.fleet.activeScope).toMatchObject({
+        connectionId: remoteId,
+        profileId: "ops",
+      });
+      expect(connected.fleet.sessions.map((s) => s.sessionId)).toContain("remote-ops-sess");
+      expect(connected.fleet.sessions.map((s) => s.sessionId)).not.toContain("remote-default-sess");
+
+      const listCalls = remoteGw.rpcCalls.filter((c) => c.method === "session.list");
+      expect(listCalls.length).toBeGreaterThan(0);
+      for (const call of listCalls) {
+        expect(call.params.profile_id).toBe("ops");
+        expect(call.params).not.toHaveProperty("profile");
+      }
+
+      await supervisor.handlers["sessions.select"](
+        { sessionId: "remote-ops-sess" },
+        { connectionId: remoteId, profileId: "ops", sessionId: "remote-ops-sess" },
+      );
+      const resumeCalls = remoteGw.rpcCalls.filter((c) => c.method === "session.resume");
+      expect(resumeCalls.length).toBeGreaterThan(0);
+      for (const call of resumeCalls) {
+        expect(call.params.profile_id).toBe("ops");
+        expect(call.params).not.toHaveProperty("profile");
+      }
+
+      const created = (await supervisor.handlers["sessions.create"](
+        { title: "Ops New Chat" },
+        { connectionId: remoteId, profileId: "ops" },
+      )) as { session: { sessionId: string; profileId: string } };
+      expect(created.session.profileId).toBe("ops");
+      const createCall = remoteGw.rpcCalls.find((c) => c.method === "session.create");
+      expect(createCall?.params.profile_id).toBe("ops");
+      expect(createCall?.params).not.toHaveProperty("profile");
+
+      const send = (await supervisor.handlers["prompts.send"](
+        { sessionId: created.session.sessionId, text: "hello ops" },
+        { connectionId: remoteId, profileId: "ops", sessionId: created.session.sessionId },
+      )) as { accepted: boolean; turnId: string };
+      expect(send.accepted).toBe(true);
+      const submitCall = remoteGw.rpcCalls.find((c) => c.method === "prompt.submit");
+      expect(submitCall?.params.profile_id).toBe("ops");
+      expect(submitCall?.params).not.toHaveProperty("profile");
+      expect(typeof submitCall?.params.submission_id).toBe("string");
+
+      const steered = (await supervisor.handlers["prompts.steer"](
+        {
+          sessionId: created.session.sessionId,
+          turnId: send.turnId,
+          text: "ops legacy steer",
+        },
+        { connectionId: remoteId, profileId: "ops", sessionId: created.session.sessionId },
+      )) as { steered: boolean };
+      expect(steered.steered).toBe(true);
+      const steerCall = remoteGw.rpcCalls.find((c) => c.method === "session.steer");
+      expect(steerCall?.params.profile_id).toBe("ops");
+      expect(steerCall?.params.turn_id).toBe(send.turnId);
+      expect(steerCall?.params).not.toHaveProperty("profile");
+
+      await supervisor.handlers["prompts.stop"](
+        { sessionId: created.session.sessionId, turnId: send.turnId },
+        { connectionId: remoteId, profileId: "ops", sessionId: created.session.sessionId },
+      );
+      const cancelCall = remoteGw.rpcCalls.find((c) => c.method === "prompt.cancel");
+      expect(cancelCall?.params.profile_id).toBe("ops");
+      expect(cancelCall?.params.turn_id).toBe(send.turnId);
+      expect(cancelCall?.params).not.toHaveProperty("profile");
+
+      for (const method of [
+        "session.list",
+        "session.resume",
+        "session.create",
+        "prompt.submit",
+        "session.steer",
+        "prompt.cancel",
+      ]) {
+        for (const call of remoteGw.rpcCalls.filter((c) => c.method === method)) {
+          expect(call.params.profile_id).toBe("ops");
+        }
+      }
+      passed = true;
+    } finally {
+      await supervisor.dispose();
+      store.close();
+      await remoteGw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("keeps the legacy profile_id receipt and resolve_unknown routing for a non-default Remote profile", async () => {
+    const sandbox = createTestSandbox("hermes-remote-legacy-receipt-");
+    let passed = false;
+    const receiptParams: Array<Record<string, unknown>> = [];
+    const resolveParams: Array<Record<string, unknown>> = [];
+    const remoteGw = await startFakeRemoteGatewayServer({
+      protocol: "http",
+      validTokens: new Set(["remote-ops-receipt-token"]),
+      useTicketEndpoint: true,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "ops", display_name: "Ops", handle: "ops", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "remote-default-receipt", title: "Default" },
+        { profile_id: "ops", session_id: "remote-ops-receipt", title: "Ops Receipt" },
+        { profile_id: "ops", session_id: "remote-ops-queue", title: "Ops Queue" },
+      ],
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume") {
+          if (params.profile_id !== "ops" || "profile" in params) {
+            ctx.replyError(4001, "invalid_params");
+            return true;
+          }
+          ctx.replyResult({
+            session_id: params.session_id,
+            messages: [],
+            active_turn_id: null,
+            execution_generation: 3,
+            ...(params.session_id === "remote-ops-receipt"
+              ? {
+                  unknown_turns: [
+                    {
+                      admission_id: "adm-remote-unknown",
+                      execution_generation: 3,
+                      text: "legacy lost",
+                    },
+                  ],
+                }
+              : {}),
+          });
+          return true;
+        }
+        if (method === "prompt.submit") {
+          if (params.profile_id !== "ops" || "profile" in params) {
+            ctx.replyError(4001, "invalid_params");
+            return true;
+          }
+          ctx.replyResult({ accepted: true, status: "unknown", session_id: params.session_id });
+          return true;
+        }
+        if (method === "prompt.receipt") {
+          receiptParams.push({ ...params });
+          if (
+            params.profile_id !== "ops" ||
+            "profile" in params ||
+            typeof params.submission_id !== "string"
+          ) {
+            ctx.replyError(4001, "invalid_params");
+            return true;
+          }
+          ctx.replyResult({
+            found: true,
+            admission: {
+              admission_id: "adm-remote-receipt",
+              submission_id: params.submission_id,
+              text: "legacy lost",
+              position: 1,
+              state: "queued",
+            },
+          });
+          return true;
+        }
+        if (method === "prompt.resolve_unknown") {
+          resolveParams.push({ ...params });
+          if (
+            params.profile_id !== "ops" ||
+            "profile" in params ||
+            params.admission_id !== "adm-remote-unknown" ||
+            params.execution_generation !== 3
+          ) {
+            ctx.replyError(4001, "invalid_params");
+            return true;
+          }
+          ctx.replyResult({ settled: true, status: "interrupted" });
+          return true;
+        }
+        return undefined;
+      },
+    });
+    const store = new RegistryStore({ rootDir: sandbox.hermesHomeDir });
+    const ports = createNodeLocalBackendPorts({
+      userDataDir: sandbox.userDataDir,
+      hermesHomeDir: sandbox.hermesHomeDir,
+      hermesHomeKind: "temp",
+      appVersion: "0.1.0",
+      buildMode: "dev",
+      pickCliFile: async () => ({ cancelled: true }),
+    });
+    const supervisor = new ConnectionSupervisor(
+      new LocalBackendManager(ports),
+      { registryStore: store },
+    );
+
+    try {
+      const addRes = store.add({
+        kind: "remote",
+        label: "Ops Receipt Remote",
+        url: remoteGw.baseUrl,
+        authMode: "token",
+        token: "remote-ops-receipt-token",
+      });
+      expect(addRes.ok).toBe(true);
+      const remoteId = addRes.snapshot.connections.find((c) => c.kind === "remote")!.id;
+
+      const connected = await supervisor.connectRemote(remoteId, {
+        profileId: "ops",
+        activate: true,
+      });
+      expect(connected.ok).toBe(true);
+      const scope = {
+        connectionId: remoteId,
+        profileId: "ops",
+        sessionId: "remote-ops-queue",
+      };
+
+      const lost = (await supervisor.handlers["prompts.queue"](
+        {
+          sessionId: "remote-ops-queue",
+          text: "legacy lost",
+          submissionId: "sub-remote-receipt",
+        },
+        scope,
+      )) as { status: string };
+      expect(lost.status).toBe("delivery_unknown");
+      const submitCall = remoteGw.rpcCalls.filter((call) => call.method === "prompt.submit").at(-1);
+      expect(submitCall?.params.profile_id).toBe("ops");
+      expect(submitCall?.params).not.toHaveProperty("profile");
+
+      const receipt = (await supervisor.handlers["prompts.checkQueueReceipt"](
+        { sessionId: "remote-ops-queue", submissionId: "sub-remote-receipt" },
+        scope,
+      )) as { found: boolean; canRetrySameSubmission: boolean };
+      expect(receipt).toMatchObject({ found: true, canRetrySameSubmission: false });
+      expect(receiptParams).toEqual([
+        {
+          profile_id: "ops",
+          session_id: "remote-ops-queue",
+          submission_id: "sub-remote-receipt",
+        },
+      ]);
+
+      const unknownScope = { ...scope, sessionId: "remote-ops-receipt" };
+      await supervisor.handlers["sessions.select"](
+        { sessionId: "remote-ops-receipt" },
+        unknownScope,
+      );
+      const resolved = (await supervisor.handlers["prompts.resolveUnknown"](
+        {
+          sessionId: "remote-ops-receipt",
+          admissionId: "adm-remote-unknown",
+          executionGeneration: 3,
+        },
+        unknownScope,
+      )) as { resolved: boolean; status: string };
+      expect(resolved).toMatchObject({ resolved: true, status: "interrupted" });
+      expect(resolveParams).toEqual([
+        {
+          profile_id: "ops",
+          session_id: "remote-ops-receipt",
+          admission_id: "adm-remote-unknown",
+          execution_generation: 3,
+        },
+      ]);
+
+      passed = true;
+    } finally {
+      await supervisor.dispose();
+      store.close();
+      await remoteGw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });

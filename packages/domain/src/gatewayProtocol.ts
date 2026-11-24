@@ -353,17 +353,38 @@ export function classifyRuntimeCapabilities(
   }
 
   const capList = asStringArray(caps);
-  const promptSubmit = capList.includes("prompt.submit") || capList.includes("chat-v1");
+  const has = (tag: string) => capList.includes(tag);
+  const gatewayLocalSessions = has("local-cli-create-v1");
+  const durableAdmission = has("durable-admission-v1");
+  const sessionTranscriptV1 = has("session-transcript-v1");
+  const sessionListPickerV1 = has("session-list-picker-v1");
+  const sessionListCursorV1 = has("session-list-cursor-v1");
+  // A single feature tag only unlocks the feature it names. The 0.23.3 canonical owner advertises
+  // this complete local-session surface; only that full fingerprint may imply the canonical verbs
+  // that have no dedicated tag (resume/cancel/steer/profiles.list).
+  const canonicalLocalSessionSurface =
+    gatewayLocalSessions &&
+    durableAdmission &&
+    sessionTranscriptV1 &&
+    sessionListPickerV1 &&
+    sessionListCursorV1;
+  const promptSubmit = has("prompt.submit") || has("chat-v1") || durableAdmission;
+  const sessionAuthority = has("session-authority-v1");
   return {
     chatAvailable: promptSubmit,
     promptSubmit,
-    promptCancel: capList.includes("prompt.cancel") || promptSubmit,
-    promptSteer: capList.includes("session.steer") || promptSubmit,
-    sessionCreate: capList.includes("session.create") || capList.includes("session-authority-v1"),
-    sessionResume: capList.includes("session.resume") || capList.includes("session-authority-v1"),
-    sessionList: capList.includes("session.list") || capList.includes("session-authority-v1"),
-    sessionTranscript: capList.includes("session.transcript") || capList.includes("session-authority-v1"),
-    profilesList: capList.includes("profiles.list") || capList.includes("session-authority-v1"),
+    promptCancel: has("prompt.cancel") || canonicalLocalSessionSurface,
+    promptSteer: has("session.steer") || canonicalLocalSessionSurface,
+    sessionCreate: has("session.create") || sessionAuthority || gatewayLocalSessions,
+    sessionResume: has("session.resume") || sessionAuthority || canonicalLocalSessionSurface,
+    sessionList:
+      has("session.list") ||
+      sessionAuthority ||
+      sessionListPickerV1 ||
+      sessionListCursorV1,
+    sessionTranscript:
+      has("session.transcript") || sessionAuthority || sessionTranscriptV1,
+    profilesList: has("profiles.list") || sessionAuthority || canonicalLocalSessionSurface,
   };
 }
 

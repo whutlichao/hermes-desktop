@@ -1250,6 +1250,7 @@ export default function App() {
     async (migrateDraftId?: string) => {
       if (!hasReadyConnection || !effectiveScope || !canCreateSession) {
         dispatch({ type: "ANNOUNCE", message: getCopy("empty.body") });
+        dispatch({ type: "SET_STOP_ERROR", message: getCopy("empty.body") });
         return null;
       }
       const draftIdToMigrate =
@@ -1272,7 +1273,18 @@ export default function App() {
         dispatch({ type: "REPLACE_TRANSCRIPT_SNAPSHOT", snapshot: applied.snapshot });
       }
       setExportedMissing(null);
-      return res.ok ? res.value.session ?? null : null;
+      if (!res.ok) {
+        dispatch({
+          type: "SET_STOP_ERROR",
+          message: res.error.message || getCopy("chat.sendFailed"),
+        });
+        return null;
+      }
+      if (!res.value.session) {
+        dispatch({ type: "SET_STOP_ERROR", message: getCopy("chat.sendFailed") });
+        return null;
+      }
+      return res.value.session;
     },
     [activeNewDraftId, canCreateSession, effectiveScope, hasReadyConnection, state.activeSessionId],
   );
@@ -1864,7 +1876,6 @@ export default function App() {
         targetSessionId = created?.sessionId ?? null;
       }
       if (!targetSessionId) {
-        reportSurfaceFailure(getCopy("chat.sendFailed"));
         return;
       }
       const targetScope: BridgeScope = {
@@ -2044,7 +2055,9 @@ export default function App() {
           message: getCopy(
             res.value.found
               ? "turn.queue.receiptAdmittedNotice"
-              : "turn.queue.receiptMissingNotice",
+              : res.value.canRetrySameSubmission
+                ? "turn.queue.receiptMissingNotice"
+                : "turn.queue.receiptUnresolvedNotice",
           ),
         });
       } finally {

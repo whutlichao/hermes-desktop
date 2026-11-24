@@ -494,6 +494,10 @@ describe("SshTransportManager (S2 fake SSH binary + known_hosts + askpass)", () 
       const entries = readAuditEntries(auditLogPath);
       expect(entries.some((e) => e.args.at(-1)?.includes("--start"))).toBe(false);
       expect(entries.some((e) => e.args.join(" ").includes("s3cr3t-passphrase"))).toBe(false);
+      const attachCommands = entries
+        .map((e) => e.args.at(-1) ?? "")
+        .filter((command) => command.includes("gateway attach"));
+      expect(attachCommands.some((command) => command.includes("--profile ops"))).toBe(true);
 
       await manager.disposeAll();
       passed = true;
