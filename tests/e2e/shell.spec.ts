@@ -2284,7 +2284,9 @@ test.describe("Ticket #31 Session rail, recovery, route banner, and transcript r
     const inspectDialog = page.getByRole("dialog", { name: "Approval 只读详情" });
     await expect(inspectDialog).toBeVisible();
     await expect(inspectDialog.locator("input, select, textarea")).toHaveCount(0);
-    await expect(inspectDialog).toContainText("owner=1 · execution=2");
+    const generation = inspectDialog.locator(".approval-generation-dl");
+    await expect(generation.locator("dt")).toHaveText(["Owner", "Execution", "Epoch"]);
+    await expect(generation.locator("dd")).toHaveText(["1", "2", "1"]);
     await page.keyboard.press("Escape");
     await expect(inspectDialog).toBeHidden();
     await expect(inspectBtn).toBeFocused();

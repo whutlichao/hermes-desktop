@@ -103,7 +103,7 @@ export function ApprovalCard({
         </div>
         <div>
           <dt>{getCopy("approval.field.host")}</dt>
-          <dd>{approval.hostDisplay || "—"}</dd>
+          <dd>{approval.hostDisplay || getCopy("common.notProvided")}</dd>
         </div>
         <div>
           <dt>{getCopy("approval.field.profile")}</dt>
@@ -115,12 +115,12 @@ export function ApprovalCard({
         </div>
         <div>
           <dt>{getCopy("approval.field.turn")}</dt>
-          <dd>{approval.turnId ?? "—"}</dd>
+          <dd>{approval.turnId ?? getCopy("common.notProvided")}</dd>
         </div>
         <div>
           <dt>{getCopy("approval.field.cwd")}</dt>
           <dd>
-            <code>{approval.cwd ?? "—"}</code>
+            {approval.cwd ? <code>{approval.cwd}</code> : getCopy("common.notProvided")}
           </dd>
         </div>
         <div>
@@ -129,7 +129,7 @@ export function ApprovalCard({
             {approval.command ? (
               <code className="approval-command-code">{approval.command}</code>
             ) : (
-              "—"
+              getCopy("common.notProvided")
             )}
           </dd>
         </div>

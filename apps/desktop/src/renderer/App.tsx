@@ -6,7 +6,6 @@ import {
   Settings2,
 } from "lucide-react";
 import {
-  SETTINGS_SECTION_IDS,
   type AppCommand,
   type ApprovalChoice,
   type ApprovalRespondResult,
@@ -3147,7 +3146,6 @@ export default function App() {
           <div className="window-title">
             <HermesMark size={14} />
             <span>HERMES DESKTOP</span>
-            <span className="window-title-sub">{getCopy("app.subtitle")}</span>
           </div>
           <div className="window-meta">
             <button
@@ -3261,7 +3259,9 @@ export default function App() {
                         : getCopy("route.noProfile")}
                 </span>
                 {activeConnection && (
-                  <span className="gateway-kind-tag">{activeConnection.kind}</span>
+                  <span className="gateway-kind-tag">
+                    {getCopy(`connection.kind.${activeConnection.kind}` as CopyKey)}
+                  </span>
                 )}
                 {!hasReadyConnection && state.chatState?.lastKnownUnverified && (
                   <span className="status-pill is-warn">{getCopy("route.unverifiedBadge")}</span>
@@ -3639,22 +3639,6 @@ export default function App() {
         closeLabel={getCopy("settings.close")}
         onClose={() => dispatch({ type: "CLOSE_SURFACE", surface: "settings" })}
       >
-        <nav
-          aria-label={getCopy("settings.navLabel")}
-          className="settings-section-nav"
-          style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}
-        >
-          {SETTINGS_SECTION_IDS.map((secId) => (
-            <span
-              key={secId}
-              className="gateway-badge"
-              data-settings-nav={secId}
-            >
-              {getCopy(`settings.section.${secId}` as CopyKey)}
-            </span>
-          ))}
-        </nav>
-
         <section
           className="settings-section"
           data-settings-section="gateways"

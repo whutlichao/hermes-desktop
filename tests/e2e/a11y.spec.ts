@@ -1566,9 +1566,9 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
     });
     expect(tokenValues.controlLine).toBe("#8a8a80");
     expect(tokenValues.focusRing).toBe("#c8442e");
-    expect(tokenValues.statusReady).toBe("#1f7a4c");
-    expect(tokenValues.statusConnecting).toBe("#a36a00");
-    expect(tokenValues.statusBlocked).toBe("#c8442e");
+    expect(tokenValues.statusReady).toBe("#376d4a");
+    expect(tokenValues.statusConnecting).toBe("#8a6215");
+    expect(tokenValues.statusBlocked).toBe("#9e2d1e");
 
     const paletteButton = page.getByRole("button", { name: /命令面板/ });
     await paletteButton.focus();
@@ -1804,7 +1804,7 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
     await expect(assertiveRegion).toHaveAttribute("data-announcement-seq", "0");
     await expect(page.locator(".status-dot.is-ready")).toHaveCSS(
       "background-color",
-      "rgb(31, 122, 76)",
+      "rgb(55, 109, 74)",
     );
     for (const region of [politeRegion, assertiveRegion]) {
       const style = await region.evaluate((element) => {
