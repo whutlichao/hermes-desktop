@@ -1,8 +1,17 @@
 node_modules/
 dist/
+dist-web/
+out/
+release/
+.dev/
+.vite/
+coverage/
+test-results/
+playwright-report/
 .impeccable/mocks/
 .impeccable/questions/
 .impeccable/review/
 .impeccable/reference/
 *.local
+*.tsbuildinfo
 .DS_Store

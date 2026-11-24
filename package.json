@@ -1,36 +1,39 @@
 {
-  "name": "hermes-desktop-prototype",
+  "name": "hermes-desktop",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --port 4173 --strictPort",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=26 <27",
+    "pnpm": "12.21.0"
   },
-  "dependencies": {
-    "@fontsource/schibsted-grotesk": "^5.3.0",
-    "@fontsource/spline-sans-mono": "^5.3.0",
-    "lucide-react": "^0.468.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-markdown": "^9.0.1",
-    "rehype-highlight": "^7.0.2",
-    "remark-gfm": "^4.0.0"
+  "scripts": {
+    "dev:web": "pnpm --filter @hermes/desktop dev:web",
+    "dev:electron": "pnpm --filter @hermes/desktop dev:electron",
+    "dev:electron:real": "pnpm --filter @hermes/desktop dev:electron:real",
+    "build": "pnpm --filter @hermes/contracts build && pnpm --filter @hermes/domain build && pnpm --filter @hermes/desktop build",
+    "package:mac": "node scripts/package-mac.mjs",
+    "package:mac:dist": "node scripts/package-mac.mjs --dist",
+    "smoke:packaged": "node scripts/smoke-packaged.mjs",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run --coverage",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test --project=e2e",
+    "test:a11y": "playwright test --project=a11y",
+    "test:electron": "playwright test --config playwright.electron.config.ts smoke.spec.ts",
+    "test:real-gateway": "node scripts/real-gateway.mjs",
+    "verify:architecture": "node scripts/verify-architecture.mjs",
+    "verify:no-official-desktop": "node scripts/verify-no-official-desktop.mjs",
+    "verify:no-mock-in-build": "node scripts/verify-no-mock-in-build.mjs",
+    "sandbox:reset": "node scripts/sandbox-reset.mjs"
   },
   "devDependencies": {
-    "@types/react": "^18.3.18",
-    "@types/react-dom": "^18.3.5",
-    "@vitejs/plugin-react": "^4.3.4",
-    "typescript": "^5.7.2",
-    "vite": "^6.0.5",
-    "vitest": "^2.1.8"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.65.1",
+    "@vitest/coverage-v8": "2.1.8",
+    "playwright": "1.65.1",
+    "typescript": "5.7.2",
+    "vitest": "2.1.8"
   }
 }

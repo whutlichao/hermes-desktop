@@ -1,0 +1,12 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+onlyBuiltDependencies:
+  - electron
+  - node-pty
+  - esbuild
+allowBuilds:
+  electron: true
+  node-pty: true
+  esbuild: true
+  electron-winstaller: false

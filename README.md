@@ -102,3 +102,11 @@ The workspace rail contains Artifacts, Files, Git, Agents, Terminal, and Voice. 
 ## Simulation boundary
 
 Every Gateway health value, latency, SSH attach, Cloud status, Telegram QR, webhook, terminal command, Git diff, file tree, subagent, voice transcript, Cron run, and update result is authored data. Nothing in this prototype performs a real network request or writes to a real Hermes configuration. The interface labels this in the title bar, status bar, drawers, previews, and voice surface.
+
+## macOS Packaging & Distribution (`local-unsigned`)
+
+- `pnpm package:mac` builds an unsigned arm64 `.app` (`appId: com.whutlichao.hermesdesktop`, `productName: Hermes Desktop`) and applies ad-hoc `codesign --sign -` (`codesign --verify --deep --strict`).
+- `pnpm package:mac:dist` additionally produces `.dmg` and `.zip` artifacts (`dmg.sign: false`, `publish: null`, no `latest-mac.yml`, and no auto-updater SDK).
+- Builds are **not** Developer ID signed, **not** notarized, and **not** auto-updated; macOS Gatekeeper warnings on downloaded/unpacked builds are expected.
+- As a documented fallback for local testing only (at your own risk, as it clears macOS quarantine attributes on the `.app` you intentionally built/inspected), you may clear quarantine with `xattr -dr com.apple.quarantine "Hermes Desktop.app"`.
+- Packaged builds fail if git SHA cannot be resolved unless `ALLOW_UNKNOWN_SHA=1` is explicitly passed (which displays `unknown` in About/Diagnostics).

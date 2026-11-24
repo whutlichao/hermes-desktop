@@ -1,0 +1,1324 @@
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
+import { _electron as electron, expect, test } from "@playwright/test";
+import { startFakeGatewayServer, startFakeRemoteGatewayServer } from "../helpers/fakeGatewayServer";
+import { createTestSandbox } from "../helpers/sandbox";
+
+function writeElectronFakeCli(options: {
+  cliPath: string;
+  counterFile: string;
+  wsUrl: string;
+  withHostScope?: boolean;
+}) {
+  const caps = options.withHostScope
+    ? ["session-authority-v1", "host-scope-interactive"]
+    : ["session-authority-v1"];
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const profileIdx = args.indexOf("--profile");
+const profileId = profileIdx >= 0 && args[profileIdx + 1] ? args[profileIdx + 1] : "default";
+const rest = profileIdx >= 0 ? args.slice(profileIdx + 2) : args;
+
+if (rest[0] === "--version") {
+  console.log("Hermes Agent v0.23.3");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "--help") {
+  console.log("{run,ensure,attach,tickets,restart}");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "ensure" && rest[2] === "--help") {
+  console.log("--json --timeout");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "attach" && rest[2] === "--help") {
+  console.log("--json --recover");
+  process.exit(0);
+}
+if (rest[0] === "gateway" && rest[1] === "tickets") {
+  console.log(JSON.stringify({ protocol: 1, purposes: ["interactive", "native-http"] }));
+  process.exit(0);
+}
+if (rest[0] === "gateway" && (rest[1] === "ensure" || rest[1] === "attach")) {
+  let ticketFields = {};
+  if (rest[1] === "attach") {
+    let n = 0;
+    try {
+      n = Number(fs.readFileSync(${JSON.stringify(options.counterFile)}, "utf8")) || 0;
+    } catch {}
+    n += 1;
+    fs.writeFileSync(${JSON.stringify(options.counterFile)}, String(n), "utf8");
+    ticketFields = { ticket: "tkt_elec_" + n, expires_in_seconds: 30 };
+  }
+  const payload = {
+    state: "ready",
+    attachable: true,
+    install_code_sha: "sha_e2e",
+    client_code_sha: "sha_e2e",
+    ...ticketFields,
+    endpoint: {
+      profile_id: profileId,
+      instance_id: "inst-elec-1",
+      authority_epoch: 1,
+      runtime_protocol: 1,
+      capabilities: ${JSON.stringify(caps)},
+      code_sha: "sha_e2e",
+      ws_url: ${JSON.stringify(options.wsUrl)},
+      ws_protocol: "hermes-gateway-v1",
+      ticket_protocol_prefix: "hermes-gateway-ticket."
+    }
+  };
+  console.log(JSON.stringify(payload));
+  process.exit(0);
+}
+process.exit(1);
+`;
+  fs.writeFileSync(options.cliPath, script, { encoding: "utf8", mode: 0o755 });
+}
+
+test.describe("Electron hardened smoke", () => {
+  test("launches real BrowserWindow with sandbox, contextIsolation, frozen window.hermesHost, no Node globals, and real empty state", async () => {
+    const sandbox = createTestSandbox("hermes-electron-smoke-");
+    let passed = false;
+    const remoteGw = await startFakeRemoteGatewayServer({
+      protocol: "http",
+      validTokens: new Set(["elec-secret-tok-123"]),
+      useTicketEndpoint: true,
+    });
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+
+      // Verify BrowserWindow webPreferences from Main process
+      const windowHardening = await electronApp.evaluate(({ BrowserWindow }) => {
+        const win = BrowserWindow.getAllWindows()[0];
+        const prefs = win.webContents.getLastWebPreferences() as Record<string, unknown>;
+        return {
+          contextIsolation: prefs.contextIsolation,
+          sandbox: prefs.sandbox,
+          nodeIntegration: prefs.nodeIntegration,
+          webSecurity: prefs.webSecurity,
+        };
+      });
+
+      expect(windowHardening).toEqual({
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+        webSecurity: true,
+      });
+
+      // Verify Renderer has no Node exposure and only frozen window.hermesHost
+      const bridgeFacts = await page.evaluate(() => {
+        const w = window as unknown as Record<string, unknown>;
+        const host = w.hermesHost as Record<string, unknown> | undefined;
+        return {
+          hasRequire: typeof w.require !== "undefined",
+          hasProcess: typeof w.process !== "undefined",
+          hasBuffer: typeof w.Buffer !== "undefined",
+          hasMockGlobal: typeof w.__HERMES_MOCK_HOST__ !== "undefined",
+          hostExists: Boolean(host),
+          hostFrozen: host ? Object.isFrozen(host) : false,
+          hostVersion: host ? host.version : null,
+        };
+      });
+
+      expect(bridgeFacts).toEqual({
+        hasRequire: false,
+        hasProcess: false,
+        hasBuffer: false,
+        hasMockGlobal: false,
+        hostExists: true,
+        hostFrozen: true,
+        hostVersion: 1,
+      });
+
+      // Verify native menu accelerators in Main
+      const menuAccelerators = await electronApp.evaluate(({ Menu }) => {
+        const menu = Menu.getApplicationMenu();
+        if (!menu) return [];
+        const list: string[] = [];
+        const walk = (items: Electron.MenuItem[]) => {
+          for (const item of items) {
+            if (item.accelerator) list.push(item.accelerator);
+            if (item.submenu) walk(item.submenu.items);
+          }
+        };
+        walk(menu.items);
+        return list;
+      });
+      for (const acc of [
+        "CmdOrCtrl+K",
+        "CmdOrCtrl+,",
+        "CmdOrCtrl+B",
+        "CmdOrCtrl+N",
+        "CmdOrCtrl+W",
+        "CmdOrCtrl+Q",
+        "CmdOrCtrl+Shift+/",
+      ]) {
+        expect(menuAccelerators).toContain(acc);
+      }
+
+      // Verify real empty state and Electron host mode label
+      await expect(page.getByRole("heading", { name: "尚未连接到 Hermes Gateway" })).toBeVisible();
+      await expect(page.locator("footer.status-footer")).toContainText("Electron 宿主模式");
+      await expect(page.locator("body")).not.toContainText("Homelab");
+      await expect(page.locator("body")).not.toContainText("SIMULATED DATA");
+
+      // Verify Settings -> Gateways runs real read-only Test before Save, writes 0600 registry file without leaking secret across bridge
+      await page.getByRole("button", { name: "管理连接" }).click();
+      const settings = page.getByRole("dialog", { name: "Settings" });
+      await expect(settings).toBeVisible();
+      await settings.getByRole("button", { name: "添加连接" }).click();
+      await settings.getByLabel("设备名称").fill("Electron Remote");
+      await settings.getByLabel("Gateway 地址").fill(remoteGw.baseUrl);
+      await settings.getByLabel("静态 Token（仅写入 Main）").fill("elec-secret-tok-123");
+      await expect(settings.getByRole("button", { name: "保存连接" })).toBeDisabled();
+      await settings.getByRole("button", { name: "测试连接" }).click();
+      await expect(settings.getByText("HTTP 与 WebSocket 双端测试通过，可以保存此 Remote 连接。")).toBeVisible();
+      await settings.getByRole("button", { name: "保存连接" }).click();
+      await expect(settings.locator('[data-connection-id="electron-remote"]')).toBeVisible();
+      await expect(settings).not.toContainText("elec-secret-tok-123");
+
+      const regFile = path.join(sandbox.hermesHomeDir, "gateway-connections.json");
+      expect(fs.existsSync(regFile)).toBe(true);
+      expect(fs.statSync(regFile).mode & 0o777).toBe(0o600);
+
+      // Verify same-source AppInfo across bridge.hello, diagnostics.export, and Settings -> About/Updates
+      const diagnosticsCheck = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: {
+            request: (cmd: string, payload?: Record<string, unknown>) => Promise<{ ok: boolean; value: unknown }>;
+          };
+        };
+        const hello = await w.hermesHost.request("bridge.hello", {});
+        const diag = await w.hermesHost.request("diagnostics.export", {});
+        return { hello, diag };
+      });
+      expect(diagnosticsCheck.hello.ok).toBe(true);
+      expect(diagnosticsCheck.diag.ok).toBe(true);
+
+      const helloInfo = diagnosticsCheck.hello.value as {
+        appVersion: string;
+        gitSha: string;
+        buildMode: string;
+        distribution: string;
+        arch: string;
+      };
+      const diagPayload = diagnosticsCheck.diag.value as {
+        appInfo: typeof helloInfo;
+        display: { headline: string; buildLine: string; runtimeLine: string; updatesNotice: string };
+      };
+      expect(diagPayload.appInfo).toEqual(helloInfo);
+      expect(helloInfo.buildMode).toBe("dev");
+      expect(helloInfo.distribution).toBe("local-unsigned");
+      expect(JSON.stringify(diagPayload)).not.toContain(process.cwd());
+
+      await expect(settings).toContainText(diagPayload.display.headline);
+      await expect(settings).toContainText(diagPayload.display.buildLine);
+      await expect(settings).toContainText(diagPayload.display.runtimeLine);
+      await expect(settings).toContainText("本地开发构建，不检查更新");
+      await expect(settings.getByRole("button", { name: /检查更新|Update/i })).toHaveCount(0);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await remoteGw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("renders Local blocked repair card and exports sanitized diagnostics without leaking paths", async () => {
+    const sandbox = createTestSandbox("hermes-electron-local-blocked-");
+    let passed = false;
+
+    const nonExecBin = path.join(sandbox.rootDir, "secret-dir", "hermes");
+    fs.mkdirSync(path.dirname(nonExecBin), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(nonExecBin, "#!/bin/sh\necho hi\n", { encoding: "utf8", mode: 0o644 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: nonExecBin }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+
+      const localCard = page.locator("section.onboarding-empty-card");
+      await expect(localCard).toContainText("This device");
+      await expect(localCard).toContainText("连接受阻");
+      await expect(localCard).toContainText("发生了什么");
+      await expect(localCard).toContainText("不具备可执行权限");
+      await expect(localCard).not.toContainText(sandbox.rootDir);
+      await expect(localCard).not.toContainText("secret-dir");
+
+      await page.getByRole("button", { name: "管理连接" }).click();
+      const settings = page.getByRole("dialog", { name: "Settings" });
+      await expect(settings).toBeVisible();
+      const diagBtn = settings.getByRole("button", { name: "打开完整诊断视图" });
+      await expect(diagBtn).toBeVisible();
+      await diagBtn.click();
+
+      const diagModal = page.getByRole("dialog", { name: "脱敏诊断摘要" });
+      await expect(diagModal).toBeVisible();
+      await expect(diagModal).toContainText("cli_not_executable");
+      await expect(diagModal).toContainText("temp");
+
+      const jsonText = await diagModal.locator("pre.diagnostics-json").innerText();
+      expect(jsonText).not.toContain(sandbox.rootDir);
+      expect(jsonText).not.toContain("secret-dir");
+      expect(jsonText).not.toContain("stderr");
+      expect(jsonText).toContain('"typedFailureCode": "cli_not_executable"');
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("connects Local gateway via control socket ticket, scopes profiles/sessions, streams reply/tools, and handles Stop failure honestly", async () => {
+    const sandbox = createTestSandbox("hc-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2", "tkt_elec_3"]);
+    let udsCounter = 0;
+    let stopShouldFail = true;
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "work", display_name: "Work", handle: "work", is_default: false },
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-def-1", title: "Local Intro", preview: "ready" },
+        { profile_id: "work", session_id: "sess-work-1", title: "Work Review", preview: "ops" },
+      ],
+      onRpc: async (method, params, ctx) => {
+        if (method === "prompt.submit") {
+          const sid = String(params.session_id);
+          const turnId = "turn-elec-1";
+          const assistantMsgId = "msg-elec-a1";
+          ctx.replyResult({
+            accepted: true,
+            session_id: sid,
+            turn_id: turnId,
+            user_message_id: "msg-elec-u1",
+            assistant_message_id: assistantMsgId,
+          });
+          ctx.sendNotification("prompt.delta", {
+            session_id: sid,
+            turn_id: turnId,
+            message_id: assistantMsgId,
+            delta: "好的，核心片段如下：\n```ts\nconst answer = 42;\n```",
+          });
+          ctx.sendNotification("activity", {
+            session_id: sid,
+            turn_id: turnId,
+            message_id: assistantMsgId,
+            tool_call_id: "tc-elec-1",
+            name: "read_file",
+            status: "completed",
+            summary: "README.md",
+          });
+          return true;
+        }
+        if (method === "prompt.cancel") {
+          if (stopShouldFail) {
+            ctx.replyError(-32000, "Stop ACK timeout");
+            return true;
+          }
+          ctx.replyResult({ stopped: true, session_id: params.session_id, turn_id: params.turn_id });
+          ctx.sendNotification("prompt.stopped", {
+            session_id: params.session_id,
+            turn_id: params.turn_id,
+            message_id: "msg-elec-a1",
+          });
+          return true;
+        }
+        return false;
+      },
+    });
+
+    const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+    const udsServer = net.createServer((socket) => {
+      let buf = "";
+      socket.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        const nl = buf.indexOf("\n");
+        if (nl === -1) return;
+        const req = JSON.parse(buf.slice(0, nl)) as Record<string, unknown>;
+        buf = buf.slice(nl + 1);
+        if (req.op === "resolve-profile") {
+          socket.write(
+            JSON.stringify({
+              status: "ok",
+              state: "ready",
+              attachable: true,
+              purposes: ["interactive"],
+              endpoint: {
+                profile_id: req.profile_id ?? "default",
+                instance_id: "inst-elec-1",
+                authority_epoch: 1,
+                runtime_protocol: 1,
+                capabilities: ["session-authority-v1", "host-scope-interactive"],
+                code_sha: "sha_e2e",
+                ws_url: gw.wsUrl,
+              },
+            }) + "\n",
+          );
+        } else if (req.op === "session-ticket") {
+          udsCounter += 1;
+          socket.write(
+            JSON.stringify({ status: "ok", ticket: `tkt_elec_${udsCounter}`, expires_in_seconds: 30 }) + "\n",
+          );
+        }
+      });
+    });
+    await new Promise<void>((resolve) => udsServer.listen(sockPath, resolve));
+    fs.chmodSync(sockPath, 0o600);
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+      withHostScope: true,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("load");
+      // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
+      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await expect(page.locator("nav.sidebar")).toBeVisible();
+
+      // Wait for real Local connection over UDS ticket + WS
+      const routeStrip = page.locator(".route-strip");
+      await expect(routeStrip).toContainText("This device");
+      await expect(routeStrip).toContainText("Default", { timeout: 15_000 });
+      await expect(routeStrip).toContainText("已连接", { timeout: 15_000 });
+
+      // Session rail is scoped strictly to (local, default)
+      const sidebar = page.locator("nav.sidebar");
+      await expect(sidebar).toContainText("Local Intro");
+      await expect(sidebar).not.toContainText("Work Review");
+
+      // Switch Profile -> Work swaps visible sessions without opening another WS
+      await routeStrip.getByRole("button", { name: /已连接/ }).click();
+      const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+      await scopeDialog.getByRole("button", { name: /Work/ }).click();
+      await expect(routeStrip).toContainText("Work");
+      await expect(sidebar).toContainText("Work Review");
+      await expect(sidebar).not.toContainText("Local Intro");
+      expect(gw.connections).toHaveLength(1);
+      expect(gw.connections[0].headers.origin).toBeUndefined();
+
+      // Switch back to Default & send first prompt
+      await routeStrip.getByRole("button", { name: /已连接/ }).click();
+      await page.getByRole("dialog", { name: "选择 Scope" }).getByRole("button", { name: /Default/ }).click();
+      await expect(sidebar).toContainText("Local Intro");
+
+      await page.locator("#composer-input").fill("帮我看下 README");
+      await page.getByRole("button", { name: "发送消息" }).click();
+
+      const thread = page.locator(".transcript-list");
+      await expect(thread).toContainText("帮我看下 README");
+      await expect(thread).toContainText("const answer = 42;");
+      await expect(thread).toContainText("read_file");
+      await expect(thread).toContainText("README.md");
+
+      // Stop fails on first attempt -> alert shown AND Stop button remains visible (not faking stopped!)
+      const stopBtn = page.getByRole("button", { name: "停止 Turn" });
+      await expect(stopBtn).toBeVisible();
+      await stopBtn.click();
+      await expect(page.locator(".chat-alert")).toContainText("停止 Turn 失败");
+      await expect(stopBtn).toBeVisible();
+
+      // Second Stop ACKs cleanly -> stopped badge shown
+      stopShouldFail = false;
+      await stopBtn.click();
+      await expect(thread).toContainText("已停止");
+      await expect(stopBtn).toHaveCount(0);
+
+      // Verify capabilities.describe + ⌘K Command Palette + Capabilities Drawer in Electron
+      const capBtn = page.getByRole("button", { name: /能力 17 可达 4 延期/ });
+      await expect(capBtn).toBeVisible();
+      await capBtn.click();
+      const capDrawer = page.getByRole("dialog", { name: "能力目录" });
+      await expect(capDrawer).toBeVisible();
+      await expect(capDrawer.getByTestId("cap-group-core")).toContainText("核心 5");
+      await expect(capDrawer.getByTestId("cap-group-admin")).toContainText("管理 8");
+      await expect(capDrawer.getByTestId("cap-group-exec")).toContainText("执行 4");
+      await expect(capDrawer.getByTestId("capabilities-deferred-footnote")).toContainText("Voice");
+      await expect(capDrawer.getByTestId("capabilities-deferred-footnote").getByRole("button")).toHaveCount(0);
+      await page.keyboard.press("Escape");
+      await expect(capDrawer).toBeHidden();
+
+      await page.getByRole("button", { name: "命令面板 ⌘K" }).click();
+      const palette = page.getByRole("dialog", { name: "命令面板" });
+      await expect(palette).toBeVisible();
+      await expect(palette.getByRole("combobox")).toBeVisible();
+      await expect(palette.getByRole("listbox")).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(palette).toBeHidden();
+
+      // Verify zero ticket / wsUrl leak in DOM or diagnostics.export
+      const bodyText = await page.locator("body").innerText();
+      expect(bodyText).not.toContain("tkt_elec_");
+      expect(bodyText).not.toContain(gw.wsUrl);
+      const diagJson = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: { request: (cmd: string, p?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return JSON.stringify(await w.hermesHost.request("diagnostics.export", {}));
+      });
+      expect(diagJson).not.toContain("tkt_elec_");
+      expect(diagJson).not.toContain(gw.wsUrl);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      udsServer.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("hides composer when gateway omits prompt.submit capability", async () => {
+    const sandbox = createTestSandbox("hr-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2"]);
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+      ],
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-ro-1", title: "Readonly Session", preview: "view only" },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+      withHostScope: false,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+      await expect(page.locator(".chat-unavailable-card")).toContainText("当前 Gateway 暂不支持 Chat");
+      await expect(page.locator("form.composer-shell")).toHaveCount(0);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("persists BrowserWindow bounds and restores lastActiveChat after bridge.hello + snapshot on relaunch", async () => {
+    const sandbox = createTestSandbox("hr-persist-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2"]);
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-1", title: "Session One", preview: "first" },
+        { profile_id: "default", session_id: "sess-2", title: "Session Two", preview: "second" },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const launchEnv = {
+      ...process.env,
+      HERMES_USER_DATA_DIR: sandbox.userDataDir,
+      HERMES_HOME: sandbox.hermesHomeDir,
+    };
+
+    // Launch #1: select sess-2, resize window, close cleanly
+    const app1 = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: launchEnv,
+    });
+    try {
+      const page1 = await app1.firstWindow();
+      await page1.waitForLoadState("load");
+      // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
+      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      await page1.setViewportSize({ width: 1440, height: 900 });
+      await expect(page1.locator("nav.sidebar")).toBeVisible();
+      await expect(page1.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      const sess2Btn = page1.locator("nav.sidebar").getByRole("button", { name: /Session Two/ });
+      await expect(sess2Btn).toBeVisible();
+      await sess2Btn.click();
+      await expect(sess2Btn).toHaveAttribute("aria-current", "page");
+
+      await app1.evaluate(({ BrowserWindow }) => {
+        const win = BrowserWindow.getAllWindows()[0];
+        win.setBounds({ x: 120, y: 90, width: 1240, height: 760 });
+      });
+      await app1.close();
+
+      // Verify 0600 window-state.json & chat-session-state.json
+      const winStatePath = path.join(sandbox.userDataDir, "window-state.json");
+      const chatStatePath = path.join(sandbox.userDataDir, "chat-session-state.json");
+      expect(fs.existsSync(winStatePath)).toBe(true);
+      expect(fs.existsSync(chatStatePath)).toBe(true);
+      expect(fs.statSync(winStatePath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(chatStatePath).mode & 0o777).toBe(0o600);
+
+      const savedWin = JSON.parse(fs.readFileSync(winStatePath, "utf8")) as Record<string, unknown>;
+      expect(savedWin.windowId).toBe("primary");
+      expect((savedWin.panes as Array<Record<string, unknown>>)[0]?.paneId).toBe("main");
+      expect((savedWin.bounds as { width: number; height: number }).width).toBe(1240);
+      expect((savedWin.bounds as { width: number; height: number }).height).toBe(760);
+      expect("sidebarOpen" in savedWin).toBe(false);
+
+      // Launch #2: verify bounds and sess-2 activeChat restored after bridge.hello + snapshot
+      const app2 = await electron.launch({
+        args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+        env: launchEnv,
+      });
+      try {
+        const page2 = await app2.firstWindow();
+        await page2.waitForLoadState("domcontentloaded");
+        await expect(page2.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+        const bounds2 = await app2.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows()[0].getBounds(),
+        );
+        expect(bounds2.width).toBe(1240);
+        expect(bounds2.height).toBe(760);
+
+        // At 1240 width (<=1340), popover trigger is shown -> open popover to verify sess-2 active
+        await page2.getByRole("button", { name: /Sessions\s+2/ }).click();
+        const popDialog = page2.getByRole("dialog", { name: "Sessions" });
+        await expect(popDialog.getByRole("button", { name: /Session Two/ })).toHaveAttribute(
+          "aria-current",
+          "page",
+        );
+        passed = true;
+      } finally {
+        await app2.close();
+      }
+    } finally {
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("enters session_missing read-only state with saved draft on startup without calling session.create", async () => {
+    const sandbox = createTestSandbox("hr-miss-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1"]);
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      initialSessions: [
+        { profile_id: "default", session_id: "sess-fallback", title: "Fallback Chat" },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+    });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "chat-session-state.json"),
+      JSON.stringify({
+        windowId: "primary",
+        paneId: "main",
+        lastActiveChat: { connectionId: "local", profileId: "default", sessionId: "sess-deleted" },
+        lastSessionByScope: { "local::default": "sess-deleted" },
+        lastValidProfileByConnection: { local: "default" },
+        lastValidScopes: [{ connectionId: "local", profileId: "default" }],
+        sessionSummaries: {
+          "local::default::sess-deleted": {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-deleted",
+            title: "Deleted Session",
+            hasDraft: true,
+            draftText: "Unsaved local draft",
+          },
+        },
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      const missingCard = page.locator(".session-missing-card");
+      await expect(missingCard).toBeVisible();
+      await expect(missingCard).toContainText("Unsaved local draft");
+      expect(gw.rpcCalls.filter((c) => c.method === "session.create")).toHaveLength(0);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("Remote HTTP+WS wizard runs read-only Test, preserves draft on failure, clears token on Save, connects Remote Scope, and sends prompt", async () => {
+    const sandbox = createTestSandbox("hr-remote-");
+    let passed = false;
+    const remoteGw = await startFakeRemoteGatewayServer({
+      protocol: "http",
+      validTokens: new Set(["remote-e2e-token-999"]),
+      useTicketEndpoint: true,
+      profiles: [
+        { profile_id: "default", display_name: "Prod Default", handle: "default", is_default: true },
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "remote-elec-sess-1",
+          title: "Remote Electron Session",
+          preview: "ready",
+        },
+      ],
+    });
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("load");
+      // Pin renderer viewport to 1440x900 so headless CI runners with narrower virtual displays
+      // still exercise the >1340px desktop rail layout instead of clamping into popover mode.
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await expect(page.locator("nav.sidebar")).toBeVisible();
+
+      await page.getByRole("button", { name: "管理连接" }).click();
+      const settings = page.getByRole("dialog", { name: "Settings" });
+      await expect(settings).toBeVisible();
+      await settings.getByRole("button", { name: "添加连接" }).click();
+
+      // Failing Test (bad token) keeps Save disabled & preserves draft; 0 registry writes
+      await settings.getByLabel("设备名称").fill("Staging Remote");
+      await settings.getByLabel("Gateway 地址").fill(remoteGw.baseUrl);
+      await settings.getByLabel("静态 Token（仅写入 Main）").fill("wrong-token");
+      await settings.getByRole("button", { name: "测试连接" }).click();
+      await expect(settings.getByText("Remote 认证失败或凭据无效")).toBeVisible();
+      await expect(settings.getByRole("button", { name: "保存连接" })).toBeDisabled();
+      await expect(settings.getByLabel("设备名称")).toHaveValue("Staging Remote");
+      await expect(settings.getByLabel("Gateway 地址")).toHaveValue(remoteGw.baseUrl);
+      expect(fs.existsSync(path.join(sandbox.hermesHomeDir, "gateway-connections.json"))).toBe(false);
+
+      // Valid token passes Test -> enables Save -> commits & dials Remote WS -> re-scopes cleanly
+      await settings.getByLabel("静态 Token（仅写入 Main）").fill("remote-e2e-token-999");
+      await settings.getByRole("button", { name: "测试连接" }).click();
+      await expect(settings.getByText("HTTP 与 WebSocket 双端测试通过，可以保存此 Remote 连接。")).toBeVisible();
+      await settings.getByRole("button", { name: "保存连接" }).click();
+
+      const stagingRow = settings.locator('[data-connection-id="staging-remote"]');
+      await expect(stagingRow).toBeVisible();
+      await expect(stagingRow).toContainText("Main 已保存凭据（Main only）");
+      await expect(settings).not.toContainText("remote-e2e-token-999");
+
+      // Reopen edit shows blank token + Main only
+      await stagingRow.getByRole("button", { name: "编辑 / 改名" }).click();
+      await expect(settings.getByLabel("静态 Token（仅写入 Main）")).toHaveValue("");
+      await expect(settings).toContainText("Main 已保存凭据（Main only）");
+      await page.keyboard.press("Escape");
+
+      // Remote Scope becomes ready & loads Remote sessions + handles prompt.submit
+      const routeStrip = page.locator(".route-strip");
+      await expect(routeStrip).toContainText("Staging Remote", { timeout: 15_000 });
+      await expect(routeStrip).toContainText("已连接", { timeout: 15_000 });
+      await expect(page.locator("nav.sidebar")).toContainText("Remote Electron Session");
+
+      await page.locator("#composer-input").fill("check remote cluster");
+      await page.getByRole("button", { name: "发送消息" }).click();
+      await expect(page.locator(".transcript-list")).toContainText("check remote cluster");
+      expect(
+        remoteGw.rpcCalls.some(
+          (call) => call.method === "prompt.submit" && call.params.text === "check remote cluster",
+        ),
+      ).toBe(true);
+
+      // Verify zero secret token leak in DOM or diagnostics.export
+      const bodyText = await page.locator("body").innerText();
+      expect(bodyText).not.toContain("remote-e2e-token-999");
+      const diagJson = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: { request: (cmd: string, p?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return JSON.stringify(await w.hermesHost.request("diagnostics.export", {}));
+      });
+      expect(diagJson).not.toContain("remote-e2e-token-999");
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await remoteGw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("Ticket #36: AppInfo 3-place parity, Settings modal 9 sections & focus return, Session CLI deep links, and Cmd+W close/reopen startup recovery", async () => {
+    const sandbox = createTestSandbox("hr-t36-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2", "tkt_elec_3", "tkt_elec_4"]);
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+        { profile_id: "work", display_name: "Work", handle: "work", is_default: false },
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "sess-t36-def",
+          title: "Default T36 Session",
+          preview: "default ready",
+        },
+        {
+          profile_id: "work",
+          session_id: "sess-t36-work",
+          title: "Work T36 Session",
+          preview: "work ready",
+        },
+      ],
+    });
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    const counterFile = path.join(sandbox.rootDir, "attach-count.txt");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile,
+      wsUrl: gw.wsUrl,
+      withHostScope: false,
+    });
+    fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      // 1. Session Details card in Electron: never renders refused methods, renders 6 CLI deep links
+      const detailsCard = page.locator(".session-details-card");
+      await expect(detailsCard).toBeVisible();
+      await expect(detailsCard).toContainText("安全与隔离");
+      await expect(detailsCard).toContainText("只读深链 · 不会在此客户端执行");
+      await expect(detailsCard).not.toContainText("session.delete");
+      await expect(detailsCard.locator('[data-cli-action="delete"]')).toHaveAttribute(
+        "data-cli-command",
+        "hermes session delete sess-t36-def",
+      );
+
+      // 2. Scope Popover: switch to Work profile
+      const scopeChip = page.locator(".route-strip").getByRole("button", { name: "已连接" });
+      await scopeChip.click();
+      const scopeDialog = page.getByRole("dialog", { name: "选择 Scope" });
+      await expect(scopeDialog).toBeVisible();
+      await scopeDialog.getByRole("button", { name: /Work/ }).click();
+      await expect(page.locator(".route-strip")).toContainText("Work");
+      await expect(detailsCard.locator('[data-cli-action="delete"]')).toHaveAttribute(
+        "data-cli-command",
+        "hermes session delete --profile work sess-t36-work",
+      );
+
+      // 3. Settings Modal via rail gear button -> verify 9 sections & 3-place AppInfo parity -> Esc returns focus
+      const railGearBtn = page.locator("#rail-settings-gear");
+      await railGearBtn.focus();
+      await railGearBtn.click();
+      const settingsDialog = page.getByRole("dialog", { name: "Settings" });
+      await expect(settingsDialog).toBeVisible();
+
+      const aboutHeadline = await settingsDialog
+        .locator('section.settings-section[aria-label="About"] .settings-about-headline')
+        .innerText();
+      const diagHeadline = await settingsDialog
+        .locator('section.settings-section[aria-label="Diagnostics"] .settings-about-headline')
+        .innerText();
+      const exportDiag = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: {
+            request: (cmd: string, p?: Record<string, unknown>) => Promise<{
+              ok: boolean;
+              value: { display: { headline: string } };
+            }>;
+          };
+        };
+        const res = await w.hermesHost.request("diagnostics.export", {});
+        return res.value.display.headline;
+      });
+      expect(aboutHeadline).toBe(diagHeadline);
+      expect(aboutHeadline).toBe(exportDiag);
+
+      await page.keyboard.press("Escape");
+      await expect(settingsDialog).toBeHidden();
+      await expect(railGearBtn).toBeFocused();
+
+      // 4. Open Settings again, then close window (Cmd+W / win.close()) and reopen via app.emit("activate")
+      await railGearBtn.click();
+      await expect(settingsDialog).toBeVisible();
+
+      const reopenedPromise = electronApp.waitForEvent("window");
+      await electronApp.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()[0]?.close();
+      });
+      await expect
+        .poll(async () => electronApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length))
+        .toBe(0);
+
+      await electronApp.evaluate(({ app }) => {
+        app.emit("activate");
+      });
+      const reopenedPage = await reopenedPromise;
+      await reopenedPage.waitForLoadState("domcontentloaded");
+      await expect(reopenedPage.locator(".route-strip")).toContainText("Work", { timeout: 15_000 });
+      await expect(reopenedPage.getByRole("dialog", { name: "Settings" })).toHaveCount(0);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("Ticket #39: Electron Main binds WS approval.requested with session cwd, enforces rail needs-input confinement, settles approval.respond, and leaks zero secrets", async () => {
+    const sandbox = createTestSandbox("hr-t39-");
+    let passed = false;
+    const validTickets = new Set<string>(["tkt_elec_1", "tkt_elec_2"]);
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+        "prompt.submit",
+        "prompt.cancel",
+        "session.steer",
+        "approval.pending",
+        "approval.respond",
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "sess-elec-fg",
+          title: "Electron Active Session",
+          preview: "fg ready",
+          cwd: "/srv/hermes/active",
+        },
+        {
+          profile_id: "default",
+          session_id: "sess-elec-bg",
+          title: "Electron Background Session",
+          preview: "bg ready",
+          cwd: "/srv/hermes/bg",
+        },
+      ],
+      onRpc: async (method, params, { replyResult }) => {
+        if (method === "approval.pending") {
+          replyResult({ approvals: [] });
+          return true;
+        }
+        if (method === "approval.respond") {
+          replyResult({ status: "settled", choice: params.choice ?? "once" });
+          return true;
+        }
+        return false;
+      },
+    });
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+      withHostScope: false,
+    });
+    fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("load");
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+      await expect(page.locator("nav.sidebar")).toContainText("Electron Active Session");
+      // Wait for initial connect approval.pending rehydration RPC before sending live approval.requested
+      await expect
+        .poll(() => gw.rpcCalls.some((c) => c.method === "approval.pending"))
+        .toBe(true);
+
+      // Push a background session high-risk request + foreground normal request over real WS
+      gw.sendServerRequest(701, "approval.requested", {
+        approval_id: "apr-elec-bg",
+        profile_id: "default",
+        session_id: "sess-elec-bg",
+        turn_id: "turn-bg-1",
+        execution_generation: 1,
+        command: "sudo systemctl status hermes",
+        description: "Check background status",
+        choices: ["once", "deny"],
+      });
+      gw.sendServerRequest(703, "approval.requested", {
+        approval_id: "apr-elec-fg-real",
+        profile_id: "default",
+        session_id: "sess-elec-fg",
+        turn_id: "turn-fg-2",
+        execution_generation: 1,
+        command: "ls -la",
+        description: "List active workspace",
+        choices: ["once", "deny"],
+      });
+
+      // Only owning foreground session renders its approval; background approval surfaces only as needs-input badge
+      const fgCard = page.locator('[data-testid="approval-card"]').filter({ hasText: "ls -la" });
+      await expect(fgCard).toBeVisible({ timeout: 10_000 });
+      await expect(fgCard).toContainText("/srv/hermes/active");
+      await expect(fgCard.locator("input, select, textarea")).toHaveCount(0);
+      await expect(
+        page.locator('[data-testid="approval-card"]').filter({ hasText: "sudo systemctl status hermes" }),
+      ).toHaveCount(0);
+
+      const bgRow = page.locator("nav.sidebar").getByRole("button", { name: /Electron Background Session/ });
+      await expect(bgRow.getByTestId("session-needs-input-badge")).toBeVisible();
+
+      // Approve active foreground card (`once`) -> sends approval.respond with approval_id + server_request_id
+      await fgCard.getByTestId("approval-choice-once").click();
+      await expect(fgCard).toHaveAttribute("data-approval-state", "settled");
+      await expect
+        .poll(() =>
+          gw.rpcCalls.some(
+            (c) =>
+              c.method === "approval.respond" &&
+              c.params.approval_id === "apr-elec-fg-real" &&
+              c.params.server_request_id === 703 &&
+              c.params.choice === "once",
+          ),
+        )
+        .toBe(true);
+
+      // Switch to background session -> deny sudo approval (skipping native sheet since deny never needs confirm)
+      await bgRow.click();
+      const bgCard = page
+        .locator('[data-testid="approval-card"]')
+        .filter({ hasText: "sudo systemctl status hermes" });
+      await expect(bgCard).toBeVisible();
+      await expect(bgCard).toContainText("/srv/hermes/bg");
+      await expect(bgCard).toHaveAttribute("data-approval-state", "actionable");
+      await bgCard.getByTestId("approval-choice-deny").click();
+      await expect(bgCard).toHaveAttribute("data-approval-state", "settled");
+      await expect(bgRow.getByTestId("session-needs-input-badge")).toHaveCount(0);
+
+      // Verify zero ticket / wsUrl leak in DOM or diagnostics
+      const bodyText = await page.locator("body").innerText();
+      expect(bodyText).not.toContain("tkt_elec_");
+      expect(bodyText).not.toContain(gw.wsUrl);
+      const diagJson = await page.evaluate(async () => {
+        const w = window as unknown as {
+          hermesHost: { request: (cmd: string, p?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return JSON.stringify(await w.hermesHost.request("diagnostics.export", {}));
+      });
+      expect(diagJson).not.toContain("tkt_elec_");
+      expect(diagJson).not.toContain(gw.wsUrl);
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  test("Ticket #40: opens real Main-owned OS PTY, verifies native grant denial & approval, CSP/sandbox, reload scrollback retention, and Git deep links", async () => {
+    const sandbox = createTestSandbox("hr-t40-pty-");
+    let passed = false;
+    const gw = await startFakeGatewayServer({
+      validTickets: new Set(["tkt_elec_1", "tkt_elec_2"]),
+      profiles: [
+        { profile_id: "default", display_name: "Default", handle: "default", is_default: true },
+      ],
+      initialSessions: [
+        {
+          profile_id: "default",
+          session_id: "sess-t40-elec",
+          title: "PTY Smoke Session",
+          preview: "ready",
+        },
+      ],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    writeElectronFakeCli({
+      cliPath,
+      counterFile: path.join(sandbox.rootDir, "cli-counter.txt"),
+      wsUrl: gw.wsUrl,
+    });
+    fs.mkdirSync(sandbox.userDataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, "local-preferences.json"),
+      JSON.stringify({ cliOverridePath: cliPath }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const electronApp = await electron.launch({
+      args: [path.resolve(process.cwd(), "apps/desktop/out/main/index.js")],
+      env: {
+        ...process.env,
+        HERMES_USER_DATA_DIR: sandbox.userDataDir,
+        HERMES_HOME: sandbox.hermesHomeDir,
+      },
+    });
+
+    try {
+      const page = await electronApp.firstWindow();
+      await page.waitForLoadState("domcontentloaded");
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+
+      // 1. Verify sandbox/contextIsolation/no-Node + CSP header on loaded renderer
+      const hardening = await electronApp.evaluate(({ BrowserWindow }) => {
+        const win = BrowserWindow.getAllWindows()[0];
+        const prefs = win.webContents.getLastWebPreferences() as Record<string, unknown>;
+        return {
+          contextIsolation: prefs.contextIsolation,
+          sandbox: prefs.sandbox,
+          nodeIntegration: prefs.nodeIntegration,
+        };
+      });
+      expect(hardening).toEqual({
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+      });
+      const nodeGlobalsAndCsp = await page.evaluate(() => ({
+        hasProcess: typeof (globalThis as Record<string, unknown>).process !== "undefined",
+        hasRequire: typeof (globalThis as Record<string, unknown>).require !== "undefined",
+        hasBuffer: typeof (globalThis as Record<string, unknown>).Buffer !== "undefined",
+      }));
+      expect(nodeGlobalsAndCsp).toEqual({
+        hasProcess: false,
+        hasRequire: false,
+        hasBuffer: false,
+      });
+
+      // 2. Intercept Main dialog.showMessageBox: DENY first-terminal grant -> PTY must NOT open
+      await electronApp.evaluate(({ dialog }) => {
+        const g = globalThis as {
+          __hermesDialogCalls?: Array<{ title?: string; message?: string }>;
+          __hermesGrantDecision?: number;
+        };
+        g.__hermesDialogCalls = [];
+        g.__hermesGrantDecision = 0; // deny
+        dialog.showMessageBox = (async (_winOrOpts: unknown, maybeOpts?: { title?: string; message?: string }) => {
+          const opts = (maybeOpts ?? _winOrOpts) as { title?: string; message?: string };
+          g.__hermesDialogCalls!.push({ title: opts?.title, message: opts?.message });
+          return { response: g.__hermesGrantDecision ?? 0, checkboxChecked: false };
+        }) as typeof dialog.showMessageBox;
+      });
+
+      await page.locator(".route-strip").getByRole("button", { name: "Workspace ⌘B" }).click();
+      const drawer = page.getByRole("complementary", { name: "Workspace" });
+      await drawer.getByRole("tab", { name: "Terminal" }).click();
+
+      await drawer.getByTestId("workspace-terminal-open-btn").click();
+      await expect(drawer.getByTestId("workspace-terminal-status")).toContainText("未授权（已拒绝）");
+      await expect(drawer.getByTestId("workspace-terminal-id")).toHaveCount(0);
+
+      const deniedDialogCalls = await electronApp.evaluate(
+        () => (globalThis as { __hermesDialogCalls?: Array<{ title?: string }> }).__hermesDialogCalls ?? [],
+      );
+      expect(deniedDialogCalls.some((c) => c.title?.includes("确认首次打开 Terminal"))).toBe(true);
+
+      // 3. Approve first-terminal grant -> opens REAL Main OS PTY -> executes shell command & resize
+      await electronApp.evaluate(() => {
+        (globalThis as { __hermesGrantDecision?: number }).__hermesGrantDecision = 1;
+      });
+      await drawer.getByTestId("workspace-terminal-open-btn").click();
+      await expect(drawer.getByTestId("workspace-terminal-status")).toContainText("运行中", {
+        timeout: 10_000,
+      });
+      const realTerminalId = await drawer.getByTestId("workspace-terminal-id").innerText();
+      expect(realTerminalId).toMatch(/^term_/);
+
+      await drawer.getByTestId("workspace-terminal-cols-input").fill("106");
+      await drawer.getByTestId("workspace-terminal-rows-input").fill("30");
+      await drawer.getByTestId("workspace-terminal-resize-btn").click();
+
+      await drawer
+        .getByTestId("workspace-terminal-input")
+        .fill('tty && stty size && echo "ELEC_REAL_""PTY_OK"');
+      await drawer.getByTestId("workspace-terminal-send-btn").click();
+
+      await expect(drawer.getByTestId("workspace-terminal-scrollback")).toContainText("/dev/tty", {
+        timeout: 10_000,
+      });
+      await expect(drawer.getByTestId("workspace-terminal-scrollback")).toContainText("30 106", {
+        timeout: 10_000,
+      });
+      await expect(drawer.getByTestId("workspace-terminal-scrollback")).toContainText(
+        "ELEC_REAL_PTY_OK",
+        { timeout: 10_000 },
+      );
+
+      // 4. Reload renderer window -> Main PTY + opaque terminalId + scrollback persist across reload
+      await page.reload();
+      await page.waitForLoadState("domcontentloaded");
+      await expect(page.locator(".route-strip")).toContainText("已连接", { timeout: 15_000 });
+      await page.locator(".route-strip").getByRole("button", { name: "Workspace ⌘B" }).click();
+      const drawerAfterReload = page.getByRole("complementary", { name: "Workspace" });
+      await drawerAfterReload.getByRole("tab", { name: "Terminal" }).click();
+      await expect(drawerAfterReload.getByTestId("workspace-terminal-id")).toHaveText(realTerminalId, {
+        timeout: 10_000,
+      });
+      await expect(drawerAfterReload.getByTestId("workspace-terminal-scrollback")).toContainText(
+        "ELEC_REAL_PTY_OK",
+      );
+
+      // 5. Git deep links tab: attribution + "不会在此客户端执行" + external https open
+      await drawerAfterReload.getByRole("tab", { name: "Git" }).click();
+      const gitPanel = drawerAfterReload.getByTestId("workspace-git-panel");
+      await expect(gitPanel.getByTestId("workspace-git-boundary")).toContainText("不会在此客户端执行");
+      await expect(gitPanel.getByTestId("workspace-git-attribution-git-status")).toContainText("外部提供");
+
+      passed = true;
+    } finally {
+      await electronApp.close();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+});
