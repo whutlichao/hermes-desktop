@@ -365,8 +365,8 @@ export const COPY_CATALOG = {
   "chat.emptyCronDefaultHint": "Routines 已折叠入 Cron 定时任务，可在能力目录查看或管理。",
   "chat.unavailableTitle": "当前 Gateway 暂不支持 Chat",
   "chat.unavailableBody": "服务端未声明 prompt.submit 能力，已隐藏对话输入，不会发送假消息。",
-  "chat.messageRequiredError": "请输入对话内容后再发送",
-  "chat.promptSubmitUnsupportedError": "当前 Gateway 不支持发送对话",
+  "chat.messageRequiredError": "发生了什么：消息内容为空。可能原因：尚未输入对话内容或输入已被清空。下一步：输入消息后重新发送。",
+  "chat.promptSubmitUnsupportedError": "发生了什么：当前 Gateway 不支持发送对话。可能原因：Gateway 版本过旧或未声明 prompt.submit 能力。下一步：升级 Gateway 或改用受支持的连接。",
   "chat.composerPlaceholder": "向当前 Scope 发送消息（Enter 发送，Shift+Enter 换行）……",
   "chat.sendAction": "发送消息",
   "chat.sendAccepted": "消息已送达 Gateway。",
@@ -879,13 +879,13 @@ export const COPY_CATALOG = {
   "turn.queue.cancelUnsupportedError": "当前 Gateway 不支持取消排队",
   "turn.queue.retryRecordNotFoundError": "未找到待重试的排队记录",
   "turn.queue.targetNotFoundError": "未找到目标排队条目",
-  "terminal.scopeRequiredError": "Terminal 操作必须提供有效 Scope。",
-  "terminal.scopeMismatchError": "Terminal 请求与当前活动 Scope 不匹配。",
-  "terminal.foreignBindingError": "Terminal ID 属于其他 Scope，已阻止跨 Scope 访问。",
-  "terminal.bindingMissingError": "指定的 Terminal 会话已不存在。",
-  "terminal.notRunningInputError": "当前 Scope 没有运行中的 Terminal，无法发送输入。",
-  "terminal.inputTypeError": "Terminal 输入内容必须为字符串。",
-  "terminal.notRunningResizeError": "当前 Scope 没有运行中的 Terminal，无法调整尺寸。",
+  "terminal.scopeRequiredError": "发生了什么：Terminal 操作缺少有效 Scope。可能原因：请求未绑定当前活动 Scope 或 Scope 已失效。下一步：重新选择 Scope 后再执行操作。",
+  "terminal.scopeMismatchError": "发生了什么：Terminal 请求与当前活动 Scope 不匹配。可能原因：连接已切换或请求来自旧 Scope。下一步：确认当前 Scope 后重试。",
+  "terminal.foreignBindingError": "发生了什么：Terminal ID 属于其他 Scope，已阻止跨 Scope 访问。可能原因：请求引用了非当前 Scope 的 Terminal。下一步：在当前 Scope 新建 Terminal 后重试。",
+  "terminal.bindingMissingError": "发生了什么：指定的 Terminal 会话已不存在。可能原因：Terminal 已关闭或连接已重建。下一步：重新打开 Terminal 后重试。",
+  "terminal.notRunningInputError": "发生了什么：当前 Scope 没有运行中的 Terminal，无法发送输入。可能原因：Terminal 尚未启动或已结束。下一步：打开 Terminal 后重新发送输入。",
+  "terminal.inputTypeError": "发生了什么：Terminal 输入内容不是字符串。可能原因：调用方传入了无效的输入类型。下一步：修正输入参数后重试。",
+  "terminal.notRunningResizeError": "发生了什么：当前 Scope 没有运行中的 Terminal，无法调整尺寸。可能原因：Terminal 尚未启动或已结束。下一步：打开 Terminal 后重新调整尺寸。",
   "turn.queue.cancelOutcome.cancelled": "排队条目已取消。",
   "turn.queue.cancelOutcome.stopped": "该排队条目已停止。",
   "turn.queue.cancelOutcome.already_started": "该排队条目已开始执行，无法再取消。",
@@ -964,6 +964,13 @@ const ERROR_TEMPLATE_KEYS = new Set<CopyKey>([
   "turn.queue.submissionIdRequiredError",
   "turn.queue.promptSubmitUnavailableError",
 ]);
+
+function requiresErrorTemplate(key: string): boolean {
+  return (
+    ERROR_TEMPLATE_KEYS.has(key as CopyKey) ||
+    ((key.startsWith("terminal.") || key.startsWith("chat.")) && key.endsWith("Error"))
+  );
+}
 
 export interface TerminologyViolation {
   key?: string;
@@ -1069,7 +1076,7 @@ export function lintCopyCatalog(
       continue;
     }
     violations.push(...validateTerminology(value, key));
-    if (ERROR_TEMPLATE_KEYS.has(key as CopyKey)) {
+    if (requiresErrorTemplate(key)) {
       for (const label of ["发生了什么", "可能原因", "下一步"]) {
         if (!value.includes(label)) {
           violations.push({
@@ -1089,37 +1096,84 @@ export interface CopyLintSourceFile {
   content: string;
 }
 
-const ERROR_FACTORY_CALL = /\b(?:makeTurnError|makeBridgeError|createCodedError|new Error)\s*\(/g;
-const STRING_LITERAL = /(["'`])((?:\\.|(?!\1)[^\\])*?)\1/g;
+const ERROR_FACTORY_CALL =
+  /\b(?:makeTurnError|makeBridgeError|createCodedError|new\s+Error)\s*\(/g;
 
-function collectVisibleLiteralsInCall(content: string, start: number): string[] {
-  let depth = 1;
+function stripComments(content: string): string {
+  let result = "";
   let quote: string | null = null;
-  let cursor = start;
-  while (cursor < content.length && depth > 0) {
+  for (let cursor = 0; cursor < content.length; cursor += 1) {
     const char = content[cursor];
     if (quote) {
+      result += char;
       if (char === "\\") {
-        cursor += 2;
-        continue;
+        result += content.slice(cursor + 1, cursor + 2);
+        cursor += 1;
+      } else if (char === quote) {
+        quote = null;
       }
-      if (char === quote) quote = null;
-      cursor += 1;
       continue;
     }
     if (char === '"' || char === "'" || char === "`") {
       quote = char;
-    } else if (char === "(") {
+      result += char;
+      continue;
+    }
+    if (char === "/" && content[cursor + 1] === "/") {
+      while (cursor < content.length && content[cursor] !== "\n") {
+        result += " ";
+        cursor += 1;
+      }
+      result += "\n";
+      continue;
+    }
+    if (char === "/" && content[cursor + 1] === "*") {
+      result += "  ";
+      cursor += 2;
+      while (
+        cursor < content.length &&
+        !(content[cursor] === "*" && content[cursor + 1] === "/")
+      ) {
+        result += content[cursor] === "\n" ? "\n" : " ";
+        cursor += 1;
+      }
+      result += "  ";
+      cursor += 1;
+      continue;
+    }
+    result += char;
+  }
+  return result;
+}
+
+function collectVisibleLiteralsInCall(content: string, start: number): string[] {
+  const literals: string[] = [];
+  let depth = 1;
+  let cursor = start;
+  while (cursor < content.length && depth > 0) {
+    const char = content[cursor];
+    if (char === '"' || char === "'" || char === "`") {
+      const quote = char;
+      const literalStart = cursor + 1;
+      cursor = literalStart;
+      while (cursor < content.length && content[cursor] !== quote) {
+        cursor += content[cursor] === "\\" ? 2 : 1;
+      }
+      const literal = content.slice(literalStart, cursor);
+      if (/[\u4e00-\u9fff]/.test(literal)) {
+        literals.push(literal);
+      }
+      cursor += 1;
+      continue;
+    }
+    if (char === "(") {
       depth += 1;
     } else if (char === ")") {
       depth -= 1;
     }
     cursor += 1;
   }
-
-  const argumentsText = content.slice(start, Math.max(start, cursor - 1));
-  return Array.from(argumentsText.matchAll(STRING_LITERAL), (match) => match[2])
-    .filter((literal) => !literal.includes("\n") && /[\u4e00-\u9fff]/.test(literal));
+  return literals;
 }
 
 export function lintVisibleErrorLiterals(
@@ -1129,9 +1183,10 @@ export function lintVisibleErrorLiterals(
   const violations: TerminologyViolation[] = [];
   for (const file of files) {
     const counts = new Map<string, number>();
-    for (const call of file.content.matchAll(ERROR_FACTORY_CALL)) {
+    const content = stripComments(file.content);
+    for (const call of content.matchAll(ERROR_FACTORY_CALL)) {
       for (const literal of collectVisibleLiteralsInCall(
-        file.content,
+        content,
         call.index! + call[0].length,
       )) {
         counts.set(literal, (counts.get(literal) ?? 0) + 1);
