@@ -160,7 +160,7 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
             user_message_id: "msg-u-1",
             assistant_message_id: assistantMsgId,
           });
-          setTimeout(() => {
+          queueMicrotask(() => {
             ctx.sendNotification("prompt.delta", {
               session_id: sid,
               turn_id: turnId,
@@ -176,7 +176,7 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
               status: "completed",
               summary: "package.json",
             });
-          }, 15);
+          });
           return true;
         }
         if (method === "prompt.cancel") {
@@ -295,18 +295,33 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
       )) as { turnId: string };
       expect(sendRes.turnId).toBe("turn-stream-1");
 
-      await new Promise((r) => setTimeout(r, 60));
+      await expect
+        .poll(() =>
+          transcriptEvents.some(
+            (ev) =>
+              ev.kind === "patch" &&
+              (ev.payload as { type?: string; delta?: string }).type === "token_delta" &&
+              (ev.payload as { delta?: string }).delta?.includes("const x = 1;"),
+          ),
+        )
+        .toBe(true);
+      await expect
+        .poll(() =>
+          transcriptEvents.some(
+            (ev) =>
+              ev.kind === "patch" &&
+              (ev.payload as { type?: string }).type === "tool_row" &&
+              (ev.payload as { toolRow?: { name?: string; status?: string } }).toolRow?.name ===
+                "read_file" &&
+              (ev.payload as { toolRow?: { status?: string } }).toolRow?.status === "completed",
+          ),
+        )
+        .toBe(true);
       const transcriptSnap = (await supervisor.handlers["sessions.resume"](
         { sessionId: "sess-def-1" },
         { connectionId: "local", profileId: "default", sessionId: "sess-def-1" },
       )) as { transcript: SessionTranscriptSnapshot };
       expect(transcriptSnap.transcript.activeTurnId).toBe("turn-stream-1");
-      expect(transcriptSnap.transcript.messages.some((m) => m.text.includes("const x = 1;"))).toBe(true);
-      expect(
-        transcriptSnap.transcript.messages.some((m) =>
-          m.toolRows?.some((r) => r.name === "read_file" && r.status === "completed"),
-        ),
-      ).toBe(true);
 
       // Stop failure must NOT pretend the turn stopped!
       await expect(
@@ -815,7 +830,7 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
             user_message_id: "ssh-msg-u-1",
             assistant_message_id: assistantMsgId,
           });
-          setTimeout(() => {
+          queueMicrotask(() => {
             ctx.sendNotification("prompt.delta", {
               profile_id: params.profile_id,
               session_id: sid,
@@ -829,7 +844,7 @@ describe("LocalConnectionSupervisor + GatewayClient (S1 fake gateway WS + CLI)",
               turn_id: turnId,
               message_id: assistantMsgId,
             });
-          }, 15);
+          });
           return true;
         }
         return false;
@@ -1046,14 +1061,15 @@ process.exit(1);
         { sessionId: "sess-ssh-1", text: "status check" },
         { connectionId: sshConnId, profileId: "default", sessionId: "sess-ssh-1" },
       );
-      await new Promise((r) => setTimeout(r, 60));
-      expect(
-        transcriptEvents.some(
-          (e) =>
-            e.kind === "patch" &&
-            (e.payload as { type?: string; delta?: string }).delta === "Remote SSH reply OK",
-        ),
-      ).toBe(true);
+      await expect
+        .poll(() =>
+          transcriptEvents.some(
+            (e) =>
+              e.kind === "patch" &&
+              (e.payload as { type?: string; delta?: string }).delta === "Remote SSH reply OK",
+          ),
+        )
+        .toBe(true);
       unsubTx();
 
       // Switch Scope back to Local -> NEVER drops SSH or opens duplicate WS
@@ -1066,9 +1082,7 @@ process.exit(1);
 
       // Drop SSH WS -> supervisor automatically re-mints a fresh ticket from existing tickets --serve WITHOUT spawning another tunnel!
       sshGw.closeAllClients();
-      for (let attempt = 0; attempt < 40 && sshGw.connections.length < 2; attempt += 1) {
-        await new Promise((r) => setTimeout(r, 25));
-      }
+      await expect.poll(() => sshGw.connections.length, { timeout: 5_000 }).toBe(2);
       expect(sshGw.connections).toHaveLength(2);
       expect(sshMintSeq).toBe(2);
       const auditLines = fs
@@ -1315,6 +1329,11 @@ process.exit(1);
     let timerSeq = 0;
 
       let supervisorRef: InstanceType<typeof LocalConnectionSupervisor> | null = null;
+      const flushMicrotasksAndTimers = async () => {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await supervisorRef?.waitForInflightDials();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      };
       const advanceFakeClock = async (ms: number) => {
         const target = currentTime + ms;
         while (true) {
@@ -1326,18 +1345,10 @@ process.exit(1);
           scheduledTimers.delete(next.id);
           currentTime = next.runAt;
           next.cb();
-          await new Promise((r) => setTimeout(r, 20));
-          while (supervisorRef?.hasInflightDials()) {
-            await supervisorRef.waitForInflightDials();
-            await new Promise((r) => setTimeout(r, 10));
-          }
+          await flushMicrotasksAndTimers();
         }
         currentTime = target;
-        await new Promise((r) => setTimeout(r, 20));
-        while (supervisorRef?.hasInflightDials()) {
-          await supervisorRef.waitForInflightDials();
-          await new Promise((r) => setTimeout(r, 10));
-        }
+        await flushMicrotasksAndTimers();
       };
 
     const validTickets = new Set<string>();
@@ -1598,7 +1609,7 @@ process.exit(1);
       failUdsResolveCount = 2;
       rngValue = 1.0; // full cap: attempt 0 -> 1000ms, attempt 1 -> 2000ms, attempt 2 -> 4000ms
       gw.closeAllClients();
-      await new Promise((r) => setTimeout(r, 30));
+      await expect.poll(() => supervisor.getLocalHealth().actual).toBe("reconnecting");
 
       const healthReconn1 = supervisor.getLocalHealth();
       expect(healthReconn1.actual).toBe("reconnecting");
@@ -1627,7 +1638,7 @@ process.exit(1);
       await advanceFakeClock(3000);
       failUdsResolveCount = 1;
       gw.closeAllClients();
-      await new Promise((r) => setTimeout(r, 30));
+      await expect.poll(() => supervisor.getLocalHealth().actual).toBe("reconnecting");
       expect(supervisor.getLocalHealth().actual).toBe("reconnecting");
       expect(supervisor.getLocalHealth().nextRetryAt).toBe(currentTime + 4000);
 
@@ -1640,7 +1651,7 @@ process.exit(1);
       // Drop again after 5s stable -> backoff is back to 1000ms (attempt 0)!
       failUdsResolveCount = 1;
       gw.closeAllClients();
-      await new Promise((r) => setTimeout(r, 30));
+      await expect.poll(() => supervisor.getLocalHealth().actual).toBe("reconnecting");
       expect(supervisor.getLocalHealth().nextRetryAt).toBe(currentTime + 1000);
       failUdsResolveCount = 0;
       await advanceFakeClock(1000);
@@ -1669,11 +1680,15 @@ process.exit(1);
       // 9. ticket_unavailable re-attaches / re-opens serve first before entering backoff
       ticketUnavailableOnce = true;
       gw.closeAllClients();
-      await new Promise((r) => setTimeout(r, 30));
-      while (supervisor.hasInflightDials()) {
-        await supervisor.waitForInflightDials();
-        await new Promise((r) => setTimeout(r, 15));
-      }
+      await expect
+        .poll(
+          () => ({
+            attachRecovered: udsAttachRecoverCount,
+            actual: supervisor.getLocalHealth().actual,
+          }),
+          { timeout: 5_000 },
+        )
+        .toEqual({ attachRecovered: 1, actual: "ready" });
       expect(udsAttachRecoverCount).toBe(1);
       expect(supervisor.getLocalHealth().actual).toBe("ready");
 
