@@ -243,34 +243,44 @@ export function ChatThread({
   const isTrulyUnconnected = !hasReadyConnection && !hasEstablishedScope;
   const queuePaused = Boolean(turnRecovery?.queuePaused || turnRecovery?.unknownTurn);
 
+  const renderStopErrorAlert = () =>
+    stopError ? (
+      <div className="chat-alert" role="alert" data-testid="chat-surface-alert">
+        {stopError}
+      </div>
+    ) : null;
+
   const renderDraftAlertsAndComposer = () => {
     if (isTrulyUnconnected) {
       return (
-        <form
-          className="composer-shell"
-          onSubmit={(event) => {
-            event.preventDefault();
-          }}
-        >
-          <label htmlFor="composer-input" className="sr-only">
-            {getCopy("composer.label")}
-          </label>
-          <textarea
-            id="composer-input"
-            ref={composerRef}
-            className="composer-textarea"
-            rows={2}
-            readOnly
-            aria-disabled="true"
-            placeholder={getCopy("composer.placeholder")}
-          />
-          <div className="composer-bar">
-            <span className="composer-hint">{getCopy("composer.unconnectedHint")}</span>
-            <button type="submit" className="button button-primary" disabled>
-              {getCopy("composer.send")}
-            </button>
-          </div>
-        </form>
+        <>
+          {renderStopErrorAlert()}
+          <form
+            className="composer-shell"
+            onSubmit={(event) => {
+              event.preventDefault();
+            }}
+          >
+            <label htmlFor="composer-input" className="sr-only">
+              {getCopy("composer.label")}
+            </label>
+            <textarea
+              id="composer-input"
+              ref={composerRef}
+              className="composer-textarea"
+              rows={2}
+              readOnly
+              aria-disabled="true"
+              placeholder={getCopy("composer.placeholder")}
+            />
+            <div className="composer-bar">
+              <span className="composer-hint">{getCopy("composer.unconnectedHint")}</span>
+              <button type="submit" className="button button-primary" disabled>
+                {getCopy("composer.send")}
+              </button>
+            </div>
+          </form>
+        </>
       );
     }
 
@@ -554,6 +564,7 @@ export function ChatThread({
       : null;
     return (
       <div className="thread-column">
+        {!isTrulyUnconnected && renderStopErrorAlert()}
         {unverifiedChat && (
           <section className="empty-relay-card unverified-card" role="status">
             <div className="local-repair-header">
@@ -638,6 +649,7 @@ export function ChatThread({
     const missing = chatState.missingSession;
     return (
       <div className="thread-column">
+        {renderStopErrorAlert()}
         <section
           className="empty-relay-card session-missing-card"
           aria-labelledby="session-missing-heading"
@@ -830,11 +842,7 @@ export function ChatThread({
         </section>
       )}
 
-      {stopError && (
-        <div className="chat-alert" role="alert" data-testid="chat-surface-alert">
-          {stopError}
-        </div>
-      )}
+      {renderStopErrorAlert()}
 
       {approvalSections}
 

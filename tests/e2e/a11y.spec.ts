@@ -1700,7 +1700,63 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
           },
           activeSessionId: "sess-live-region",
         },
+        chatState: {
+          windowId: "primary",
+          paneId: "main",
+          lastActiveChat: {
+            connectionId: "local",
+            profileId: "default",
+            sessionId: "sess-live-region",
+          },
+          lastSessionByScope: { "local::default": "sess-live-region" },
+          lastValidProfileByConnection: { local: "default" },
+          lastValidScopes: [{ connectionId: "local", profileId: "default" }],
+          sessionSummaries: {
+            "local::default::sess-live-region": {
+              connectionId: "local",
+              profileId: "default",
+              sessionId: "sess-live-region",
+              title: "Live Region Session",
+              hasDraft: true,
+              draftText: "session missing surface probe",
+            },
+          },
+          draftsByKey: {
+            "local::default::sess-live-region": {
+              draftId: "draft-live-region",
+              sessionId: "sess-live-region",
+              scope: { connectionId: "local", profileId: "default" },
+              text: "session missing surface probe",
+              attachments: [],
+              contexts: [],
+              composer: {},
+              updatedAt: "2026-11-23T09:00:00.000Z",
+              revision: 1,
+              origin: {
+                connectionId: "local",
+                profileId: "default",
+                sessionId: "sess-live-region",
+                title: "Live Region Session",
+              },
+              deliveryStatus: "idle",
+            },
+          },
+          draftStorageUsage: {
+            totalBytes: 30,
+            maxDraftBytes: 1024 * 1024,
+            maxTotalBytes: 50 * 1024 * 1024,
+            overTotalLimit: false,
+            draftCount: 1,
+            orphanedCount: 0,
+          },
+          activeStatus: "ready",
+          lastKnownUnverified: false,
+          missingSession: null,
+          routeBanner: null,
+        },
         approvalRespondFailure: true,
+        failPromptSend: true,
+        missingSessionOnPromptFailure: true,
         approvals: [
           {
             gateway: {
@@ -1735,6 +1791,8 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
 
     const politeRegion = page.getByTestId("live-region-polite");
     const assertiveRegion = page.getByTestId("live-region-assertive");
+    const surfaceAlert = page.getByTestId("chat-surface-alert");
+    const surfaceErrorText = "宿主内部处理失败，请重试或导出脱敏诊断信息。";
     await expect(politeRegion).toHaveCount(1);
     await expect(assertiveRegion).toHaveCount(1);
     await expect(assertiveRegion).not.toHaveAttribute("role", "alert");
@@ -1768,6 +1826,42 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
       expect(style.overflow).toBe("hidden");
     }
 
+    await expect(page.locator("#composer-input")).toHaveValue("session missing surface probe");
+    const assertiveSeqBeforeEarlyReturnFailure =
+      await assertiveRegion.getAttribute("data-announcement-seq");
+    await page.getByRole("button", { name: "发送消息", exact: true }).click();
+    await expect(page.locator(".session-missing-card")).toBeVisible();
+    await expect(surfaceAlert).toBeVisible();
+    await expect(surfaceAlert).toHaveAttribute("role", "alert");
+    await expect(surfaceAlert).toContainText(surfaceErrorText);
+    await expect(surfaceAlert).toHaveCount(1);
+    await expect(
+      page
+        .locator('[role="alert"], [aria-live]:not([aria-live="off"])')
+        .filter({ hasText: surfaceErrorText }),
+    ).toHaveCount(1);
+    await expect(assertiveRegion).not.toContainText(surfaceErrorText);
+    await expect(assertiveRegion).toHaveAttribute(
+      "data-announcement-seq",
+      assertiveSeqBeforeEarlyReturnFailure ?? "0",
+    );
+
+    await page.evaluate(() => {
+      const fixture = (
+        window as unknown as {
+          __HERMES_E2E_FIXTURE__: {
+            failPromptSend?: boolean;
+            missingSessionOnPromptFailure?: boolean;
+          };
+        }
+      ).__HERMES_E2E_FIXTURE__;
+      fixture.failPromptSend = false;
+      fixture.missingSessionOnPromptFailure = false;
+    });
+    await page.getByRole("button", { name: "关闭并切换可用 Session" }).click();
+    await expect(page.locator(".session-missing-card")).toHaveCount(0);
+    await expect(surfaceAlert).toHaveCount(1);
+
     const scopeButton = page.locator(".route-strip").getByRole("button", {
       name: /未连接|已连接/,
     });
@@ -1798,6 +1892,7 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
           __HERMES_E2E_FIXTURE__: {
             failPromptSend?: boolean;
             promptReceiptMode?: "accepted" | "admitted" | "delivery_unknown";
+            missingSessionOnPromptFailure?: boolean;
           };
         }
       ).__HERMES_E2E_FIXTURE__;
@@ -1811,8 +1906,6 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
       .getByRole("button", { name: "发送消息", exact: true });
     await sendButton.click();
 
-    const surfaceAlert = page.getByTestId("chat-surface-alert");
-    const surfaceErrorText = "宿主内部处理失败，请重试或导出脱敏诊断信息。";
     await expect(surfaceAlert).toBeVisible();
     await expect(surfaceAlert).toHaveAttribute("role", "alert");
     await expect(surfaceAlert).toContainText(surfaceErrorText);
@@ -1833,11 +1926,13 @@ test.describe("E2E-MOTION-01 / E2E-ZOOM-01 / E2E-CONTRAST-01", () => {
           __HERMES_E2E_FIXTURE__: {
             failPromptSend?: boolean;
             promptReceiptMode?: "accepted" | "admitted" | "delivery_unknown";
+            missingSessionOnPromptFailure?: boolean;
           };
         }
       ).__HERMES_E2E_FIXTURE__;
       fixture.failPromptSend = false;
       fixture.promptReceiptMode = "accepted";
+      fixture.missingSessionOnPromptFailure = false;
     });
     await sendButton.click();
     await expect(surfaceAlert).toHaveCount(0);

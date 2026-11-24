@@ -266,6 +266,7 @@ interface MockE2EFixture {
   promptReceiptMode?: "accepted" | "admitted" | "delivery_unknown";
   failSessionCreate?: boolean;
   failPromptSend?: boolean;
+  missingSessionOnPromptFailure?: boolean;
   turnRecovery?: {
     sessions?: Array<{
       connectionId?: string;
@@ -3796,6 +3797,27 @@ export function createMockHostBridge(): HermesHost {
         }
         if (liveFixture?.failPromptSend) {
           markMockDraftDeliveryStatus(cid, pid, sid, draftId, "delivery_unknown");
+          if (liveFixture?.missingSessionOnPromptFailure) {
+            currentChatState = recomputeMockDraftState({
+              ...currentChatState,
+              lastActiveChat: { connectionId: cid, profileId: pid, sessionId: sid },
+              lastSessionByScope: {
+                ...currentChatState.lastSessionByScope,
+                [`${cid}::${pid}`]: sid,
+              },
+              activeStatus: "session_missing",
+              missingSession: {
+                connectionId: cid,
+                profileId: pid,
+                sessionId: sid,
+                title: "Missing session after failed send",
+                hasDraft: Boolean(text),
+                ...(text ? { draftText: text } : {}),
+                lastKnownMessages: [],
+              },
+            });
+            emitChatStatePatch();
+          }
           const err = new Error("Delivery status unknown");
           (err as { code?: string }).code = "gateway_error";
           throw err;
