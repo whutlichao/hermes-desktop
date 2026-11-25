@@ -581,4 +581,85 @@ describe("ChatSessionStateStore (S1/S3 startup recovery, 0600 persistence, sessi
       sandbox.cleanup(passed);
     }
   });
+
+  it("preserves persisted canonical path profileIds and non-destructively adopts legacy handle aliases", () => {
+    const sandbox = createTestSandbox("hermes-chatstate-optionb-alias-");
+    let passed = false;
+    try {
+      const canonicalPath = sandbox.hermesHomeDir;
+      const store = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      store.recordActiveChat({
+        connectionId: "local",
+        profileId: "default",
+        sessionId: "sess-legacy",
+      });
+      store.syncSessionSummaries([session("local", "default", "sess-legacy", "Legacy Chat")]);
+      store.saveDraft(
+        { connectionId: "local", profileId: "default", sessionId: "sess-legacy" },
+        "legacy unsent draft",
+      );
+      store.saveDraft(
+        { connectionId: "remote-1", profileId: "/srv/remote-profile", sessionId: "sess-rem" },
+        "remote unsent draft",
+      );
+
+      expect(store.adoptLocalProfileAlias("default", canonicalPath)).toBe(true);
+
+      const reloaded = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir }).load();
+      expect(reloaded.lastActiveChat).toEqual({
+        connectionId: "local",
+        profileId: canonicalPath,
+        sessionId: "sess-legacy",
+      });
+      expect(reloaded.lastValidProfileByConnection.local).toBe(canonicalPath);
+      expect(reloaded.lastSessionByScope[`local::${canonicalPath}`]).toBe("sess-legacy");
+      expect(reloaded.lastSessionByScope["local::default"]).toBeUndefined();
+      expect(reloaded.sessionSummaries[`local::${canonicalPath}::sess-legacy`]).toMatchObject({
+        profileId: canonicalPath,
+        hasDraft: true,
+        draftText: "legacy unsent draft",
+      });
+      expect(
+        reloaded.draftsByKey?.[makeActiveChatDraftKey("local", canonicalPath, "sess-legacy")],
+      ).toMatchObject({
+        scope: { connectionId: "local", profileId: canonicalPath },
+        text: "legacy unsent draft",
+      });
+      expect(
+        reloaded.draftsByKey?.[makeActiveChatDraftKey("remote-1", "/srv/remote-profile", "sess-rem")],
+      ).toMatchObject({
+        scope: { connectionId: "remote-1", profileId: "/srv/remote-profile" },
+        text: "remote unsent draft",
+      });
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("persists optional localProfileHandlesByCanonical across restarts while loading legacy files without it", () => {
+    const sandbox = createTestSandbox("hermes-chatstate-profile-handles-");
+    let passed = false;
+    try {
+      const store1 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      // Legacy file without localProfileHandlesByCanonical must load cleanly with empty handles
+      expect(store1.load().activeStatus).toBe("empty");
+      expect(store1.getLocalProfileHandles()).toEqual({});
+
+      const opsPath = path.join(sandbox.hermesHomeDir, "profiles", "ops");
+      expect(store1.recordLocalProfileAlias(`${opsPath}/`, "ops")).toBe(true);
+      expect(store1.recordLocalProfileAlias(opsPath, "ops")).toBe(false);
+      // Reject path-like handle
+      expect(store1.recordLocalProfileAlias(opsPath, "/bad/handle")).toBe(false);
+
+      const store2 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      store2.load();
+      expect(store2.getLocalProfileHandles()).toEqual({ [opsPath]: "ops" });
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
 });

@@ -1092,4 +1092,89 @@ describe("CapabilityRegistry 21-domain matrix, explicit aliases & invariants (S0
     expect(unavailable.cron.supportedActions.canStatus).toBe(false);
     expect(unavailable.cron.supportedActions.canSubmit).toBe(false);
   });
+
+  it("R11 repro: applyConnectHandshake recognizes Hermes 0.23.4 durable-admission-v1 capability array for prompt.submit", () => {
+    const registry = new CapabilityRegistry();
+    const snap = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "/Users/apple/.hermes",
+      ownerGeneration: 1,
+      authorityEpoch: 27,
+      gatewayVersionOrSha: "8fc0374447313e276f6b9a2764bfc750190c966a",
+      serverRequestsSupported: true,
+      describeResult: {
+        runtime_protocol: 1,
+        capabilities: [
+          "durable-admission-v1",
+          "event-replay-v1",
+          "local-cli-create-v1",
+          "acp-editor-policy-v1",
+          "acp-session-mcp-v1",
+          "clarify-batch-v1",
+          "plugin-rpc-v1",
+          "session-client-v1",
+          "session-transcript-v1",
+          "session-list-picker-v1",
+          "session-list-cursor-v1",
+          "client-identity-v1",
+          "client-activity-v1",
+        ],
+      },
+    });
+
+    expect(snap.methodTiers["prompt.submit"]).toBe("served");
+    expect(snap.methodTiers["session.list"]).toBe("served");
+  });
+
+  it("maps durable-admission-v1 selectively without over-promoting undeclared methods and preserves refused_methods precedence", () => {
+    const registry = new CapabilityRegistry();
+    const selective = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 1,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "0.23.4",
+      serverRequestsSupported: true,
+      describeResult: {
+        runtime_protocol: 1,
+        capabilities: ["durable-admission-v1"],
+      },
+    });
+    expect(selective.methodTiers["prompt.submit"]).toBe("served");
+    expect(selective.methodTiers["session.list"]).toBeUndefined();
+    expect(selective.methodTiers["prompt.cancel"]).toBeUndefined();
+
+    const refused = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 2,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "0.23.4",
+      serverRequestsSupported: true,
+      describeResult: {
+        runtime_protocol: 1,
+        capabilities: ["durable-admission-v1", "session-list-picker-v1"],
+        refused_methods: ["prompt.submit"],
+      },
+    });
+    expect(refused.methodTiers["prompt.submit"]).toBe("refused");
+    expect(refused.methodTiers["session.list"]).toBe("served");
+
+    const mapPartialRefusal = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 3,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "0.23.4",
+      serverRequestsSupported: true,
+      describeResult: {
+        runtime_protocol: 1,
+        capabilities: { chat: true },
+        refused_methods: ["prompt.submit"],
+      },
+    });
+    expect(mapPartialRefusal.methodTiers["prompt.submit"]).toBe("refused");
+    expect(mapPartialRefusal.methodTiers["prompt.cancel"]).toBe("served");
+    expect(mapPartialRefusal.methodTiers["session.steer"]).toBe("served");
+  });
 });

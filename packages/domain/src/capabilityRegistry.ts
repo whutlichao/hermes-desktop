@@ -34,6 +34,7 @@ import type {
   ToolsInventoryView,
 } from "@hermes/contracts";
 import { getCopy, type CopyKey } from "./copy";
+import { classifyRuntimeCapabilities } from "./gatewayProtocol";
 
 export interface CapabilityDomainMeta {
   domain: CapabilityDomainId;
@@ -1527,31 +1528,43 @@ function parseDescribeMethodTiers(
   }
 
   // Fallback when runtime.describe uses capabilities map or capability tags without served_methods
-  if (Object.keys(methodTiers).length === 0) {
+  if (
+    !Array.isArray(describeResult.served_methods) &&
+    !Array.isArray(describeResult.older_methods) &&
+    Object.keys(methodTiers).filter((method) => methodTiers[method] !== "refused").length === 0
+  ) {
     if (caps && typeof caps === "object" && !Array.isArray(caps)) {
       const capMap = caps as Record<string, unknown>;
       for (const [k, v] of Object.entries(capMap)) {
         if (k === "plugin-rpc-v1" || k.startsWith("plugin.")) continue;
-        if (v === true) methodTiers[k] = "served";
-        else if (v === false) methodTiers[k] = "refused";
+        if (!methodTiers[k]) {
+          if (v === true) methodTiers[k] = "served";
+          else if (v === false) methodTiers[k] = "refused";
+        }
       }
-      if (capMap.chat === true && !methodTiers["prompt.submit"]) {
-        methodTiers["prompt.submit"] = "served";
-        methodTiers["prompt.cancel"] = "served";
-        methodTiers["session.steer"] = "served";
+      if (capMap.chat === true) {
+        if (!methodTiers["prompt.submit"]) methodTiers["prompt.submit"] = "served";
+        if (!methodTiers["prompt.cancel"]) methodTiers["prompt.cancel"] = "served";
+        if (!methodTiers["session.steer"]) methodTiers["session.steer"] = "served";
       }
     } else {
       const capList = asStringArray(caps);
-      if (capList.includes("session-authority-v1")) {
-        methodTiers["session.list"] = "served";
-        methodTiers["session.create"] = "served";
-        methodTiers["session.resume"] = "served";
-        methodTiers["profiles.list"] = "served";
-      }
-      if (capList.includes("chat-v1") || capList.includes("prompt.submit")) {
-        methodTiers["prompt.submit"] = "served";
-        methodTiers["prompt.cancel"] = "served";
-        methodTiers["session.steer"] = "served";
+      const classified = classifyRuntimeCapabilities({ capabilities: capList });
+      const hasLegacyChatTag = capList.includes("chat-v1") || capList.includes("prompt.submit");
+      const tagMethods: ReadonlyArray<[boolean, string]> = [
+        [classified.promptSubmit, "prompt.submit"],
+        [classified.promptCancel || hasLegacyChatTag, "prompt.cancel"],
+        [classified.promptSteer || hasLegacyChatTag, "session.steer"],
+        [classified.sessionCreate, "session.create"],
+        [classified.sessionResume, "session.resume"],
+        [classified.sessionList, "session.list"],
+        [classified.sessionTranscript, "session.transcript"],
+        [classified.profilesList, "profiles.list"],
+      ];
+      for (const [supported, method] of tagMethods) {
+        if (supported && !methodTiers[method]) {
+          methodTiers[method] = "served";
+        }
       }
     }
   }

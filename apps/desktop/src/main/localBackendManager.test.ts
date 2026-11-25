@@ -1039,4 +1039,250 @@ describe("LocalBackendManager (S2 fake CLI/process/control-socket/fs/clock)", ()
       sandbox.cleanup(passed);
     }
   });
+
+  it("R11 repro: prepareDial with canonical home profileId persisted by Hermes 0.23.4 must not pass --profile <path> to CLI", async () => {
+    const sandbox = createTestSandbox("hermes-r11-canonical-profile-cli-");
+    let passed = false;
+    try {
+      const cliBin = path.join(sandbox.rootDir, "hermes");
+      const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+      const profileIdentity = sandbox.hermesHomeDir;
+      const endpoint = {
+        api_origin: "http://127.0.0.1:63943",
+        authority_epoch: 27,
+        capabilities: ["durable-admission-v1", "event-replay-v1", "session-authority-v1"],
+        code_sha: "sha_live_0234",
+        control_home: null,
+        instance_id: "inst-live-0234",
+        profile_id: profileIdentity,
+        runtime_protocol: 1,
+        supervisor: "launchd",
+      };
+
+      const ports = createFakePorts({
+        sandboxRoot: sandbox.rootDir,
+        userDataDir: sandbox.userDataDir,
+        overridePath: cliBin,
+        files: {
+          [cliBin]: { executable: true },
+          [sockPath]: { executable: false },
+        },
+        processes: (req) => {
+          const profileFlagIdx = req.args.indexOf("--profile");
+          const requestedCliProfile =
+            profileFlagIdx >= 0 ? req.args[profileFlagIdx + 1] : undefined;
+          // Real Hermes 0.23.4 CLI rejects filesystem path selectors passed to --profile with exit code 2
+          if (requestedCliProfile && requestedCliProfile.includes(path.sep)) {
+            return {
+              exitCode: 2,
+              stdout: "",
+              stderr: `Error: '${requestedCliProfile}' is not a valid profile name. Use lowercase letters, numbers, '-' or '_'`,
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("--version")) {
+            return { exitCode: 0, stdout: "Hermes Agent v0.23.4", stderr: "", timedOut: false };
+          }
+          if (
+            req.args.includes("gateway") &&
+            req.args.includes("--help") &&
+            !req.args.includes("ensure") &&
+            !req.args.includes("attach")
+          ) {
+            return { exitCode: 0, stdout: "{run,ensure,attach,tickets,restart}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--help")) {
+            return { exitCode: 0, stdout: "--json --timeout", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("attach") && req.args.includes("--help")) {
+            return { exitCode: 0, stdout: "--json --recover", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("tickets") && req.args.includes("--probe")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                protocol: 1,
+                purposes: ["interactive", "native-http"],
+                windows_service_session: false,
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                client_code_sha: "sha_live_0234",
+                detail: null,
+                endpoint,
+                reason_code: null,
+                state: "ready",
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("attach") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                client_code_sha: "sha_live_0234",
+                detail: null,
+                endpoint,
+                protocol: "hermes-gateway-v1",
+                protocols: ["hermes-gateway-v1", "hermes-gateway-ticket.tkt_0234_1"],
+                reason_code: null,
+                state: "ready",
+                ticket: "tkt_0234_1",
+                url: "ws://127.0.0.1:63943/api/ws",
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+        },
+      });
+      ports.ports.getControlSocketCandidates = () => [sockPath];
+      ports.ports.controlSocketRequest = async () => ({ status: "unsupported" });
+
+      const mgr = new LocalBackendManager(ports.ports);
+      const firstDial = await mgr.prepareDial({ profileId: "default" });
+      expect(firstDial.ok).toBe(true);
+      if (!firstDial.ok) return;
+
+      // Subsequent startup / retry / scopes.switch receives the persisted canonical profileId (e.g. ~/.hermes)
+      const secondDial = await mgr.prepareDial({ profileId: firstDial.dial.profileId });
+      expect(secondDial.ok).toBe(true);
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("maps cold-start path profileId to default CLI selector while keeping canonical dial.profileId and preserving ops handles", async () => {
+    const sandbox = createTestSandbox("hermes-option-b-cold-ops-");
+    let passed = false;
+    try {
+      const cliBin = path.join(sandbox.rootDir, "hermes");
+      const sockPath = path.join(sandbox.hermesHomeDir, "gateway.sock");
+      const ports = createFakePorts({
+        sandboxRoot: sandbox.rootDir,
+        userDataDir: sandbox.userDataDir,
+        overridePath: cliBin,
+        files: {
+          [cliBin]: { executable: true },
+          [sockPath]: { executable: false },
+        },
+        processes: (req) => {
+          const profileFlagIdx = req.args.indexOf("--profile");
+          const requestedCliProfile =
+            profileFlagIdx >= 0 ? req.args[profileFlagIdx + 1] : undefined;
+          if (requestedCliProfile && requestedCliProfile.includes(path.sep)) {
+            return {
+              exitCode: 2,
+              stdout: "",
+              stderr: `Invalid profile selector: ${requestedCliProfile}`,
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("--version")) {
+            return { exitCode: 0, stdout: "Hermes Agent v0.23.4", stderr: "", timedOut: false };
+          }
+          if (
+            req.args.includes("gateway") &&
+            req.args.includes("--help") &&
+            !req.args.includes("ensure") &&
+            !req.args.includes("attach")
+          ) {
+            return { exitCode: 0, stdout: "{run,ensure,attach,tickets}", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("ensure") && req.args.includes("--help")) {
+            return { exitCode: 0, stdout: "--json --timeout", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("attach") && req.args.includes("--help")) {
+            return { exitCode: 0, stdout: "--json", stderr: "", timedOut: false };
+          }
+          if (req.args.includes("tickets")) {
+            return { exitCode: 0, stdout: JSON.stringify({ protocol: 1, purposes: ["interactive"] }), stderr: "", timedOut: false };
+          }
+          const isOps = requestedCliProfile === "ops";
+          const endpoint = {
+            profile_id: isOps ? path.join(sandbox.hermesHomeDir, "profiles", "ops") : sandbox.hermesHomeDir,
+            instance_id: isOps ? "inst-ops-0234" : "inst-default-0234",
+            authority_epoch: 27,
+            runtime_protocol: 1,
+            capabilities: ["durable-admission-v1", "session-authority-v1"],
+            code_sha: "sha_0234",
+            ws_url: "ws://127.0.0.1:63944/api/ws",
+            ws_protocol: "hermes-gateway-v1",
+            ticket_protocol_prefix: "hermes-gateway-ticket.",
+          };
+          if (req.args.includes("ensure") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({ state: "ready", client_code_sha: "sha_0234", endpoint }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          if (req.args.includes("attach") && req.args.includes("--json")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                state: "ready",
+                client_code_sha: "sha_0234",
+                ticket: isOps ? "tkt_ops_1" : "tkt_default_1",
+                endpoint,
+              }),
+              stderr: "",
+              timedOut: false,
+            };
+          }
+          return { exitCode: 1, stdout: "", stderr: "", timedOut: false };
+        },
+      });
+      ports.ports.getControlSocketCandidates = () => [sockPath];
+      ports.ports.controlSocketRequest = async () => ({ status: "unsupported" });
+
+      const mgr = new LocalBackendManager(ports.ports);
+      const coldDefault = await mgr.prepareDial({ profileId: sandbox.hermesHomeDir });
+      expect(coldDefault.ok).toBe(true);
+      if (coldDefault.ok) {
+        expect(coldDefault.dial.profileId).toBe(sandbox.hermesHomeDir);
+        expect(coldDefault.dial.cliProfileId).toBe("default");
+      }
+
+      const opsPath = path.join(sandbox.hermesHomeDir, "profiles", "ops");
+      const opsDial = await mgr.prepareDial({ profileId: "ops" });
+      expect(opsDial.ok).toBe(true);
+      if (opsDial.ok) {
+        expect(opsDial.dial.profileId).toBe(opsPath);
+        expect(opsDial.dial.cliProfileId).toBe("ops");
+      }
+
+      // Subsequent dial with ops canonical path resolves back to "--profile ops"
+      const opsRetry = await mgr.prepareDial({ profileId: opsPath });
+      expect(opsRetry.ok).toBe(true);
+      if (opsRetry.ok) {
+        expect(opsRetry.dial.profileId).toBe(opsPath);
+        expect(opsRetry.dial.cliProfileId).toBe("ops");
+      }
+
+      expect(
+        ports.invokedCommands.some((c) => c.args.includes("--profile") && c.args.includes("ops")),
+      ).toBe(true);
+      expect(
+        ports.invokedCommands.some(
+          (c) => c.args.includes("--profile") && c.args.some((arg) => arg.includes(path.sep)),
+        ),
+      ).toBe(false);
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
 });

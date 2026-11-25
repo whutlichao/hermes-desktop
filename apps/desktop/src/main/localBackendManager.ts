@@ -29,6 +29,7 @@ import {
   sanitizeDiagnosticsPayload,
   validateEndpointProtocol,
 } from "@hermes/domain";
+import { LocalProfileIdentityRegistry } from "./localProfileIdentity";
 
 export interface ProcessRunRequest {
   command: string;
@@ -162,6 +163,8 @@ export class LocalBackendManager {
   private lastCliPath: string | null = null;
   private readonly recoveryInFlight = new Map<string, Promise<{ ok: boolean; failure?: LocalTypedFailure }>>();
   private readonly attemptedRecoveries = new Set<string>();
+  /** Shared canonical <-> CLI-handle identity seam for this local host. */
+  readonly profileIdentities = new LocalProfileIdentityRegistry();
 
   constructor(private readonly ports: LocalBackendPorts) {}
 
@@ -193,8 +196,9 @@ export class LocalBackendManager {
   }
 
   private buildProfileArgs(profileId: string | undefined, gatewayArgs: string[]): string[] {
-    if (profileId && profileId !== "default") {
-      return ["--profile", profileId, ...gatewayArgs];
+    const cliProfileId = this.profileIdentities.resolveCliSelector(profileId);
+    if (cliProfileId && cliProfileId !== "default") {
+      return ["--profile", cliProfileId, ...gatewayArgs];
     }
     return gatewayArgs;
   }
@@ -747,7 +751,8 @@ export class LocalBackendManager {
     clientCodeSha?: string;
     cliPath?: string;
   }): Promise<{ ok: boolean; failure?: LocalTypedFailure }> {
-    const key = `${options.ownerProfile}:${options.staleInstanceId}:${options.clientCodeSha ?? ""}`;
+    const cliSelector = this.profileIdentities.resolveCliSelector(options.ownerProfile);
+    const key = `${cliSelector}:${options.staleInstanceId}:${options.clientCodeSha ?? ""}`;
     const existing = this.recoveryInFlight.get(key);
     if (existing) {
       return existing;
@@ -775,7 +780,7 @@ export class LocalBackendManager {
       this.attemptedRecoveries.add(key);
       const res = await this.ports.runProcess({
         command: cliPath,
-        args: this.buildProfileArgs(options.ownerProfile, ["gateway", "restart", "--detach"]),
+        args: this.buildProfileArgs(cliSelector, ["gateway", "restart", "--detach"]),
         timeoutMs: 15_000,
         stdinClose: true,
       });
@@ -954,7 +959,8 @@ export class LocalBackendManager {
     timeoutMs?: number;
     pollIntervalMs?: number;
   }): Promise<LocalPrepareDialResult> {
-    const profileId = options?.profileId ?? "default";
+    const requestedProfileId = options?.profileId?.trim() || "default";
+    const profileId = this.profileIdentities.resolveCliSelector(requestedProfileId);
     const inspection = await this.inspect();
     if (
       (inspection.actual === "blocked" && !inspection.failure?.retryable) ||
@@ -1028,6 +1034,7 @@ export class LocalBackendManager {
       installCodeSha: parsed.installCodeSha,
     });
     if (shaCheck.mismatch) {
+      this.profileIdentities.registerAlias(parsed.endpoint.profileId, profileId);
       const recovery = await this.recover({
         ownerProfile: parsed.endpoint.profileId,
         staleInstanceId: parsed.endpoint.instanceId,
@@ -1129,10 +1136,13 @@ export class LocalBackendManager {
       return { ok: false, failure, inspection };
     }
 
+    const canonicalProfileId = finalEndpoint.profileId || profileId;
+    this.profileIdentities.registerAlias(canonicalProfileId, profileId);
+
     const ticketHandle = this.createSingleUseTicketHandle(ticket, expiresInSeconds);
     const dial: LocalDialMaterial = {
       connectionId: "local",
-      profileId: finalEndpoint.profileId,
+      profileId: canonicalProfileId,
       cliProfileId: profileId,
       instanceId: finalEndpoint.instanceId,
       authorityEpoch: finalEndpoint.authorityEpoch,
@@ -1173,7 +1183,10 @@ export class LocalBackendManager {
     if (!cliPath) {
       return { ok: false, failure: mapLocalFailure("hermes_not_found", "locate_cli") };
     }
-    const attached = await this.runPerProfileAttach(cliPath, dial.cliProfileId);
+    const attached = await this.runPerProfileAttach(
+      cliPath,
+      this.profileIdentities.resolveCliSelector(dial.cliProfileId || dial.profileId),
+    );
     if (attached.kind === "ready" && attached.ticket) {
       const handle = this.createSingleUseTicketHandle(attached.ticket, attached.expiresInSeconds);
       return { ok: true, ...handle };

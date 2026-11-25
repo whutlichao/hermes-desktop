@@ -40,6 +40,11 @@ import {
   type ActiveChatResolveResult,
   type ResolverConnection,
 } from "@hermes/domain";
+import {
+  isPathLikeProfileId,
+  normalizeCanonicalLookupKey,
+  normalizeProfilePathAliasKey,
+} from "./localProfileIdentity";
 import { assertSafeSandboxRoot } from "./security";
 
 export interface ChatSessionStateStoreOptions {
@@ -383,6 +388,7 @@ export class ChatSessionStateStore {
   readonly filePath: string;
   private readonly now: () => number;
   private state: ChatSessionProjection;
+  private localProfileHandlesByCanonical: Record<string, string> = {};
   private loaded = false;
   private idSeq = 0;
 
@@ -433,6 +439,9 @@ export class ChatSessionStateStore {
     this.recomputeStorageUsage();
     const persisted = {
       ...this.state,
+      ...(Object.keys(this.localProfileHandlesByCanonical).length > 0
+        ? { localProfileHandlesByCanonical: { ...this.localProfileHandlesByCanonical } }
+        : {}),
       windowId: "primary" as const,
       paneId: "main" as const,
     };
@@ -441,6 +450,7 @@ export class ChatSessionStateStore {
 
   load(): ChatSessionProjection {
     this.loaded = true;
+    this.localProfileHandlesByCanonical = {};
     if (!fs.existsSync(this.filePath)) {
       this.state = emptyProjection();
       return structuredClone(this.state);
@@ -450,6 +460,18 @@ export class ChatSessionStateStore {
       if (!isPlainObject(parsed)) {
         this.state = emptyProjection();
         return structuredClone(this.state);
+      }
+
+      if (isPlainObject(parsed.localProfileHandlesByCanonical)) {
+        for (const [rawCanonical, rawHandle] of Object.entries(
+          parsed.localProfileHandlesByCanonical,
+        )) {
+          const canonical = rawCanonical.trim();
+          const handle = typeof rawHandle === "string" ? rawHandle.trim() : "";
+          if (!canonical || !handle || isPathLikeProfileId(handle)) continue;
+          const lookup = normalizeCanonicalLookupKey(canonical);
+          this.localProfileHandlesByCanonical[lookup] = handle;
+        }
       }
 
       const lastSessionByScope: Record<string, string> = {};
@@ -1365,5 +1387,132 @@ export class ChatSessionStateStore {
 
     this.persist();
     return this.getProjection();
+  }
+
+  /**
+   * Non-destructively migrates a persisted local handle alias (e.g. `"default"`) to its
+   * canonical Gateway `profileId` when the alias is retired after connect. Never overwrites
+   * existing entries for `canonicalProfileId`.
+   */
+  adoptLocalProfileAlias(fromHandle: string, canonicalProfileId: string): boolean {
+    this.ensureLoaded();
+    const from = fromHandle.trim();
+    const to = canonicalProfileId.trim();
+    if (!from || !to || from === to) return false;
+
+    let changed = false;
+    if (
+      this.state.lastActiveChat &&
+      this.state.lastActiveChat.connectionId === "local" &&
+      this.state.lastActiveChat.profileId === from
+    ) {
+      this.state.lastActiveChat = { ...this.state.lastActiveChat, profileId: to };
+      changed = true;
+    }
+
+    if (this.state.lastValidProfileByConnection.local === from) {
+      this.state.lastValidProfileByConnection.local = to;
+      changed = true;
+    }
+
+    const fromScopeKey = makeScopeKey("local", from);
+    const toScopeKey = makeScopeKey("local", to);
+    if (this.state.lastSessionByScope[fromScopeKey]) {
+      if (!this.state.lastSessionByScope[toScopeKey]) {
+        this.state.lastSessionByScope[toScopeKey] = this.state.lastSessionByScope[fromScopeKey];
+      }
+      delete this.state.lastSessionByScope[fromScopeKey];
+      changed = true;
+    }
+
+    const hadFromScope = this.state.lastValidScopes.some(
+      (s) => s.connectionId === "local" && s.profileId === from,
+    );
+    if (hadFromScope) {
+      const hasToScope = this.state.lastValidScopes.some(
+        (s) => s.connectionId === "local" && s.profileId === to,
+      );
+      this.state.lastValidScopes = this.state.lastValidScopes.flatMap((s) => {
+        if (s.connectionId === "local" && s.profileId === from) {
+          return hasToScope ? [] : [{ connectionId: "local", profileId: to }];
+        }
+        return [s];
+      });
+      changed = true;
+    }
+
+    const prefix = makeSessionKey("local", from, "");
+    for (const [k, summary] of Object.entries(this.state.sessionSummaries)) {
+      if (!k.startsWith(prefix)) continue;
+      const nextKey = makeSessionKey("local", to, summary.sessionId);
+      if (!this.state.sessionSummaries[nextKey]) {
+        this.state.sessionSummaries[nextKey] = { ...summary, profileId: to };
+      }
+      delete this.state.sessionSummaries[k];
+      changed = true;
+    }
+
+    if (this.state.draftsByKey) {
+      for (const [k, draft] of Object.entries(this.state.draftsByKey)) {
+        if (draft.scope.connectionId !== "local" || draft.scope.profileId !== from) continue;
+        const nextKey = draft.sessionId
+          ? makeActiveChatDraftKey("local", to, draft.sessionId)
+          : makeNewChatDraftKey("local", to, draft.draftId);
+        if (!this.state.draftsByKey[nextKey]) {
+          this.state.draftsByKey[nextKey] = {
+            ...draft,
+            scope: { connectionId: "local", profileId: to },
+            origin:
+              draft.origin.connectionId === "local" && draft.origin.profileId === from
+                ? { ...draft.origin, profileId: to }
+                : draft.origin,
+          };
+        }
+        delete this.state.draftsByKey[k];
+        changed = true;
+      }
+    }
+
+    if (!isPathLikeProfileId(from) && isPathLikeProfileId(to)) {
+      const aliasKey = normalizeProfilePathAliasKey(to);
+      if (this.localProfileHandlesByCanonical[aliasKey] !== from) {
+        this.localProfileHandlesByCanonical[aliasKey] = from;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.persist();
+    }
+    return changed;
+  }
+
+  /**
+   * Returns persisted canonical `profileId -> cliHandle` mappings for cold-start hydration.
+   */
+  getLocalProfileHandles(): Record<string, string> {
+    this.ensureLoaded();
+    return { ...this.localProfileHandlesByCanonical };
+  }
+
+  /**
+   * Persists a known local canonical `profileId -> cliHandle` mapping in a backward-compatible
+   * optional field so non-default path profiles (e.g. `.../profiles/ops -> "ops"`) survive
+   * restarts without modifying `ChatSessionProjection` contracts.
+   */
+  recordLocalProfileAlias(canonicalProfileId: string, cliHandle: string): boolean {
+    this.ensureLoaded();
+    const canonical = canonicalProfileId.trim();
+    const handle = cliHandle.trim();
+    if (!canonical || !handle || isPathLikeProfileId(handle) || canonical === handle) {
+      return false;
+    }
+    const key = normalizeCanonicalLookupKey(canonical);
+    if (this.localProfileHandlesByCanonical[key] === handle) {
+      return false;
+    }
+    this.localProfileHandlesByCanonical[key] = handle;
+    this.persist();
+    return true;
   }
 }
