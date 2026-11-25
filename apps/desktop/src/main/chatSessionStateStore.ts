@@ -1366,4 +1366,94 @@ export class ChatSessionStateStore {
     this.persist();
     return this.getProjection();
   }
+
+  /**
+   * Non-destructively migrates a persisted local handle alias (e.g. `"default"`) to its
+   * canonical Gateway `profileId` when the alias is retired after connect. Never overwrites
+   * existing entries for `canonicalProfileId`.
+   */
+  adoptLocalProfileAlias(fromHandle: string, canonicalProfileId: string): boolean {
+    this.ensureLoaded();
+    const from = fromHandle.trim();
+    const to = canonicalProfileId.trim();
+    if (!from || !to || from === to) return false;
+
+    let changed = false;
+    if (
+      this.state.lastActiveChat &&
+      this.state.lastActiveChat.connectionId === "local" &&
+      this.state.lastActiveChat.profileId === from
+    ) {
+      this.state.lastActiveChat = { ...this.state.lastActiveChat, profileId: to };
+      changed = true;
+    }
+
+    if (this.state.lastValidProfileByConnection.local === from) {
+      this.state.lastValidProfileByConnection.local = to;
+      changed = true;
+    }
+
+    const fromScopeKey = makeScopeKey("local", from);
+    const toScopeKey = makeScopeKey("local", to);
+    if (this.state.lastSessionByScope[fromScopeKey]) {
+      if (!this.state.lastSessionByScope[toScopeKey]) {
+        this.state.lastSessionByScope[toScopeKey] = this.state.lastSessionByScope[fromScopeKey];
+      }
+      delete this.state.lastSessionByScope[fromScopeKey];
+      changed = true;
+    }
+
+    const hadFromScope = this.state.lastValidScopes.some(
+      (s) => s.connectionId === "local" && s.profileId === from,
+    );
+    if (hadFromScope) {
+      const hasToScope = this.state.lastValidScopes.some(
+        (s) => s.connectionId === "local" && s.profileId === to,
+      );
+      this.state.lastValidScopes = this.state.lastValidScopes.flatMap((s) => {
+        if (s.connectionId === "local" && s.profileId === from) {
+          return hasToScope ? [] : [{ connectionId: "local", profileId: to }];
+        }
+        return [s];
+      });
+      changed = true;
+    }
+
+    const prefix = `local::${from}::`;
+    for (const [k, summary] of Object.entries(this.state.sessionSummaries)) {
+      if (!k.startsWith(prefix)) continue;
+      const nextKey = makeSessionKey("local", to, summary.sessionId);
+      if (!this.state.sessionSummaries[nextKey]) {
+        this.state.sessionSummaries[nextKey] = { ...summary, profileId: to };
+      }
+      delete this.state.sessionSummaries[k];
+      changed = true;
+    }
+
+    if (this.state.draftsByKey) {
+      for (const [k, draft] of Object.entries(this.state.draftsByKey)) {
+        if (draft.scope.connectionId !== "local" || draft.scope.profileId !== from) continue;
+        const nextKey = draft.sessionId
+          ? makeActiveChatDraftKey("local", to, draft.sessionId)
+          : makeNewChatDraftKey("local", to, draft.draftId);
+        if (!this.state.draftsByKey[nextKey]) {
+          this.state.draftsByKey[nextKey] = {
+            ...draft,
+            scope: { connectionId: "local", profileId: to },
+            origin:
+              draft.origin.connectionId === "local" && draft.origin.profileId === from
+                ? { ...draft.origin, profileId: to }
+                : draft.origin,
+          };
+        }
+        delete this.state.draftsByKey[k];
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.persist();
+    }
+    return changed;
+  }
 }
