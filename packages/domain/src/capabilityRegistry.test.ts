@@ -1159,5 +1159,22 @@ describe("CapabilityRegistry 21-domain matrix, explicit aliases & invariants (S0
     });
     expect(refused.methodTiers["prompt.submit"]).toBe("refused");
     expect(refused.methodTiers["session.list"]).toBe("served");
+
+    const mapPartialRefusal = registry.applyConnectHandshake({
+      connectionId: "local",
+      profileId: "default",
+      ownerGeneration: 3,
+      authorityEpoch: 1,
+      gatewayVersionOrSha: "0.23.4",
+      serverRequestsSupported: true,
+      describeResult: {
+        runtime_protocol: 1,
+        capabilities: { chat: true },
+        refused_methods: ["prompt.submit"],
+      },
+    });
+    expect(mapPartialRefusal.methodTiers["prompt.submit"]).toBe("refused");
+    expect(mapPartialRefusal.methodTiers["prompt.cancel"]).toBe("served");
+    expect(mapPartialRefusal.methodTiers["session.steer"]).toBe("served");
   });
 });

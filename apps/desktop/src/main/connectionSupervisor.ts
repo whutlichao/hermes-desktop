@@ -702,7 +702,7 @@ export class ConnectionSupervisor {
   private readonly remoteHealth = new Map<string, ConnectionHealthSummary>();
   private readonly sshHealthById = new Map<string, ConnectionHealthSummary>();
   private readonly linksByKey = new Map<string, ConnectionLinkState>();
-  private readonly localProfileIdentities = new LocalProfileIdentityRegistry();
+  private readonly localProfileIdentities: LocalProfileIdentityRegistry;
   private readonly profilesByConnection = new Map<string, ProfileSummary[]>();
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
   private readonly sessionCwdByScope = new Map<string, string>();
@@ -721,6 +721,8 @@ export class ConnectionSupervisor {
 
   constructor(localBackend: LocalBackendManager, options?: ConnectionSupervisorOptions) {
     this.localBackend = localBackend;
+    this.localProfileIdentities =
+      localBackend.profileIdentities ?? new LocalProfileIdentityRegistry();
     this.getLocalLabel = options?.getLocalLabel ?? (() => "This device");
     this.probeTimeoutMs = options?.probeTimeoutMs ?? 1200;
     this.chatSessionStateStore = options?.chatSessionStateStore ?? null;
@@ -768,9 +770,14 @@ export class ConnectionSupervisor {
       nextRetryAt: null,
       profileExceptionCount: 0,
     };
-    this.ensureLinkState("local", "default", "enabled");
-
     const saved = this.chatSessionStateStore?.load();
+    const savedHandles = this.chatSessionStateStore?.getLocalProfileHandles();
+    if (savedHandles) {
+      for (const [canonical, handle] of Object.entries(savedHandles)) {
+        this.localProfileIdentities.registerAlias(canonical, handle);
+      }
+    }
+    this.ensureLinkState("local", this.resolveLocalProfileId("local", "default"), "enabled");
     if (saved?.lastActiveChat) {
       this.activeScope = {
         connectionId: saved.lastActiveChat.connectionId,
@@ -876,10 +883,14 @@ export class ConnectionSupervisor {
     if (connectionId !== "local" || requestedProfileId === resolvedProfileId) return;
     if (!isPathLikeProfileId(requestedProfileId)) {
       this.localProfileIdentities.registerAlias(resolvedProfileId, requestedProfileId);
+      this.chatSessionStateStore?.recordLocalProfileAlias(resolvedProfileId, requestedProfileId);
     }
     const key = scopeKey(connectionId, requestedProfileId);
     const alias = this.linksByKey.get(key);
     if (alias) {
+      const canonical = this.ensureLinkState(connectionId, resolvedProfileId, alias.desired);
+      canonical.wasDesiredBeforeSuspend =
+        canonical.wasDesiredBeforeSuspend || alias.wasDesiredBeforeSuspend;
       this.clearLinkTimers(alias);
       this.linksByKey.delete(key);
     }
@@ -945,7 +956,7 @@ export class ConnectionSupervisor {
     return Boolean(
       this.activeScope &&
         this.activeScope.connectionId === connectionId &&
-        (this.activeScope.profileId ?? "default") === profileId &&
+        this.matchesProfileScope(connectionId, this.activeScope.profileId, profileId) &&
         (this.activeSessionId ?? this.activeScope.sessionId ?? null) === sessionId,
     );
   }
@@ -1026,7 +1037,7 @@ export class ConnectionSupervisor {
           Boolean(
             sub.scope &&
               sub.scope.connectionId === connectionId &&
-              (sub.scope.profileId ?? "default") === profileId &&
+              this.matchesProfileScope(connectionId, sub.scope.profileId, profileId) &&
               sub.scope.sessionId === sessionId,
           ),
       );
@@ -1068,7 +1079,7 @@ export class ConnectionSupervisor {
           Boolean(
             sub.scope &&
               sub.scope.connectionId === connectionId &&
-              (sub.scope.profileId ?? "default") === profileId &&
+              this.matchesProfileScope(connectionId, sub.scope.profileId, profileId) &&
               sub.scope.sessionId === sessionId,
           ),
       );
@@ -2024,7 +2035,6 @@ export class ConnectionSupervisor {
 
   private async reconnectLocalAfterDrop(previousDial: LocalDialMaterial): Promise<void> {
     if (this.disposed || this.shuttingDown || this.suspended) return;
-    this.localProfileIdentities.registerAlias(previousDial.profileId, previousDial.cliProfileId);
     const profileId = this.resolveLocalProfileId("local", previousDial.profileId);
     const link = this.ensureLinkState("local", profileId, "enabled");
     if (link.desired !== "enabled") return;
@@ -2065,10 +2075,9 @@ export class ConnectionSupervisor {
       if (!minted.ok && minted.failure.code === "ticket_unavailable") {
         const reattached = await this.localBackend.prepareDial({ profileId });
         if (reattached.ok) {
-          this.localProfileIdentities.registerAlias(
-            reattached.dial.profileId,
-            reattached.dial.cliProfileId,
-          );
+          if (reattached.dial.profileId && reattached.dial.profileId !== profileId) {
+            this.retireLocalProfileAlias("local", profileId, reattached.dial.profileId);
+          }
           let ticket = reattached.dial.consumeTicket();
           if (!ticket) {
             const reminted = await this.localBackend.mintReconnectTicket(reattached.dial);
@@ -2655,6 +2664,15 @@ export class ConnectionSupervisor {
     return null;
   }
 
+  private resetLocalLinkToClean(link: ConnectionLinkState, actual: ConnectionActualState): void {
+    link.actual = actual;
+    link.degraded = false;
+    link.errorCode = undefined;
+    link.unavailableCode = undefined;
+    link.message = undefined;
+    link.nextRetryAt = null;
+  }
+
   private async connectLocalInternal(
     requestedProfileId: string,
     options?: { forceReconnect?: boolean; activate?: boolean; activateScope?: boolean },
@@ -2664,13 +2682,20 @@ export class ConnectionSupervisor {
     }
 
     const profileId = this.resolveLocalProfileId("local", requestedProfileId);
-    const link = this.ensureLinkState("local", profileId, "enabled");
+    let link = this.ensureLinkState("local", profileId, "enabled");
     if (!this.suspended) {
       link.desired = "enabled";
       link.wasDesiredBeforeSuspend = true;
     }
 
     const existingOpenTransport = this.findOpenLocalTransport(profileId);
+    const hadHealthyOpenTransport = Boolean(
+      existingOpenTransport &&
+        !existingOpenTransport.disposed &&
+        existingOpenTransport.client.isOpen() &&
+        link.actual === "ready" &&
+        !link.degraded,
+    );
     if (options?.forceReconnect) {
       for (const [k, entry] of this.transports.entries()) {
         if (entry.connectionId === "local" && !entry.client.isOpen()) {
@@ -2680,12 +2705,7 @@ export class ConnectionSupervisor {
     }
 
     if (!existingOpenTransport) {
-      link.actual = "connecting";
-      link.degraded = false;
-      link.errorCode = undefined;
-      link.unavailableCode = undefined;
-      link.message = undefined;
-      link.nextRetryAt = null;
+      this.resetLocalLinkToClean(link, "connecting");
       this.localHealth = {
         ...this.localHealth,
         label: this.getLocalLabel(),
@@ -2703,13 +2723,18 @@ export class ConnectionSupervisor {
     const startedAt = this.now();
     const dialResult = await this.localBackend.prepareDial({ profileId });
     if (!dialResult.ok) {
-      if (existingOpenTransport && !existingOpenTransport.disposed && existingOpenTransport.client.isOpen()) {
-        link.actual = "ready";
-        link.degraded = false;
-        link.errorCode = undefined;
-        link.unavailableCode = undefined;
-        link.message = undefined;
-        link.nextRetryAt = null;
+      // Preserve a still-open healthy transport during transient ensure retries (e.g. R11 retry),
+      // but never mask persistent/incompatible failures or failures on an already degraded link.
+      const preserveExistingHealthy =
+        hadHealthyOpenTransport &&
+        existingOpenTransport &&
+        !existingOpenTransport.disposed &&
+        existingOpenTransport.client.isOpen() &&
+        (!options?.forceReconnect ||
+          dialResult.failure.actual !== "blocked" ||
+          dialResult.failure.code === "gateway_start_failed");
+      if (preserveExistingHealthy) {
+        this.resetLocalLinkToClean(link, "ready");
         this.syncProfileAndConnectionProjections("local");
         this.syncChatStateWithSnapshot();
         this.emitFleet("local");
@@ -2718,6 +2743,13 @@ export class ConnectionSupervisor {
           failure: dialResult.failure,
           fleet: this.getFleetSnapshot(),
         };
+      }
+      if (options?.forceReconnect) {
+        for (const [k, entry] of [...this.transports.entries()]) {
+          if (this.isMatchingLocalTransportKey(k, entry, profileId)) {
+            this.disposeTransportEntry(k, entry);
+          }
+        }
       }
       const errCode = mapLocalFailureToErrorCode(dialResult.failure);
       const msg = getLocalFailureCopy(dialResult.failure.code).whatHappened;
@@ -2753,12 +2785,19 @@ export class ConnectionSupervisor {
     }
 
     const dial = dialResult.dial;
-    this.localProfileIdentities.registerAlias(dial.profileId, dial.cliProfileId);
+    // Retire CLI handle alias as soon as prepareDial reveals canonical profileId so downstream
+    // mint/connect/describe failures never leave split alias + canonical links in linksByKey.
+    if (dial.profileId && dial.profileId !== profileId) {
+      this.retireLocalProfileAlias("local", profileId, dial.profileId);
+    }
+    const targetProfileId = dial.profileId || profileId;
+    link = this.ensureLinkState("local", targetProfileId, "enabled");
+
     if (options?.forceReconnect) {
       for (const [k, entry] of [...this.transports.entries()]) {
         if (
           this.isMatchingLocalTransportKey(k, entry, profileId) ||
-          this.isMatchingLocalTransportKey(k, entry, dial.profileId)
+          this.isMatchingLocalTransportKey(k, entry, targetProfileId)
         ) {
           this.disposeTransportEntry(k, entry);
         }
@@ -2767,19 +2806,18 @@ export class ConnectionSupervisor {
     const transportKey =
       dial.transportMode === "shared-host-scope"
         ? "local::shared"
-        : `local::profile:${dial.profileId}`;
+        : `local::profile:${targetProfileId}`;
 
     let ticket = dial.consumeTicket();
     if (!ticket) {
       const minted = await this.localBackend.mintReconnectTicket(dial);
       if (!minted.ok) {
         if (minted.failure.code === "ticket_unavailable") {
-          const reattached = await this.localBackend.prepareDial({ profileId: dial.profileId });
+          const reattached = await this.localBackend.prepareDial({ profileId: targetProfileId });
           if (reattached.ok) {
-            this.localProfileIdentities.registerAlias(
-              reattached.dial.profileId,
-              reattached.dial.cliProfileId,
-            );
+            if (reattached.dial.profileId && reattached.dial.profileId !== targetProfileId) {
+              this.retireLocalProfileAlias("local", targetProfileId, reattached.dial.profileId);
+            }
             const retriedTicket = reattached.dial.consumeTicket();
             if (retriedTicket) {
               return this.finishGatewayHandshake({
@@ -2797,7 +2835,7 @@ export class ConnectionSupervisor {
           }
           const errCode = mapLocalFailureToErrorCode(minted.failure);
           const msg = getLocalFailureCopy(minted.failure.code).whatHappened;
-          this.scheduleLinkBackoff("local", profileId, errCode, msg);
+          this.scheduleLinkBackoff("local", targetProfileId, errCode, msg);
           return {
             ok: false,
             failure: minted.failure,
@@ -3240,7 +3278,6 @@ export class ConnectionSupervisor {
     });
     this.markLinkReady(connectionId, dial.profileId, latencyMs);
     if ("cliProfileId" in dial) {
-      this.localProfileIdentities.registerAlias(dial.profileId, dial.cliProfileId);
       this.retireLocalProfileAlias(connectionId, dial.cliProfileId, dial.profileId);
     }
 
@@ -4076,7 +4113,7 @@ export class ConnectionSupervisor {
         Boolean(
           sub.scope &&
             sub.scope.connectionId === connectionId &&
-            (sub.scope.profileId ?? "default") === profileId &&
+            this.matchesProfileScope(connectionId, sub.scope.profileId, profileId) &&
             sub.scope.sessionId === sessionId,
         ),
     );
@@ -5217,7 +5254,8 @@ export class ConnectionSupervisor {
     const scopeMatchesSession = (sub: SubscriberRecord) =>
       !sub.scope ||
       (sub.scope.connectionId === connectionId &&
-        (!sub.scope.profileId || sub.scope.profileId === resolvedProfileId) &&
+        (!sub.scope.profileId ||
+          this.matchesProfileScope(connectionId, sub.scope.profileId, resolvedProfileId)) &&
         (!sub.scope.sessionId || sub.scope.sessionId === sessionId));
 
     if (method === "prompt.started" || method === "turn.started") {

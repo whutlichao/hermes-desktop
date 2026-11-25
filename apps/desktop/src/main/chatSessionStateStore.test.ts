@@ -637,4 +637,29 @@ describe("ChatSessionStateStore (S1/S3 startup recovery, 0600 persistence, sessi
       sandbox.cleanup(passed);
     }
   });
+
+  it("persists optional localProfileHandlesByCanonical across restarts while loading legacy files without it", () => {
+    const sandbox = createTestSandbox("hermes-chatstate-profile-handles-");
+    let passed = false;
+    try {
+      const store1 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      // Legacy file without localProfileHandlesByCanonical must load cleanly with empty handles
+      expect(store1.load().activeStatus).toBe("empty");
+      expect(store1.getLocalProfileHandles()).toEqual({});
+
+      const opsPath = path.join(sandbox.hermesHomeDir, "profiles", "ops");
+      expect(store1.recordLocalProfileAlias(`${opsPath}/`, "ops")).toBe(true);
+      expect(store1.recordLocalProfileAlias(opsPath, "ops")).toBe(false);
+      // Reject path-like handle
+      expect(store1.recordLocalProfileAlias(opsPath, "/bad/handle")).toBe(false);
+
+      const store2 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      store2.load();
+      expect(store2.getLocalProfileHandles()).toEqual({ [opsPath]: "ops" });
+
+      passed = true;
+    } finally {
+      sandbox.cleanup(passed);
+    }
+  });
 });

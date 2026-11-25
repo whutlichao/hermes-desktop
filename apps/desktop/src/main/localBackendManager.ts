@@ -163,7 +163,8 @@ export class LocalBackendManager {
   private lastCliPath: string | null = null;
   private readonly recoveryInFlight = new Map<string, Promise<{ ok: boolean; failure?: LocalTypedFailure }>>();
   private readonly attemptedRecoveries = new Set<string>();
-  private readonly profileIdentities = new LocalProfileIdentityRegistry();
+  /** Shared canonical <-> CLI-handle identity seam for this local host. */
+  readonly profileIdentities = new LocalProfileIdentityRegistry();
 
   constructor(private readonly ports: LocalBackendPorts) {}
 

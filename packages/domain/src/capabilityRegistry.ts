@@ -1542,8 +1542,8 @@ function parseDescribeMethodTiers(
           else if (v === false) methodTiers[k] = "refused";
         }
       }
-      if (capMap.chat === true && !methodTiers["prompt.submit"]) {
-        methodTiers["prompt.submit"] = "served";
+      if (capMap.chat === true) {
+        if (!methodTiers["prompt.submit"]) methodTiers["prompt.submit"] = "served";
         if (!methodTiers["prompt.cancel"]) methodTiers["prompt.cancel"] = "served";
         if (!methodTiers["session.steer"]) methodTiers["session.steer"] = "served";
       }

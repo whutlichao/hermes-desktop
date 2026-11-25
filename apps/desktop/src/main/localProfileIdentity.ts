@@ -52,7 +52,11 @@ export function normalizeProfilePathAliasKey(rawPath: string): string {
   return trimmed.replace(/[\\/]+$/, "") || "/";
 }
 
-function normalizeCanonicalLookupKey(profileId: string): string {
+/**
+ * Normalizes a local profile identifier lookup key (normalizes filesystem paths while
+ * preserving logical CLI handles as-is).
+ */
+export function normalizeCanonicalLookupKey(profileId: string): string {
   const trimmed = profileId.trim();
   return isPathLikeProfileId(trimmed) ? normalizeProfilePathAliasKey(trimmed) : trimmed;
 }
@@ -139,6 +143,13 @@ export class LocalProfileIdentityRegistry {
     return this.canonicalToCli.get(normalizeProfilePathAliasKey(trimmed)) ?? safeFallback;
   }
 
+  private resolveCanonicalEntry(candidate: string): string {
+    if (!isPathLikeProfileId(candidate)) {
+      return this.cliToCanonical.get(candidate) ?? candidate;
+    }
+    return this.canonicalByLookupKey.get(normalizeProfilePathAliasKey(candidate)) ?? candidate;
+  }
+
   /**
    * Resolves a local profile identifier or retired CLI handle alias (e.g. `"default"`) into its
    * registered canonical Gateway `profileId` when known, or preserves the input if not aliased.
@@ -147,18 +158,8 @@ export class LocalProfileIdentityRegistry {
     profileIdOrAlias: string | undefined | null,
     fallback = "default",
   ): string {
-    const trimmed = asTrimmedString(profileIdOrAlias);
-    if (!trimmed) {
-      const fb = asTrimmedString(fallback) || "default";
-      if (!isPathLikeProfileId(fb)) {
-        return this.cliToCanonical.get(fb) ?? fb;
-      }
-      return this.canonicalByLookupKey.get(normalizeProfilePathAliasKey(fb)) ?? fb;
-    }
-    if (!isPathLikeProfileId(trimmed)) {
-      return this.cliToCanonical.get(trimmed) ?? trimmed;
-    }
-    return this.canonicalByLookupKey.get(normalizeProfilePathAliasKey(trimmed)) ?? trimmed;
+    const candidate = asTrimmedString(profileIdOrAlias) || asTrimmedString(fallback) || "default";
+    return this.resolveCanonicalEntry(candidate);
   }
 
   /**

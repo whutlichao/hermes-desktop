@@ -7366,4 +7366,374 @@ process.exit(1);
       sandbox.cleanup(passed);
     }
   });
+
+  it("shares LocalProfileIdentityRegistry between LocalBackendManager and ConnectionSupervisor and persists non-default handles across restarts", async () => {
+    const sandbox = createTestSandbox("hermes-s1-shared-registry-ops-");
+    let passed = false;
+    const defaultPath = sandbox.hermesHomeDir;
+    const opsPath = path.join(sandbox.hermesHomeDir, "profiles", "ops");
+    const validTickets = new Set<string>();
+    const observedCliProfiles: string[] = [];
+
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "sessions.list",
+        "session.list",
+      ],
+      profiles: [
+        { name: "default", path: defaultPath, is_default: true },
+        { name: "ops", path: opsPath, is_default: false },
+      ],
+      initialSessions: [],
+    });
+
+    const cliPath = path.join(sandbox.rootDir, "hermes");
+    const cliScript = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const profileIdx = args.indexOf("--profile");
+const selector = profileIdx >= 0 && args[profileIdx + 1] ? args[profileIdx + 1] : "default";
+const rest = profileIdx >= 0 ? args.slice(profileIdx + 2) : args;
+if (selector.includes(${JSON.stringify(path.sep)})) {
+  console.error("Invalid --profile path: " + selector);
+  process.exit(2);
+}
+const endpointPid = selector === "ops" ? ${JSON.stringify(opsPath)} : ${JSON.stringify(defaultPath)};
+if (rest[0] === "--version") { console.log("Hermes Agent v0.23.4"); process.exit(0); }
+if (rest[0] === "gateway" && rest[1] === "--help") { console.log("{run,ensure,attach,tickets,restart}"); process.exit(0); }
+if (rest[0] === "gateway" && rest[1] === "ensure" && rest[2] === "--help") { console.log("--json --timeout"); process.exit(0); }
+if (rest[0] === "gateway" && rest[1] === "attach" && rest[2] === "--help") { console.log("--json --recover"); process.exit(0); }
+if (rest[0] === "gateway" && rest[1] === "tickets") { console.log(JSON.stringify({ protocol: 1, purposes: ["interactive"] })); process.exit(0); }
+if (rest[0] === "gateway" && (rest[1] === "ensure" || rest[1] === "attach")) {
+  const ticket = "tkt_ops_" + selector + "_" + Date.now();
+  console.log(JSON.stringify({
+    state: "ready",
+    attachable: true,
+    ticket,
+    expires_in_seconds: 30,
+    endpoint: {
+      profile_id: endpointPid,
+      instance_id: "inst-shared-" + selector,
+      authority_epoch: 1,
+      runtime_protocol: 1,
+      capabilities: ["durable-admission-v1", "session-authority-v1"],
+      code_sha: "sha_ops",
+      ws_url: ${JSON.stringify(gw.wsUrl)},
+      ws_protocol: "hermes-gateway-v1",
+      ticket_protocol_prefix: "hermes-gateway-ticket."
+    }
+  }));
+  process.exit(0);
+}
+process.exit(1);
+`;
+    fs.writeFileSync(cliPath, cliScript, { encoding: "utf8", mode: 0o755 });
+
+    const buildPorts = () => {
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        if (req.args.includes("gateway") && (req.args.includes("ensure") || req.args.includes("attach")) && !req.args.includes("--help")) {
+          const idx = req.args.indexOf("--profile");
+          observedCliProfiles.push(idx >= 0 ? req.args[idx + 1] : "default");
+        }
+        const res = await origRun(req);
+        if (res.exitCode === 0 && res.stdout.includes("\"ticket\"")) {
+          try {
+            const parsed = JSON.parse(res.stdout) as { ticket?: string };
+            if (parsed.ticket) validTickets.add(parsed.ticket);
+          } catch {
+            // ignore
+          }
+        }
+        return res;
+      };
+      return ports;
+    };
+
+    let supervisor1: ConnectionSupervisor | null = null;
+    let supervisor2: ConnectionSupervisor | null = null;
+
+    try {
+      const ports1 = buildPorts();
+      await ports1.writeOverridePath(cliPath);
+      const stateStore1 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const backend1 = new LocalBackendManager(ports1);
+      supervisor1 = new LocalConnectionSupervisor(backend1, { chatSessionStateStore: stateStore1 });
+      const first = await supervisor1.connectLocal("default");
+      expect(first.ok).toBe(true);
+
+      // refreshProfiles learned { name: "ops", path: opsPath } on supervisor1; shared registry must let backend1 pass --profile ops!
+      observedCliProfiles.length = 0;
+      const opsDial = await backend1.prepareDial({ profileId: opsPath });
+      expect(opsDial.ok).toBe(true);
+      expect(observedCliProfiles).toEqual(["ops"]);
+
+      await supervisor1.dispose();
+      supervisor1 = null;
+
+      // Cold restart: fresh stateStore2 + backend2 + supervisor2 must hydrate persisted opsPath -> "ops" and dial --profile ops!
+      observedCliProfiles.length = 0;
+      const stateStore2 = new ChatSessionStateStore({ userDataDir: sandbox.userDataDir });
+      const backend2 = new LocalBackendManager(buildPorts());
+      supervisor2 = new LocalConnectionSupervisor(backend2, { chatSessionStateStore: stateStore2 });
+      const relaunchOps = await supervisor2.connectLocal(opsPath);
+      expect(relaunchOps.ok).toBe(true);
+      expect(observedCliProfiles).toEqual(["ops"]);
+
+      passed = true;
+    } finally {
+      await supervisor1?.dispose();
+      await supervisor2?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("delivers prompt and session.transcript live patches to default-handle subscribers when gateway emits canonical profile paths", async () => {
+    const sandbox = createTestSandbox("hermes-s1-live-notif-alias-");
+    let passed = false;
+    const profileIdentity = sandbox.hermesHomeDir;
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: [
+        "runtime.describe",
+        "client.capabilities",
+        "subscribe",
+        "profiles.list",
+        "sessions.list",
+        "session.list",
+        "session.resume",
+        "session.transcript",
+      ],
+      profiles: [{ name: "default", path: profileIdentity, is_default: true }],
+      initialSessions: [{ profile_id: profileIdentity, session_id: "sess-live-1", title: "Live Alias Session" }],
+      onRpc: (method, params, ctx) => {
+        if (method === "session.resume") {
+          ctx.replyResult({ session_id: params.session_id, messages: [] });
+          return true;
+        }
+        return false;
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+
+    try {
+      supervisor = await bootFakeLocalSupervisor({
+        sandbox,
+        wsUrl: gw.wsUrl,
+        validTickets,
+        profileIdentity,
+      });
+
+      await supervisor.handlers["sessions.resume"](
+        { sessionId: "sess-live-1" },
+        { connectionId: "local", profileId: "default", sessionId: "sess-live-1" },
+      );
+
+      const promptEvents: Array<Record<string, unknown>> = [];
+      const transcriptPatches: Array<Record<string, unknown>> = [];
+      const unsubPrompt = supervisor.subscribe(
+        "prompt",
+        { connectionId: "local", profileId: "default", sessionId: "sess-live-1" },
+        (ev) => {
+          if (ev.kind === "patch") {
+            promptEvents.push(ev.payload as Record<string, unknown>);
+          }
+        },
+      );
+      const unsubTx = supervisor.subscribe(
+        "session.transcript",
+        { connectionId: "local", profileId: "default", sessionId: "sess-live-1" },
+        (ev) => {
+          if (ev.kind === "patch") {
+            transcriptPatches.push(ev.payload as Record<string, unknown>);
+          }
+        },
+      );
+
+      gw.sendNotification("prompt.delta", {
+        profile_id: profileIdentity,
+        session_id: "sess-live-1",
+        turn_id: "turn-alias-1",
+        message_id: "msg-alias-1",
+        delta: "hello canonical",
+      });
+
+      await expect.poll(() => promptEvents.length).toBeGreaterThan(0);
+      expect(promptEvents.some((p) => p.delta === "hello canonical")).toBe(true);
+      expect(transcriptPatches.some((p) => p.type === "token_delta" && p.delta === "hello canonical")).toBe(true);
+
+      unsubPrompt();
+      unsubTx();
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("retires alias link before runtime.describe failure so linksByKey never retains split default and canonical links", async () => {
+    const sandbox = createTestSandbox("hermes-s1-no-split-link-on-fail-");
+    let passed = false;
+    const profileIdentity = sandbox.hermesHomeDir;
+    const validTickets = new Set<string>();
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: ["runtime.describe"],
+      onRpc: (method, _params, ctx) => {
+        if (method === "runtime.describe") {
+          ctx.replyError(-32001, "unsupported gateway handshake");
+          return true;
+        }
+        return false;
+      },
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({
+        cliPath,
+        wsUrl: gw.wsUrl,
+        profileIdentity,
+      });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      supervisor = new LocalConnectionSupervisor(new LocalBackendManager(ports));
+      const res = await supervisor.connectLocal("default");
+      expect(res.ok).toBe(false);
+      expect(supervisor.getConnectionLink("local", "default")).toBeNull();
+      expect(supervisor.getConnectionLink("local", profileIdentity)?.actual).toBe("blocked");
+      expect(supervisor.getLocalHealth().profileExceptionCount).toBe(1);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
+
+  it("preserves healthy open transport on transient retry failure while surfacing blocked forceReconnect failures", async () => {
+    const sandbox = createTestSandbox("hermes-s1-force-reconnect-failure-");
+    let passed = false;
+    const profileIdentity = sandbox.hermesHomeDir;
+    const validTickets = new Set<string>();
+    let failHardBlocked = false;
+    let failTransientEnsure = false;
+    const gw = await startFakeGatewayServer({
+      validTickets,
+      servedMethods: ["runtime.describe", "client.capabilities", "subscribe", "profiles.list"],
+      profiles: [{ name: "default", path: profileIdentity, is_default: true }],
+      initialSessions: [],
+    });
+    let supervisor: ConnectionSupervisor | null = null;
+
+    try {
+      const cliPath = path.join(sandbox.rootDir, "hermes");
+      await writeFakeHermesCli({ cliPath, wsUrl: gw.wsUrl, profileIdentity });
+      const ports = createNodeLocalBackendPorts({
+        userDataDir: sandbox.userDataDir,
+        hermesHomeDir: sandbox.hermesHomeDir,
+        hermesHomeKind: "temp",
+        appVersion: "0.1.0",
+        buildMode: "dev",
+        pickCliFile: async () => ({ cancelled: true }),
+      });
+      await ports.writeOverridePath(cliPath);
+      const origRun = ports.runProcess;
+      ports.runProcess = async (req) => {
+        if (failTransientEnsure && req.args.includes("ensure") && req.args.includes("--json")) {
+          failTransientEnsure = false;
+          return { exitCode: 7, stdout: "", stderr: "transient ensure failure", timedOut: false };
+        }
+        if (failHardBlocked && req.args.includes("ensure") && req.args.includes("--json")) {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              state: "ready",
+              attachable: true,
+              install_code_sha: "sha_1",
+              client_code_sha: "sha_1",
+              endpoint: {
+                profile_id: profileIdentity,
+                instance_id: "inst-fake-1",
+                authority_epoch: 1,
+                runtime_protocol: 99,
+                capabilities: ["session-authority-v1"],
+                code_sha: "sha_1",
+                ws_url: gw.wsUrl,
+                ws_protocol: "hermes-gateway-v1",
+                ticket_protocol_prefix: "hermes-gateway-ticket.",
+              },
+            }),
+            stderr: "",
+            timedOut: false,
+          };
+        }
+        const res = await origRun(req);
+        if (req.args.includes("attach") && req.args.includes("--json") && res.exitCode === 0) {
+          const parsed = JSON.parse(res.stdout) as { ticket?: string };
+          if (parsed.ticket) validTickets.add(parsed.ticket);
+        }
+        return res;
+      };
+
+      supervisor = new LocalConnectionSupervisor(new LocalBackendManager(ports));
+      expect((await supervisor.connectLocal("default")).ok).toBe(true);
+
+      // 1. Transient retry failure while transport stays healthy: keep live link ready, still return failure
+      failTransientEnsure = true;
+      const transientRes = await supervisor.connectLocal(profileIdentity, { forceReconnect: true });
+      expect(transientRes.ok).toBe(false);
+      expect(transientRes.failure?.code).toBe("gateway_start_failed");
+      expect(supervisor.getConnectionLink("local", profileIdentity)?.actual).toBe("ready");
+      expect(supervisor.getLocalHealth().degraded).toBe(false);
+
+      // 2. Hard blocked failure during explicit forceReconnect: must never be masked as ready
+      failHardBlocked = true;
+      const blockedRes = await supervisor.connectLocal(profileIdentity, { forceReconnect: true });
+      expect(blockedRes.ok).toBe(false);
+      expect(supervisor.getConnectionLink("local", profileIdentity)?.actual).toBe("blocked");
+      expect(supervisor.getConnectionLink("local", profileIdentity)?.degraded).toBe(true);
+      expect(supervisor.getLocalHealth().degraded).toBe(true);
+
+      passed = true;
+    } finally {
+      await supervisor?.dispose();
+      await gw.close();
+      sandbox.cleanup(passed);
+    }
+  });
 });
