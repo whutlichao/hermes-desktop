@@ -255,6 +255,112 @@ function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+/** Returns the first non-empty trimmed string from candidate fields, or "". */
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+/** Picks the first string field, preferring non-empty text without altering whitespace. */
+function pickTextField(...values: unknown[]): string {
+  let firstString: string | undefined;
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    if (value.length > 0) return value;
+    if (firstString === undefined) firstString = value;
+  }
+  return firstString ?? "";
+}
+
+function epochToIsoString(epoch: number): string | null {
+  if (!Number.isFinite(epoch)) return null;
+  const ms = Math.abs(epoch) >= 1e11 ? epoch : epoch * 1000;
+  const parsed = new Date(ms);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+/** Normalizes ISO strings or Unix epoch seconds/milliseconds into an ISO-8601 timestamp. */
+function normalizeTimestampIso(raw: Record<string, unknown>): string {
+  const candidates = [raw.created_at, raw.createdAt, raw.timestamp];
+  for (const candidate of candidates) {
+    if (typeof candidate === "number") {
+      const iso = epochToIsoString(candidate);
+      if (iso) return iso;
+      continue;
+    }
+    if (typeof candidate === "string" && candidate.trim()) {
+      const trimmed = candidate.trim();
+      if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+        const iso = epochToIsoString(Number(trimmed));
+        if (iso) return iso;
+        continue;
+      }
+      return trimmed;
+    }
+  }
+  return new Date().toISOString();
+}
+
+function normalizeTerminalOutcome(rawOutcome: unknown): "completed" | "stopped" | "interrupted" | "error" {
+  const normalized = typeof rawOutcome === "string" ? rawOutcome.trim().toLowerCase() : "";
+  if (normalized === "stopped" || normalized === "cancelled" || normalized === "canceled") {
+    return "stopped";
+  }
+  if (normalized === "interrupted") {
+    return "interrupted";
+  }
+  if (normalized === "error" || normalized === "failed") {
+    return "error";
+  }
+  return "completed";
+}
+
+function normalizeTerminalMessageStatus(rawStatus: unknown): TranscriptMessage["status"] {
+  const outcome = normalizeTerminalOutcome(rawStatus);
+  if (outcome === "stopped" || outcome === "interrupted") return "stopped";
+  if (outcome === "error") return "error";
+  return "complete";
+}
+
+function isEmptyStreamingAssistantPlaceholder(msg: TranscriptMessage): boolean {
+  return (
+    msg.role === "assistant" &&
+    Boolean(msg.streaming) &&
+    msg.text.trim() === "" &&
+    !(msg.toolRows && msg.toolRows.length > 0)
+  );
+}
+
+function isTerminalMessageStatus(status: TranscriptMessage["status"]): boolean {
+  return status === "complete" || status === "stopped" || status === "error";
+}
+
+/** Unwraps Hermes canonical `method === "event"` envelopes while preserving legacy bare notifications. */
+function unwrapGatewayNotification(
+  method: string,
+  params: Record<string, unknown>,
+): { method: string; params: Record<string, unknown> } | null {
+  if (method !== "event") return { method, params };
+  const eventType = firstNonEmptyString(params.type, params.event, params.method);
+  if (!eventType) return null;
+  const rawPayload = params.payload;
+  const inner =
+    rawPayload && typeof rawPayload === "object" && !Array.isArray(rawPayload)
+      ? (rawPayload as Record<string, unknown>)
+      : {};
+  const merged: Record<string, unknown> = { ...params };
+  for (const [key, value] of Object.entries(inner)) {
+    if (value !== undefined && (value !== null || merged[key] === undefined)) {
+      merged[key] = value;
+    }
+  }
+  return { method: eventType, params: merged };
+}
+
 type PromptSubmitReceiptClass =
   | { kind: "accepted"; receipt: "accepted" }
   | { kind: "admitted"; receipt: "admitted" }
@@ -377,15 +483,38 @@ function mapRawSession(
   };
 }
 
+/** Resolves a stable gateway message identifier with canonical uid and row_id fallbacks. */
+function resolveRawMessageId(raw: Record<string, unknown>): string {
+  const explicitId = firstNonEmptyString(
+    raw.message_id,
+    raw.messageId,
+    raw.id,
+    raw.message_uid,
+    raw.messageUid,
+  );
+  if (explicitId) return explicitId;
+  if (typeof raw.id === "number" && Number.isFinite(raw.id)) {
+    return String(raw.id);
+  }
+  const rawRowId = raw.row_id ?? raw.rowId;
+  if (typeof rawRowId === "number" && Number.isFinite(rawRowId)) {
+    return `row-${rawRowId}`;
+  }
+  if (typeof rawRowId === "string" && rawRowId.trim()) {
+    return `row-${rawRowId.trim()}`;
+  }
+  return "";
+}
+
 function mapRawMessage(raw: Record<string, unknown>, sessionId: string): TranscriptMessage | null {
-  const messageId = asString(raw.message_id ?? raw.messageId ?? raw.id).trim();
+  const messageId = resolveRawMessageId(raw);
   if (!messageId) return null;
-  const rawRole = asString(raw.role, "assistant");
+  const rawRole = firstNonEmptyString(raw.role) || "assistant";
   const role: TranscriptMessage["role"] =
     rawRole === "user" || rawRole === "system" ? rawRole : "assistant";
-  const text = asString(raw.text ?? raw.content, "");
-  const createdAt = asString(raw.created_at ?? raw.createdAt, new Date().toISOString());
-  const turnId = asString(raw.turn_id ?? raw.turnId) || undefined;
+  const text = pickTextField(raw.text, raw.content);
+  const createdAt = normalizeTimestampIso(raw);
+  const turnId = firstNonEmptyString(raw.turn_id, raw.turnId) || undefined;
   const toolRowsRaw = Array.isArray(raw.tool_rows ?? raw.toolRows)
     ? ((raw.tool_rows ?? raw.toolRows) as Array<Record<string, unknown>>)
     : [];
@@ -427,6 +556,10 @@ function mapRawMessage(raw: Record<string, unknown>, sessionId: string): Transcr
           }),
         }))
       : undefined;
+  const streaming = Boolean(raw.streaming);
+  const status: TranscriptMessage["status"] = streaming
+    ? "streaming"
+    : normalizeTerminalMessageStatus(raw.status);
   return {
     messageId,
     sessionId,
@@ -435,9 +568,117 @@ function mapRawMessage(raw: Record<string, unknown>, sessionId: string): Transcr
     createdAt,
     ...(turnId ? { turnId } : {}),
     ...(toolRows ? { toolRows } : {}),
-    streaming: Boolean(raw.streaming),
-    status: raw.streaming ? "streaming" : "complete",
+    streaming,
+    status,
   };
+}
+
+/** Merges gateway-persisted messages with in-flight local messages and removes superseded optimistic placeholders. */
+function mergeTranscriptMessages(input: {
+  gatewayMessages: TranscriptMessage[];
+  localMessages: TranscriptMessage[];
+  replace: boolean;
+  gatewayProvesIdle: boolean;
+  optimisticIds?: ReadonlySet<string>;
+}): TranscriptMessage[] {
+  if (input.replace) {
+    // Clean full replacement on gap/resync: never mix stale or torn local messages
+    return input.gatewayMessages;
+  }
+
+  const merged = input.gatewayMessages.map((gm) => ({ ...gm }));
+  const indexById = new Map<string, number>();
+  merged.forEach((gm, idx) => indexById.set(gm.messageId, idx));
+  const consumedGatewayIndices = new Set<number>();
+  let lastMatchedGatewayIdx = -1;
+
+  for (const localMsg of input.localMessages) {
+    const exactIdx = indexById.get(localMsg.messageId);
+    if (exactIdx !== undefined) {
+      consumedGatewayIndices.add(exactIdx);
+      lastMatchedGatewayIdx = Math.max(lastMatchedGatewayIdx, exactIdx);
+      const fromGw = merged[exactIdx];
+      const gwSettled =
+        fromGw.streaming === false ||
+        fromGw.status === "stopped" ||
+        fromGw.status === "error" ||
+        (fromGw.status === "complete" && fromGw.text.length >= localMsg.text.length);
+      const streaming =
+        input.gatewayProvesIdle || gwSettled ? false : (localMsg.streaming ?? fromGw.streaming);
+      const status: TranscriptMessage["status"] =
+        gwSettled
+          ? (fromGw.status ?? "complete")
+          : input.gatewayProvesIdle && (localMsg.status === "streaming" || fromGw.status === "streaming")
+            ? "complete"
+            : (localMsg.status ?? fromGw.status);
+      merged[exactIdx] = {
+        ...fromGw,
+        text: localMsg.text.length >= fromGw.text.length ? localMsg.text : fromGw.text,
+        toolRows: localMsg.toolRows ?? fromGw.toolRows,
+        streaming,
+        status,
+        turnId: localMsg.turnId ?? fromGw.turnId,
+      };
+      continue;
+    }
+
+    if (input.gatewayProvesIdle && isEmptyStreamingAssistantPlaceholder(localMsg)) {
+      continue;
+    }
+
+    if (input.optimisticIds?.has(localMsg.messageId)) {
+      let matchIdx = merged.findIndex(
+        (gm, idx) =>
+          idx > lastMatchedGatewayIdx &&
+          !consumedGatewayIndices.has(idx) &&
+          gm.role === localMsg.role &&
+          gm.text === localMsg.text,
+      );
+      if (matchIdx === -1) {
+        matchIdx = merged.findIndex(
+          (gm, idx) => !consumedGatewayIndices.has(idx) && gm.role === localMsg.role && gm.text === localMsg.text,
+        );
+      }
+      if (matchIdx === -1 && input.gatewayProvesIdle && localMsg.role === "assistant") {
+        // Only align a trailing optimistic assistant message with an unconsumed gateway assistant row after the matched turn position.
+        const candidateIdx = merged.findIndex(
+          (gm, idx) =>
+            idx > lastMatchedGatewayIdx &&
+            !consumedGatewayIndices.has(idx) &&
+            gm.role === "assistant" &&
+            gm.text.length > 0,
+        );
+        if (candidateIdx !== -1) {
+          matchIdx = candidateIdx;
+        }
+      }
+      if (matchIdx !== -1) {
+        consumedGatewayIndices.add(matchIdx);
+        lastMatchedGatewayIdx = Math.max(lastMatchedGatewayIdx, matchIdx);
+        const fromGw = merged[matchIdx];
+        merged[matchIdx] = {
+          ...fromGw,
+          text: localMsg.text.length >= fromGw.text.length ? localMsg.text : fromGw.text,
+          toolRows: localMsg.toolRows ?? fromGw.toolRows,
+          streaming: input.gatewayProvesIdle ? false : fromGw.streaming,
+        };
+        continue;
+      }
+    }
+
+    if (input.gatewayProvesIdle && localMsg.streaming) {
+      merged.push({
+        ...localMsg,
+        streaming: false,
+        status: localMsg.status === "streaming" ? "complete" : localMsg.status,
+      });
+      continue;
+    }
+
+    merged.push(localMsg);
+  }
+
+  return merged;
 }
 
 function isRpcAuthError(err: unknown): boolean {
@@ -692,6 +933,7 @@ export class ConnectionSupervisor {
   private revision = 1;
   private subscriberSeq = 0;
   private ownerGenerationSeq = 0;
+  private syntheticIdSeq = 0;
   private inflightCoreProbes: Promise<void> | null = null;
   private disposed = false;
   private shuttingDown = false;
@@ -707,6 +949,9 @@ export class ConnectionSupervisor {
   private readonly sessionsByScope = new Map<string, SessionSummary[]>();
   private readonly sessionCwdByScope = new Map<string, string>();
   private readonly transcripts = new Map<string, SessionTranscriptSnapshot>();
+  private readonly activeStreamingMessageBySession = new Map<string, string>();
+  private readonly optimisticMessageIdsBySession = new Map<string, Set<string>>();
+  private readonly optimisticTurnIdBySession = new Map<string, string>();
   private readonly backgroundJournal = new BackgroundJournalManager();
   private readonly pendingResyncKeys = new Set<string>();
   private explicitWindowFocused: boolean | null = null;
@@ -1044,15 +1289,42 @@ export class ConnectionSupervisor {
       return { transcript: null, resyncRequired: true };
     }
 
+    const preSwitchOptimisticIds = new Set(this.optimisticMessageIdsBySession.get(tk) ?? []);
     let snapshot = await this.loadTranscriptSnapshot(entry, profileId, sessionId);
     if (journal && journal.events.length > 0) {
+      const bufferedAssistantText = new Map<string, string>();
+      for (const ev of journal.events) {
+        if (ev.patch.type === "token_delta") {
+          const prevText = bufferedAssistantText.get(ev.patch.messageId) ?? "";
+          bufferedAssistantText.set(ev.patch.messageId, `${prevText}${ev.patch.delta}`);
+        } else if (ev.patch.type === "message_upsert" && ev.patch.message.role === "assistant") {
+          bufferedAssistantText.set(ev.patch.message.messageId, ev.patch.message.text);
+        }
+      }
       let current = snapshot;
       for (const ev of journal.events) {
         const patch = ev.patch;
-        if (patch.type === "token_delta") {
-          const existingMsg = current.messages.find((m) => m.messageId === patch.messageId);
-          if (existingMsg && existingMsg.status === "complete" && existingMsg.text.length > 0) {
+        if (patch.type === "token_delta" || patch.type === "message_upsert") {
+          const patchMsgId =
+            patch.type === "token_delta" ? patch.messageId : patch.message.messageId;
+          const existingMsg = current.messages.find((m) => m.messageId === patchMsgId);
+          if (existingMsg && isTerminalMessageStatus(existingMsg.status) && existingMsg.text.length > 0) {
             continue;
+          }
+          if (current.activeTurnId === null) {
+            const expectedText = bufferedAssistantText.get(patchMsgId);
+            const isSupersededByPersisted =
+              expectedText !== undefined &&
+              expectedText.length > 0 &&
+              current.messages.some(
+                (m) =>
+                  m.role === "assistant" &&
+                  isTerminalMessageStatus(m.status) &&
+                  m.text === expectedText,
+              );
+            if (isSupersededByPersisted && (preSwitchOptimisticIds.has(patchMsgId) || patch.type === "message_upsert" || patch.type === "token_delta")) {
+              continue;
+            }
           }
         }
         const next = reduceTranscriptEvent(current, {
@@ -1068,6 +1340,7 @@ export class ConnectionSupervisor {
         }
       }
       this.transcripts.set(tk, current);
+      this.chatSessionStateStore?.recordTranscriptSnapshot(current);
       this.backgroundJournal.dropBufferOnly(jKey);
       snapshot = current;
       this.emitTopic(
@@ -1322,6 +1595,7 @@ export class ConnectionSupervisor {
     for (const tk of [...this.transcripts.keys()]) {
       if (tk.startsWith(`${connectionId}::`)) {
         this.transcripts.delete(tk);
+        this.clearSessionTrackingMaps(tk);
       }
     }
     if (this.activeScope?.connectionId === connectionId) {
@@ -1802,6 +2076,7 @@ export class ConnectionSupervisor {
     for (const key of [...this.transcripts.keys()]) {
       if (key.startsWith(`${connectionId}::`)) {
         this.transcripts.delete(key);
+        this.clearSessionTrackingMaps(key);
       }
     }
     for (const key of [...this.sessionCwdByScope.keys()]) {
@@ -3307,6 +3582,7 @@ export class ConnectionSupervisor {
           });
         } else {
           this.transcripts.delete(tk);
+          this.clearSessionTrackingMaps(tk);
           this.backgroundJournal.markResyncRequired(tk, "reconnect");
         }
       }
@@ -3466,6 +3742,7 @@ export class ConnectionSupervisor {
             });
           } else {
             this.transcripts.delete(tk);
+            this.clearSessionTrackingMaps(tk);
             this.backgroundJournal.markResyncRequired(tk, "reconnect");
           }
         }
@@ -3983,37 +4260,9 @@ export class ConnectionSupervisor {
       .map((m) => mapRawMessage(m, sessionId))
       .filter((m): m is TranscriptMessage => m !== null);
 
-    let finalMessages: TranscriptMessage[];
-    if (options?.replace) {
-      // Clean full replacement on gap/resync: never mix stale or torn local messages
-      finalMessages = gatewayMessages;
-    } else {
-      // Preserve live in-flight messages / tokens / tool rows while incorporating persisted gateway messages
-      const mergedById = new Map<string, TranscriptMessage>();
-      for (const gm of gatewayMessages) {
-        mergedById.set(gm.messageId, gm);
-      }
-      for (const localMsg of base.messages) {
-        const fromGw = mergedById.get(localMsg.messageId);
-        if (!fromGw) {
-          mergedById.set(localMsg.messageId, localMsg);
-        } else {
-          mergedById.set(localMsg.messageId, {
-            ...fromGw,
-            text: localMsg.text.length >= fromGw.text.length ? localMsg.text : fromGw.text,
-            toolRows: localMsg.toolRows ?? fromGw.toolRows,
-            streaming: localMsg.streaming ?? fromGw.streaming,
-            status: localMsg.status ?? fromGw.status,
-            turnId: localMsg.turnId ?? fromGw.turnId,
-          });
-        }
-      }
-      finalMessages = [...mergedById.values()];
-    }
-
     const gwTurnId =
       rawResult && typeof (rawResult.active_turn_id ?? rawResult.activeTurnId) === "string"
-        ? String(rawResult.active_turn_id ?? rawResult.activeTurnId)
+        ? String(rawResult.active_turn_id ?? rawResult.activeTurnId).trim() || null
         : null;
 
     const gwExecGen =
@@ -4047,7 +4296,28 @@ export class ConnectionSupervisor {
           | undefined)
       : undefined;
 
-    const resolvedActiveTurnId = options?.replace ? gwTurnId : base.activeTurnId ?? gwTurnId;
+    const hasExplicitPending = Array.isArray(rawResult?.pending);
+    const hasPendingItems = hasExplicitPending ? (rawResult!.pending as unknown[]).length > 0 : false;
+    const hasUnknownTurns = Array.isArray(rawUnknownTurns) && rawUnknownTurns.length > 0;
+    const gatewayProvesIdle = Boolean(
+      rawResult &&
+        rawResult.running === false &&
+        hasExplicitPending &&
+        !hasPendingItems &&
+        !hasUnknownTurns &&
+        !gwTurnId,
+    );
+
+    const finalMessages = mergeTranscriptMessages({
+      gatewayMessages,
+      localMessages: base.messages,
+      replace: Boolean(options?.replace),
+      gatewayProvesIdle,
+      optimisticIds: this.optimisticMessageIdsBySession.get(key),
+    });
+
+    const resolvedActiveTurnId =
+      options?.replace || gatewayProvesIdle ? gwTurnId : (base.activeTurnId ?? gwTurnId);
     const recoveryView = rawResult
       ? this.turnCoordinator.reconcileFromResume({
           connectionId,
@@ -4065,7 +4335,9 @@ export class ConnectionSupervisor {
 
     const effectiveActiveTurnId = recoveryView?.unknownTurn
       ? null
-      : recoveryView?.activeTurnId ?? resolvedActiveTurnId;
+      : gatewayProvesIdle
+        ? null
+        : recoveryView?.activeTurnId ?? resolvedActiveTurnId;
 
     const merged: SessionTranscriptSnapshot = {
       ...base,
@@ -4090,7 +4362,11 @@ export class ConnectionSupervisor {
       ...(options?.resynced ? { resynced: true } : {}),
     };
 
-    if (recoveryView?.unknownTurn) {
+    if (options?.replace || gatewayProvesIdle) {
+      this.clearSessionTrackingMaps(key);
+    }
+
+    if (recoveryView?.unknownTurn || (gatewayProvesIdle && !effectiveActiveTurnId)) {
       this.backgroundJournal.setPinnedFlags(
         makeSessionJournalKey(connectionId, profileId, sessionId),
         { runningTurn: false },
@@ -4907,10 +5183,479 @@ export class ConnectionSupervisor {
     }
   }
 
+  /** Clears per-session optimistic message/turn tracking state when a transcript is reset or dropped. */
+  private clearSessionTrackingMaps(txKey: string): void {
+    this.activeStreamingMessageBySession.delete(txKey);
+    this.optimisticMessageIdsBySession.delete(txKey);
+    this.optimisticTurnIdBySession.delete(txKey);
+  }
+
+  /** Generates a monotonically increasing synthetic local identifier for optimistic items. */
+  private nextSyntheticId(prefix: string): string {
+    this.syntheticIdSeq += 1;
+    return `${prefix}-${this.now()}-${this.syntheticIdSeq}`;
+  }
+
+  /** Records a locally synthesized message ID so session.resume can deduplicate it against DB rows. */
+  private trackOptimisticMessageId(txKey: string, messageId: string): void {
+    let set = this.optimisticMessageIdsBySession.get(txKey);
+    if (!set) {
+      set = new Set<string>();
+      this.optimisticMessageIdsBySession.set(txKey, set);
+    }
+    set.add(messageId);
+  }
+
+  /** Resolves or creates the active streaming assistant messageId for a session turn. */
+  private resolveAssistantMessageId(
+    txKey: string,
+    params: Record<string, unknown>,
+    turnId?: string,
+    admId?: string,
+  ): string {
+    const explicitId = firstNonEmptyString(params.message_id, params.messageId, params.id);
+    if (explicitId) {
+      this.activeStreamingMessageBySession.set(txKey, explicitId);
+      return explicitId;
+    }
+    const tracked = this.activeStreamingMessageBySession.get(txKey);
+    if (tracked) return tracked;
+    const existingMessages = this.transcripts.get(txKey)?.messages ?? [];
+    for (let i = existingMessages.length - 1; i >= 0; i -= 1) {
+      const m = existingMessages[i];
+      if (m.role !== "assistant") continue;
+      if ((m.streaming || m.status === "streaming") && (!turnId || !m.turnId || m.turnId === turnId)) {
+        this.activeStreamingMessageBySession.set(txKey, m.messageId);
+        return m.messageId;
+      }
+    }
+    const generated = turnId
+      ? `assistant-${turnId}`
+      : admId
+        ? `assistant-${admId}`
+        : this.nextSyntheticId("assistant");
+    this.activeStreamingMessageBySession.set(txKey, generated);
+    this.trackOptimisticMessageId(txKey, generated);
+    return generated;
+  }
+
+  /** Replaces an optimistic local turnId with the gateway's canonical turnId without dropping stop state. */
+  private syncTurnIdFromGatewayEvent(
+    connectionId: string,
+    profileId: string,
+    sessionId: string,
+    txKey: string,
+    gwTurnId: string,
+    ownerGeneration: number,
+    execGen?: number,
+  ): void {
+    const existing = this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
+    if (existing?.activeTurnId === gwTurnId) return;
+    if (existing?.activeTurnId && this.optimisticTurnIdBySession.get(txKey) !== existing.activeTurnId) {
+      return;
+    }
+    this.optimisticTurnIdBySession.delete(txKey);
+    if (existing?.activeTurnId) {
+      this.turnCoordinator.adoptGatewayTurnId({
+        connectionId,
+        profileId,
+        sessionId,
+        turnId: gwTurnId,
+        ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+      });
+      return;
+    }
+    this.turnCoordinator.noteTurnStarted({
+      connectionId,
+      profileId,
+      sessionId,
+      turnId: gwTurnId,
+      executionGeneration: execGen ?? existing?.executionGeneration ?? 1,
+      ownerGeneration,
+    });
+  }
+
+  /** Advances the background journal sequence watermark for non-patch session notifications. */
+  private recordGatewaySeqCheckpoint(input: {
+    jKey: string;
+    seqRaw?: number;
+    isFocused: boolean;
+    isActive: boolean;
+  }): void {
+    if (typeof input.seqRaw !== "number") return;
+    this.backgroundJournal.recordEvent(input.jKey, {
+      kind: "other",
+      countsAsUnread: false,
+      gatewaySeq: input.seqRaw,
+      isWindowFocused: input.isFocused,
+      isViewingSession: input.isActive,
+    });
+  }
+
+  /** Applies a transcript patch directly to the active session or buffers it in the background journal. */
+  private recordTranscriptPatchOrBuffer(input: {
+    entry: GatewayTransportEntry;
+    connectionId: string;
+    profileId: string;
+    sessionId: string;
+    jKey: string;
+    kind: BackgroundJournalEventKind;
+    countsAsUnread: boolean;
+    seqRaw?: number;
+    isFocused: boolean;
+    isActive: boolean;
+    patch: TranscriptPatchPayload;
+  }): void {
+    if (input.isActive) {
+      this.backgroundJournal.recordEvent(input.jKey, {
+        kind: input.kind,
+        countsAsUnread: input.countsAsUnread,
+        gatewaySeq: input.seqRaw,
+        isWindowFocused: input.isFocused,
+        isViewingSession: true,
+      });
+      this.applyPatchToTranscript(
+        input.entry,
+        input.connectionId,
+        input.profileId,
+        input.sessionId,
+        input.patch,
+      );
+      return;
+    }
+    this.backgroundJournal.recordEvent(input.jKey, {
+      kind: input.kind,
+      countsAsUnread: input.countsAsUnread,
+      gatewaySeq: input.seqRaw,
+      isWindowFocused: input.isFocused,
+      isViewingSession: false,
+      patch: input.patch,
+    });
+  }
+
+  /** Reconciles unknown turns reported inside a canonical `session.info` notification. */
+  private handleSessionInfoUnknownTurns(input: {
+    entry: GatewayTransportEntry;
+    connectionId: string;
+    profileId: string;
+    sessionId: string;
+    jKey: string;
+    txKey: string;
+    isActive: boolean;
+    isFocused: boolean;
+    seqRaw?: number;
+    execGen?: number;
+    hasQueued: boolean;
+    canonicalPending: CanonicalPendingProjection;
+  }): void {
+    const {
+      entry,
+      connectionId,
+      profileId,
+      sessionId,
+      jKey,
+      txKey,
+      isActive,
+      isFocused,
+      seqRaw,
+      execGen,
+      hasQueued,
+      canonicalPending,
+    } = input;
+    const recovery = this.turnCoordinator.reconcileFromResume({
+      connectionId,
+      profileId,
+      sessionId,
+      ownerGeneration: entry.ownerGeneration,
+      activeTurnId: null,
+      ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+      unknownTurns: canonicalPending.unknownTurns,
+      queuedAdmissions: canonicalPending.queuedAdmissions,
+      queueSnapshotProvesAbsence: false,
+    });
+    this.activeStreamingMessageBySession.delete(txKey);
+    this.optimisticTurnIdBySession.delete(txKey);
+    this.backgroundJournal.setPinnedFlags(jKey, { runningTurn: false, queuedAdmission: hasQueued });
+    this.recordTranscriptPatchOrBuffer({
+      entry,
+      connectionId,
+      profileId,
+      sessionId,
+      jKey,
+      kind: "turn_boundary",
+      countsAsUnread: false,
+      seqRaw,
+      isFocused,
+      isActive,
+      patch: {
+        type: "turn_state",
+        sessionId,
+        activeTurnId: null,
+        turnStopping: false,
+        executionGeneration: recovery.executionGeneration,
+        stopState: recovery.stopState,
+      },
+    });
+    this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+      ...prev,
+      activeTurnId: null,
+      status: "idle",
+      queuedAdmission: hasQueued,
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  /** Settles any lingering optimistic turn and empty streaming placeholder on explicit `running=false, pending=[]`. */
+  private handleSessionInfoIdle(input: {
+    entry: GatewayTransportEntry;
+    connectionId: string;
+    profileId: string;
+    sessionId: string;
+    jKey: string;
+    txKey: string;
+    isActive: boolean;
+    isFocused: boolean;
+    seqRaw?: number;
+    execGen?: number;
+  }): void {
+    const { entry, connectionId, profileId, sessionId, jKey, txKey, isActive, isFocused, seqRaw, execGen } = input;
+    const existing = this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
+    const currentTx = this.transcripts.get(txKey);
+    const hasStreamingMsg = Boolean(
+      currentTx?.messages.some((m) => m.streaming || m.status === "streaming"),
+    );
+    const wasActive = Boolean(
+      existing?.activeTurnId || (currentTx && (currentTx.activeTurnId !== null || hasStreamingMsg)),
+    );
+
+    this.activeStreamingMessageBySession.delete(txKey);
+    this.optimisticTurnIdBySession.delete(txKey);
+    this.backgroundJournal.setPinnedFlags(jKey, { runningTurn: false, queuedAdmission: false });
+
+    if (existing?.activeTurnId) {
+      this.turnCoordinator.noteTurnTerminal({
+        connectionId,
+        profileId,
+        sessionId,
+        ...(execGen !== undefined && execGen >= existing.executionGeneration
+          ? { executionGeneration: execGen }
+          : {}),
+        outcome: "completed",
+      });
+    }
+
+    let recordedSeq = false;
+    if (wasActive) {
+      const latestRecovery = this.turnCoordinator.getSessionView({
+        connectionId,
+        profileId,
+        sessionId,
+      });
+      const patch: TranscriptPatchPayload = {
+        type: "turn_state",
+        sessionId,
+        activeTurnId: null,
+        turnStopping: false,
+        ...(latestRecovery ? { executionGeneration: latestRecovery.executionGeneration } : {}),
+        stopState: latestRecovery?.stopState ?? "idle",
+      };
+      if (isActive && currentTx && currentTx.messages.some(isEmptyStreamingAssistantPlaceholder)) {
+        const settledMessages = currentTx.messages
+          .filter((m) => !isEmptyStreamingAssistantPlaceholder(m))
+          .map((m) =>
+            m.streaming
+              ? {
+                  ...m,
+                  streaming: false,
+                  status: m.status === "streaming" ? ("complete" as const) : m.status,
+                }
+              : m,
+          );
+        const nextSnap: SessionTranscriptSnapshot = {
+          ...currentTx,
+          messages: settledMessages,
+          activeTurnId: null,
+          turnStopping: false,
+          ...(latestRecovery ? { executionGeneration: latestRecovery.executionGeneration } : {}),
+          stopState: latestRecovery?.stopState ?? "idle",
+          snapshotSeq: 0,
+        };
+        this.transcripts.set(txKey, nextSnap);
+        this.emitTopic(
+          "session.transcript",
+          { connectionId, profileId, sessionId },
+          "snapshot",
+          nextSnap,
+          (sub) =>
+            Boolean(
+              sub.scope &&
+                sub.scope.connectionId === connectionId &&
+                this.matchesProfileScope(connectionId, sub.scope.profileId, profileId) &&
+                sub.scope.sessionId === sessionId,
+            ),
+        );
+      } else {
+        this.recordTranscriptPatchOrBuffer({
+          entry,
+          connectionId,
+          profileId,
+          sessionId,
+          jKey,
+          kind: "turn_boundary",
+          countsAsUnread: false,
+          seqRaw,
+          isFocused,
+          isActive,
+          patch,
+        });
+        recordedSeq = true;
+      }
+    }
+
+    if (!recordedSeq) {
+      this.recordGatewaySeqCheckpoint({ jKey, seqRaw, isFocused, isActive });
+    }
+
+    this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+      ...prev,
+      activeTurnId: null,
+      status: "idle",
+      queuedAdmission: false,
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  /** Handles canonical `session.info` snapshots for queued, running, unknown-turn, and idle states. */
+  private handleSessionInfoNotification(input: {
+    entry: GatewayTransportEntry;
+    connectionId: string;
+    profileId: string;
+    sessionId: string;
+    params: Record<string, unknown>;
+    jKey: string;
+    txKey: string;
+    isActive: boolean;
+    isFocused: boolean;
+    seqRaw?: number;
+  }): void {
+    const { entry, connectionId, profileId, sessionId, params, jKey, txKey, isActive, isFocused, seqRaw } = input;
+    const canonicalPending = Array.isArray(params.pending) ? projectCanonicalPending(params) : null;
+    const execGen =
+      typeof (params.execution_generation ?? params.executionGeneration) === "number"
+        ? Number(params.execution_generation ?? params.executionGeneration)
+        : undefined;
+    const hasUnknown = Boolean(canonicalPending && canonicalPending.unknownTurns.length > 0);
+    const hasRawPendingItems = Array.isArray(params.pending) && params.pending.length > 0;
+    const hasQueued = Boolean(canonicalPending?.admissions.some((a) => a.status === "queued"));
+
+    if (hasUnknown && canonicalPending) {
+      this.handleSessionInfoUnknownTurns({
+        entry,
+        connectionId,
+        profileId,
+        sessionId,
+        jKey,
+        txKey,
+        isActive,
+        isFocused,
+        seqRaw,
+        execGen,
+        hasQueued,
+        canonicalPending,
+      });
+      return;
+    }
+
+    if (canonicalPending?.present) {
+      this.turnCoordinator.applyGatewayQueueSnapshot({
+        connectionId,
+        profileId,
+        sessionId,
+        queuedAdmissions: canonicalPending.queuedAdmissions,
+      });
+      this.backgroundJournal.setPinnedFlags(jKey, { queuedAdmission: hasQueued });
+    }
+
+    if (params.running === true) {
+      this.recordGatewaySeqCheckpoint({ jKey, seqRaw, isFocused, isActive });
+      const existing = this.turnCoordinator.getSessionView({ connectionId, profileId, sessionId });
+      const startedAdm = canonicalPending?.admissions.find((a) => a.status === "started");
+      const explicitTurnId = firstNonEmptyString(params.turn_id, params.turnId);
+      const turnId =
+        explicitTurnId ||
+        existing?.activeTurnId ||
+        (startedAdm ? `turn-${startedAdm.admissionId}` : this.nextSyntheticId("turn"));
+      let recovery = existing;
+      if (!existing?.activeTurnId) {
+        recovery = this.turnCoordinator.noteTurnStarted({
+          connectionId,
+          profileId,
+          sessionId,
+          turnId,
+          ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+          ownerGeneration: entry.ownerGeneration,
+        });
+        if (isActive) {
+          this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
+            type: "turn_state",
+            sessionId,
+            activeTurnId: turnId,
+            turnStopping: false,
+            executionGeneration: recovery.executionGeneration,
+            stopState: "idle",
+          });
+        }
+      }
+      this.backgroundJournal.setPinnedFlags(jKey, {
+        runningTurn: true,
+        ...(canonicalPending?.present ? { queuedAdmission: hasQueued } : {}),
+      });
+      this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+        ...prev,
+        activeTurnId: turnId,
+        status: "running",
+        ...(canonicalPending?.present ? { queuedAdmission: hasQueued } : {}),
+        updatedAt: new Date().toISOString(),
+      }));
+      return;
+    }
+
+    const isExplicitIdle =
+      params.running === false &&
+      Array.isArray(params.pending) &&
+      !hasRawPendingItems &&
+      !hasUnknown;
+
+    if (!isExplicitIdle) {
+      this.recordGatewaySeqCheckpoint({ jKey, seqRaw, isFocused, isActive });
+      if (canonicalPending?.present) {
+        this.updateSessionSummary(connectionId, profileId, sessionId, (prev) => ({
+          ...prev,
+          queuedAdmission: hasQueued,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      return;
+    }
+
+    this.handleSessionInfoIdle({
+      entry,
+      connectionId,
+      profileId,
+      sessionId,
+      jKey,
+      txKey,
+      isActive,
+      isFocused,
+      seqRaw,
+      execGen,
+    });
+  }
+
   private handleGatewayNotification(
     entry: GatewayTransportEntry,
-    method: string,
-    params: Record<string, unknown>,
+    rawMethod: string,
+    rawParams: Record<string, unknown>,
     serverRequestId?: string | number,
   ): void {
     if (this.disposed || this.shuttingDown || entry.disposed) return;
@@ -4918,6 +5663,10 @@ export class ConnectionSupervisor {
     if (currentEntry && currentEntry.ownerGeneration !== entry.ownerGeneration) {
       return;
     }
+
+    const unwrapped = unwrapGatewayNotification(rawMethod, rawParams);
+    if (!unwrapped) return;
+    const { method, params } = unwrapped;
 
     const connectionId = entry.connectionId;
     if (method === "auth.required" || method === "auth_required") {
@@ -5251,6 +6000,7 @@ export class ConnectionSupervisor {
     const isActive = this.isSessionCurrentlyActive(connectionId, resolvedProfileId, sessionId);
     const isFocused = this.isEffectiveWindowFocused();
     const jKey = makeSessionJournalKey(connectionId, resolvedProfileId, sessionId);
+    const txKey = transcriptKey(connectionId, resolvedProfileId, sessionId);
     const scopeMatchesSession = (sub: SubscriberRecord) =>
       !sub.scope ||
       (sub.scope.connectionId === connectionId &&
@@ -5258,12 +6008,82 @@ export class ConnectionSupervisor {
           this.matchesProfileScope(connectionId, sub.scope.profileId, resolvedProfileId)) &&
         (!sub.scope.sessionId || sub.scope.sessionId === sessionId));
 
-    if (method === "prompt.started" || method === "turn.started") {
-      const turnId = asString(params.turn_id ?? params.turnId, `turn-${Date.now()}`);
+    if (method === "session.info") {
+      this.handleSessionInfoNotification({
+        entry,
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+        params,
+        jKey,
+        txKey,
+        isActive,
+        isFocused,
+        seqRaw,
+      });
+      return;
+    }
+
+    if (method === "prompt.started" || method === "turn.started" || method === "message.start") {
+      const explicitTurnId = firstNonEmptyString(params.turn_id, params.turnId);
+      const admId = firstNonEmptyString(params.admission_id, params.admissionId) || undefined;
       const execGen =
         typeof (params.execution_generation ?? params.executionGeneration) === "number"
           ? Number(params.execution_generation ?? params.executionGeneration)
           : undefined;
+      const existing = this.turnCoordinator.getSessionView({
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+      });
+      if (method === "message.start" && !explicitTurnId && existing?.activeTurnId) {
+        const messageId = this.resolveAssistantMessageId(
+          txKey,
+          params,
+          existing.activeTurnId,
+          admId,
+        );
+        const existingTx = this.transcripts.get(txKey);
+        const hasPlaceholder = Boolean(existingTx?.messages.some((m) => m.messageId === messageId));
+        if (!hasPlaceholder) {
+          this.recordTranscriptPatchOrBuffer({
+            entry,
+            connectionId,
+            profileId: resolvedProfileId,
+            sessionId,
+            jKey,
+            kind: "other",
+            countsAsUnread: false,
+            seqRaw,
+            isFocused,
+            isActive,
+            patch: {
+              type: "message_upsert",
+              sessionId,
+              message: {
+                messageId,
+                sessionId,
+                role: "assistant",
+                text: "",
+                createdAt: new Date().toISOString(),
+                turnId: existing.activeTurnId,
+                streaming: true,
+                status: "streaming",
+              },
+            },
+          });
+        } else {
+          this.recordGatewaySeqCheckpoint({ jKey, seqRaw, isFocused, isActive });
+        }
+        return;
+      }
+      this.recordGatewaySeqCheckpoint({ jKey, seqRaw, isFocused, isActive });
+      const turnId = explicitTurnId || existing?.activeTurnId || this.nextSyntheticId("turn");
+      if (!explicitTurnId) {
+        this.optimisticTurnIdBySession.set(txKey, turnId);
+      } else {
+        this.optimisticTurnIdBySession.delete(txKey);
+      }
       const recovery = this.turnCoordinator.noteTurnStarted({
         connectionId,
         profileId: resolvedProfileId,
@@ -5272,7 +6092,9 @@ export class ConnectionSupervisor {
         ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
         ownerGeneration: entry.ownerGeneration,
       });
-      const admId = asString(params.admission_id ?? params.admissionId).trim();
+      if (method === "message.start") {
+        this.resolveAssistantMessageId(txKey, params, turnId, admId);
+      }
       if (admId) {
         this.turnCoordinator.applyAdmissionEvent({
           connectionId,
@@ -5329,10 +6151,34 @@ export class ConnectionSupervisor {
       return;
     }
 
-    if (method === "prompt.delta" || method === "prompt.token") {
-      const messageId = asString(params.message_id ?? params.messageId, `assistant-${Date.now()}`);
-      const turnId = asString(params.turn_id ?? params.turnId) || undefined;
-      const delta = asString(params.delta ?? params.text, "");
+    if (method === "prompt.delta" || method === "prompt.token" || method === "message.delta") {
+      const explicitTurnId = firstNonEmptyString(params.turn_id, params.turnId) || undefined;
+      const admId = firstNonEmptyString(params.admission_id, params.admissionId) || undefined;
+      const execGen =
+        typeof (params.execution_generation ?? params.executionGeneration) === "number"
+          ? Number(params.execution_generation ?? params.executionGeneration)
+          : undefined;
+      if (explicitTurnId) {
+        this.syncTurnIdFromGatewayEvent(
+          connectionId,
+          resolvedProfileId,
+          sessionId,
+          txKey,
+          explicitTurnId,
+          entry.ownerGeneration,
+          execGen,
+        );
+      }
+      const turnId =
+        explicitTurnId ??
+        this.turnCoordinator.getSessionView({
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+        })?.activeTurnId ??
+        undefined;
+      const messageId = this.resolveAssistantMessageId(txKey, params, turnId, admId);
+      const delta = pickTextField(params.delta, params.text, params.content);
       const patch: TranscriptPatchPayload = {
         type: "token_delta",
         sessionId,
@@ -5340,15 +6186,20 @@ export class ConnectionSupervisor {
         messageId,
         delta,
       };
+      this.recordTranscriptPatchOrBuffer({
+        entry,
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+        jKey,
+        kind: "token_delta",
+        countsAsUnread: false,
+        seqRaw,
+        isFocused,
+        isActive,
+        patch,
+      });
       if (isActive) {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: "token_delta",
-          countsAsUnread: false,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: true,
-        });
-        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
         const promptPayload: PromptEventPayload = {
           connectionId,
           profileId: resolvedProfileId,
@@ -5365,15 +6216,6 @@ export class ConnectionSupervisor {
           promptPayload,
           scopeMatchesSession,
         );
-      } else {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: "token_delta",
-          countsAsUnread: false,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: false,
-          patch,
-        });
       }
       return;
     }
@@ -5435,7 +6277,10 @@ export class ConnectionSupervisor {
           : knownTool?.attribution ?? resolveExternalAttribution({}),
       };
       const turnId = asString(params.turn_id ?? params.turnId) || undefined;
-      const messageId = asString(params.message_id ?? params.messageId) || undefined;
+      const messageId =
+        firstNonEmptyString(params.message_id, params.messageId) ||
+        this.activeStreamingMessageBySession.get(txKey) ||
+        undefined;
       const patch: TranscriptPatchPayload = {
         type: "tool_row",
         sessionId,
@@ -5453,15 +6298,20 @@ export class ConnectionSupervisor {
         : "tool_running";
       const countsAsUnread = isUserVisibleProgressKind(journalKind);
 
+      this.recordTranscriptPatchOrBuffer({
+        entry,
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+        jKey,
+        kind: journalKind,
+        countsAsUnread,
+        seqRaw,
+        isFocused,
+        isActive,
+        patch,
+      });
       if (isActive) {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: journalKind,
-          countsAsUnread,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: true,
-        });
-        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
         const activityPayload: ActivityEventPayload = {
           connectionId,
           profileId: resolvedProfileId,
@@ -5476,15 +6326,6 @@ export class ConnectionSupervisor {
           activityPayload,
           scopeMatchesSession,
         );
-      } else {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: journalKind,
-          countsAsUnread,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: false,
-          patch,
-        });
       }
 
       if (countsAsUnread) {
@@ -5516,25 +6357,19 @@ export class ConnectionSupervisor {
         sessionId,
         message: mapped,
       };
-      if (isActive) {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: journalKind,
-          countsAsUnread,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: true,
-        });
-        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
-      } else {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: journalKind,
-          countsAsUnread,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: false,
-          patch,
-        });
-      }
+      this.recordTranscriptPatchOrBuffer({
+        entry,
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+        jKey,
+        kind: journalKind,
+        countsAsUnread,
+        seqRaw,
+        isFocused,
+        isActive,
+        patch,
+      });
       if (countsAsUnread) {
         this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
           ...prev,
@@ -5549,31 +6384,87 @@ export class ConnectionSupervisor {
       method === "prompt.completed" ||
       method === "prompt.done" ||
       method === "prompt.stopped" ||
-      method === "prompt.error"
+      method === "prompt.error" ||
+      method === "message.complete"
     ) {
-      const turnId = asString(params.turn_id ?? params.turnId, "");
+      const explicitTurnId = firstNonEmptyString(params.turn_id, params.turnId);
       const execGen =
         typeof (params.execution_generation ?? params.executionGeneration) === "number"
           ? Number(params.execution_generation ?? params.executionGeneration)
           : undefined;
-      const messageId = asString(params.message_id ?? params.messageId) || undefined;
-      const status: TranscriptMessage["status"] =
+      const admId = firstNonEmptyString(params.admission_id, params.admissionId);
+      const existingRecovery = this.turnCoordinator.getSessionView({
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+      });
+      if (explicitTurnId) {
+        this.syncTurnIdFromGatewayEvent(
+          connectionId,
+          resolvedProfileId,
+          sessionId,
+          txKey,
+          explicitTurnId,
+          entry.ownerGeneration,
+          execGen,
+        );
+      }
+      const turnId = explicitTurnId || existingRecovery?.activeTurnId || "";
+      const rawOutcome = firstNonEmptyString(params.outcome, params.status);
+      const terminalOutcome =
         method === "prompt.stopped"
           ? "stopped"
           : method === "prompt.error"
             ? "error"
-            : "complete";
-      const terminalOutcome =
-        method === "prompt.stopped" ? "stopped" : method === "prompt.error" ? "error" : "completed";
+            : method === "message.complete"
+              ? normalizeTerminalOutcome(rawOutcome)
+              : "completed";
+      const status =
+        method === "prompt.stopped"
+          ? "stopped"
+          : method === "prompt.error"
+            ? "error"
+            : method === "message.complete"
+              ? normalizeTerminalMessageStatus(rawOutcome)
+              : "complete";
+
+      const finalText = pickTextField(params.text, params.content);
+      const explicitMessageId = firstNonEmptyString(params.message_id, params.messageId, params.id);
+      const trackedMessageId = this.activeStreamingMessageBySession.get(txKey);
+      const explicitOrTrackedMessageId = explicitMessageId || trackedMessageId;
+      const messageId = finalText
+        ? (explicitOrTrackedMessageId ??
+          this.resolveAssistantMessageId(txKey, params, turnId || undefined, admId || undefined))
+        : explicitOrTrackedMessageId || undefined;
+      const supersededPlaceholderId =
+        explicitMessageId &&
+        trackedMessageId &&
+        trackedMessageId !== explicitMessageId &&
+        this.optimisticMessageIdsBySession.get(txKey)?.has(trackedMessageId)
+          ? trackedMessageId
+          : undefined;
+
+      this.activeStreamingMessageBySession.delete(txKey);
+      this.optimisticTurnIdBySession.delete(txKey);
+
+      const postSyncRecovery = this.turnCoordinator.getSessionView({
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+      });
+      const shouldPassTurnId =
+        Boolean(explicitTurnId) &&
+        (!postSyncRecovery?.activeTurnId || postSyncRecovery.activeTurnId === explicitTurnId);
+      const canPassExecGen =
+        execGen !== undefined && execGen >= (postSyncRecovery?.executionGeneration ?? 0);
       const recovery = this.turnCoordinator.noteTurnTerminal({
         connectionId,
         profileId: resolvedProfileId,
         sessionId,
-        ...(turnId ? { turnId } : {}),
-        ...(execGen !== undefined ? { executionGeneration: execGen } : {}),
+        ...(shouldPassTurnId ? { turnId: explicitTurnId } : {}),
+        ...(canPassExecGen ? { executionGeneration: execGen } : {}),
         outcome: terminalOutcome,
       });
-      const admId = asString(params.admission_id ?? params.admissionId).trim();
       if (admId) {
         this.turnCoordinator.applyAdmissionEvent({
           connectionId,
@@ -5585,6 +6476,76 @@ export class ConnectionSupervisor {
           executionGeneration: recovery.executionGeneration,
         });
       }
+
+      if (finalText && messageId) {
+        const existingTx = this.transcripts.get(txKey);
+        const existingMsg = existingTx?.messages.find((m) => m.messageId === messageId);
+        const supersededMsg = supersededPlaceholderId
+          ? existingTx?.messages.find((m) => m.messageId === supersededPlaceholderId)
+          : undefined;
+        const carryText = supersededMsg && supersededMsg.text.length > finalText.length ? supersededMsg.text : finalText;
+        const resolvedText =
+          existingMsg && existingMsg.text.length > carryText.length ? existingMsg.text : carryText;
+        const needsUpsert =
+          !isActive || !existingMsg || existingMsg.text !== resolvedText || Boolean(existingMsg.streaming);
+        if (needsUpsert) {
+          this.recordTranscriptPatchOrBuffer({
+            entry,
+            connectionId,
+            profileId: resolvedProfileId,
+            sessionId,
+            jKey,
+            kind: "assistant_message",
+            countsAsUnread: false,
+            isFocused,
+            isActive,
+            patch: {
+              type: "message_upsert",
+              sessionId,
+              message: {
+                messageId,
+                sessionId,
+                role: "assistant",
+                text: resolvedText,
+                createdAt: existingMsg?.createdAt ?? supersededMsg?.createdAt ?? normalizeTimestampIso(params),
+                ...(existingMsg?.turnId ?? supersededMsg?.turnId ?? turnId
+                  ? { turnId: existingMsg?.turnId ?? supersededMsg?.turnId ?? turnId }
+                  : {}),
+                ...(existingMsg?.toolRows ?? supersededMsg?.toolRows
+                  ? { toolRows: existingMsg?.toolRows ?? supersededMsg?.toolRows }
+                  : {}),
+                streaming: false,
+                status,
+              },
+            },
+          });
+        }
+      }
+
+      if (supersededPlaceholderId) {
+        this.recordTranscriptPatchOrBuffer({
+          entry,
+          connectionId,
+          profileId: resolvedProfileId,
+          sessionId,
+          jKey,
+          kind: "other",
+          countsAsUnread: false,
+          isFocused,
+          isActive,
+          patch: {
+            type: "turn_state",
+            sessionId,
+            activeTurnId: null,
+            turnStopping: false,
+            executionGeneration: recovery.executionGeneration,
+            stopState: recovery.stopState,
+            messageId: supersededPlaceholderId,
+            status,
+          },
+        });
+      }
+
       const patch: TranscriptPatchPayload = {
         type: "turn_state",
         sessionId,
@@ -5597,19 +6558,24 @@ export class ConnectionSupervisor {
       };
       this.backgroundJournal.setPinnedFlags(jKey, { runningTurn: false });
 
+      this.recordTranscriptPatchOrBuffer({
+        entry,
+        connectionId,
+        profileId: resolvedProfileId,
+        sessionId,
+        jKey,
+        kind: "turn_boundary",
+        countsAsUnread: true,
+        seqRaw,
+        isFocused,
+        isActive,
+        patch,
+      });
       if (isActive) {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: "turn_boundary",
-          countsAsUnread: true,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: true,
-        });
-        this.applyPatchToTranscript(entry, connectionId, resolvedProfileId, sessionId, patch);
         const kind: PromptEventPayload["kind"] =
-          method === "prompt.stopped"
+          terminalOutcome === "stopped" || terminalOutcome === "interrupted"
             ? "stopped"
-            : method === "prompt.error"
+            : terminalOutcome === "error"
               ? "error"
               : "completed";
         this.emitTopic(
@@ -5626,25 +6592,17 @@ export class ConnectionSupervisor {
           } satisfies PromptEventPayload,
           scopeMatchesSession,
         );
-      } else {
-        this.backgroundJournal.recordEvent(jKey, {
-          kind: "turn_boundary",
-          countsAsUnread: true,
-          gatewaySeq: seqRaw,
-          isWindowFocused: isFocused,
-          isViewingSession: false,
-          patch,
-        });
       }
 
       this.updateSessionSummary(connectionId, resolvedProfileId, sessionId, (prev) => ({
         ...prev,
         activeTurnId: null,
-        status: method === "prompt.error" ? "error" : "idle",
+        status: terminalOutcome === "error" ? "error" : "idle",
+        ...(finalText ? { preview: finalText.slice(0, 140) } : {}),
         updatedAt: new Date().toISOString(),
       }));
 
-      if (method === "prompt.completed" || method === "prompt.done") {
+      if (terminalOutcome === "completed") {
         this.notifyBackgroundEventForTest({
           kind: "turn_completed",
           scope: {
@@ -6688,7 +7646,7 @@ export class ConnectionSupervisor {
         this.emitChatState();
       }
 
-      const turnId = asString(res.turn_id ?? res.turnId, `turn-${Date.now()}`);
+      const turnId = asString(res.turn_id ?? res.turnId) || this.nextSyntheticId("turn");
       const gwExecGen =
         typeof (res.execution_generation ?? res.executionGeneration) === "number"
           ? Number(res.execution_generation ?? res.executionGeneration)
@@ -6701,11 +7659,23 @@ export class ConnectionSupervisor {
         ...(gwExecGen !== undefined ? { executionGeneration: gwExecGen } : {}),
         ownerGeneration: entry.ownerGeneration,
       });
-      const userMsgId = asString(res.user_message_id ?? res.userMessageId, `user-${Date.now()}`);
-      const assistantMsgId = asString(
-        res.assistant_message_id ?? res.assistantMessageId,
-        `assistant-${Date.now()}`,
-      );
+      const rawUserMsgId = asString(res.user_message_id ?? res.userMessageId).trim();
+      const rawAssistantMsgId = asString(res.assistant_message_id ?? res.assistantMessageId).trim();
+      const userMsgId = rawUserMsgId || this.nextSyntheticId("user");
+      const assistantMsgId = rawAssistantMsgId || this.nextSyntheticId("assistant");
+      const txKey = transcriptKey(connectionId, profileId, sessionId);
+      if (!asString(res.turn_id ?? res.turnId).trim()) {
+        this.optimisticTurnIdBySession.set(txKey, turnId);
+      } else {
+        this.optimisticTurnIdBySession.delete(txKey);
+      }
+      if (!rawUserMsgId) {
+        this.trackOptimisticMessageId(txKey, userMsgId);
+      }
+      if (!rawAssistantMsgId) {
+        this.trackOptimisticMessageId(txKey, assistantMsgId);
+      }
+      this.activeStreamingMessageBySession.set(txKey, assistantMsgId);
       const nowIso = new Date().toISOString();
 
       this.applyPatchToTranscript(entry, connectionId, profileId, sessionId, {
@@ -8989,6 +9959,9 @@ export class ConnectionSupervisor {
     this.backgroundJournal.clear();
     this.pendingResyncKeys.clear();
     this.transcripts.clear();
+    this.activeStreamingMessageBySession.clear();
+    this.optimisticMessageIdsBySession.clear();
+    this.optimisticTurnIdBySession.clear();
     for (const link of this.linksByKey.values()) {
       link.actual = "idle";
     }

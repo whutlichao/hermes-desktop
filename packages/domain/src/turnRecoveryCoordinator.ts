@@ -228,6 +228,28 @@ export class TurnRecoveryCoordinator {
     return this.toImmutableView(rec);
   }
 
+  /** Adopts the gateway-assigned turn ID onto an active optimistic turn without resetting stop state. */
+  adoptGatewayTurnId(input: {
+    connectionId: string;
+    profileId: string;
+    sessionId: string;
+    turnId: string;
+    executionGeneration?: number;
+  }): TurnSessionRecoveryView | null {
+    const rec = this.sessions.get(makeKey(input.connectionId, input.profileId, input.sessionId));
+    if (!rec) return null;
+    rec.activeTurnId = input.turnId;
+    if (rec.stopState === "stopping") {
+      rec.stopRequestedTurnId = input.turnId;
+    }
+    if (typeof input.executionGeneration === "number" && Number.isFinite(input.executionGeneration)) {
+      rec.executionGeneration = Math.max(rec.executionGeneration, input.executionGeneration);
+    }
+    rec.updatedAt = new Date(this.now()).toISOString();
+    this.emitChange();
+    return this.toImmutableView(rec);
+  }
+
   noteTurnTerminal(input: {
     connectionId: string;
     profileId: string;
